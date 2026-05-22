@@ -1,0 +1,221 @@
+/**
+ * FTS5 Query Sanitizer — validates and sanitizes search queries before MATCH.
+ *
+ * Strips unbalanced quotes, escapes stray special characters, preserves valid
+ * FTS5 operators (AND, OR, NOT, NEAR, quoted phrases, prefix *), and falls
+ * back to implicit-AND (space-separated quoted tokens) for unsafe input.
+ *
+ * IMPORTANT: unicode61 tokenizer treats hyphens and underscores as token
+ * separators, so `claude-transcript` is indexed as two tokens: `claude` +
+ * `transcript`. Worse, FTS5 query syntax interprets `-` as the NOT operator,
+ * so a raw `claude-transcript` query means "claude WITHOUT transcript" — the
+ * exact opposite of the intent. This sanitizer normalizes hyphens/underscores
+ * between word characters into spaces early, before any FTS5 parsing.
+ *
+ * IDF Filtering:
+ * For 3+ word queries, filters out high-frequency (low-IDF) terms by querying
+ * the fts5vocab virtual table. Uses FTS5's own porter stemmer (via the `_stem`
+ * helper table) to resolve stems, guaranteeing exact match with the index.
+ * Terms appearing in >15% of indexed messages are dropped before building the
+ * final OR query.
+ *
+ * @module core/recall/query-sanitizer
+ */
+
+import { getDb } from '../db.js';
+import { dbPath } from '../paths.js';
+import { log } from '../log.js';
+
+/** FTS5 boolean operators that should be preserved when recognized. */
+const FTS5_OPERATORS = /\b(AND|OR|NOT|NEAR)\b/;
+
+/** Characters that are special in FTS5 query syntax. */
+const SPECIAL_CHARS = /[*^:{}[\]()]/g;
+
+/** Threshold: drop terms appearing in >X% of all indexed messages. */
+const IDF_PERCENTILE_THRESHOLD = 0.15;
+
+// ============================================================================
+// FTS5-Native Stemmer
+// ============================================================================
+
+/**
+ * Resolve the porter stem of a word using FTS5's own tokenizer.
+ *
+ * Inserts the word into the `_stem` helper FTS5 table (same `porter unicode61`
+ * tokenizer as `messages_fts`), then reads the stemmed form from `_stem_vocab`.
+ * This guarantees the stem matches what's stored in the index — no JS/C
+ * stemmer mismatch.
+ *
+ * Returns the stemmed form, or the lowercase word if stemming fails.
+ */
+function fts5Stem(word: string): string {
+  try {
+    const d = getDb(dbPath());
+    d.exec('DELETE FROM _stem');
+    d.exec(`INSERT INTO _stem(t) VALUES ('${word.replace(/'/g, "''")}')`);
+    const row = d.get('SELECT term FROM _stem_vocab LIMIT 1');
+    return row ? (row as Record<string, unknown>).term as string : word.toLowerCase();
+  } catch {
+    return word.toLowerCase();
+  }
+}
+
+/** Cached total message count — refreshed at most once per minute. */
+let cachedTotal = 0;
+let cachedTotalTs = 0;
+
+function getTotalMessages(): number {
+  const now = Date.now();
+  if (cachedTotal > 0 && now - cachedTotalTs < 60_000) return cachedTotal;
+  try {
+    const row = getDb(dbPath()).get('SELECT COUNT(*) as total FROM messages');
+    cachedTotal = row ? (row as Record<string, unknown>).total as number : 1;
+    cachedTotalTs = now;
+    return cachedTotal;
+  } catch {
+    return cachedTotal || 1;
+  }
+}
+
+/**
+ * Get document frequency for a term from fts5vocab.
+ * Returns the fraction of messages containing the term (0.0–1.0).
+ * On error or if vocab is unavailable, returns 0 (assume low-frequency).
+ */
+function getTermDocFrequency(term: string): number {
+  try {
+    const stemmed = fts5Stem(term);
+    const row = getDb(dbPath()).get(
+      'SELECT doc FROM messages_fts_vocab WHERE term = ?',
+      [stemmed],
+    );
+    if (!row) return 0;
+    const docCount = (row as Record<string, unknown>).doc as number;
+    return docCount / getTotalMessages();
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * Normalize hyphens and underscores between word characters into spaces.
+ *
+ * unicode61 tokenizer splits on these anyway, so `claude-transcript` is
+ * stored as two tokens. But at query time, `-` means NOT in FTS5, so
+ * `claude-transcript` would mean "claude WITHOUT transcript". Converting
+ * to spaces makes it an implicit AND, matching the user's intent.
+ *
+ * Preserves hyphens/underscores at word boundaries (e.g. leading `-` for
+ * NOT) and inside quoted strings.
+ */
+function normalizeTokenSeparators(input: string): string {
+  // Split on quoted strings to preserve them, normalize only unquoted parts
+  const parts = input.split(/("(?:[^"\\]|\\.)*")/);
+  return parts
+    .map((part, i) => {
+      // Odd indices are quoted strings — leave them alone
+      if (i % 2 === 1) return part;
+      // Replace word-hyphen-word and word-underscore-word with spaces
+      return part.replace(/(\w)[-_](\w)/g, '$1 $2');
+    })
+    .join('');
+}
+
+/**
+ * Sanitize a raw search string for use in FTS5 MATCH.
+ *
+ * Returns the sanitized query string, or `null` if the input is
+ * empty/whitespace-only (callers should skip the MATCH entirely).
+ */
+export function sanitizeFts5Query(raw: string): string | null {
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+
+  // Normalize hyphens/underscores between word chars into spaces FIRST,
+  // before FTS5 can misinterpret `-` as the NOT operator.
+  const normalized = normalizeTokenSeparators(trimmed);
+
+  // Balance double-quotes: if odd count, strip all quotes and fall through
+  const quoteCount = (normalized.match(/"/g) ?? []).length;
+  const balanced = quoteCount % 2 === 0 ? normalized : normalized.replace(/"/g, '');
+
+  // If the input contains recognized FTS5 operators and looks well-formed,
+  // do a light sanitize (strip truly dangerous chars) and pass through.
+  if (FTS5_OPERATORS.test(balanced)) {
+    // Strip characters that could cause parse errors but keep * for prefix
+    const cleaned = balanced
+      .replace(/[^a-zA-Z0-9\s"*.\-_'/]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (cleaned) return cleaned;
+  }
+
+  // Check for a valid prefix search (word*)
+  if (/^"[^"]+"\s*$/.test(balanced) || /^[\w]+\*?\s*$/.test(balanced)) {
+    return balanced;
+  }
+
+  // Fallback: split into words and wrap each in quotes (implicit AND)
+  let words = balanced
+    .replace(SPECIAL_CHARS, '')
+    .replace(/"/g, '')
+    .split(/\s+/)
+    .filter(Boolean);
+
+  if (words.length === 0) return null;
+
+  // Single word — just return as-is
+  if (words.length === 1) return words[0]!;
+
+  // 2 words — implicit AND (high precision, usually fine)
+  if (words.length <= 2) return words.map((w) => `"${w}"`).join(' ');
+
+  // 3+ words — filter by IDF before building OR query.
+  // Drop terms appearing in >15% of indexed messages (high-frequency noise).
+  // Uses FTS5-native stemmer to guarantee stems match the index.
+  const originalCount = words.length;
+  const dropped: string[] = [];
+  words = words.filter(w => {
+    const df = getTermDocFrequency(w);
+    if (df >= IDF_PERCENTILE_THRESHOLD) {
+      dropped.push(`${w}(${(df * 100).toFixed(0)}%)`);
+      return false;
+    }
+    return true;
+  });
+
+  if (dropped.length > 0) {
+    log({
+      source: 'query-sanitizer',
+      level: 'debug',
+      summary: `IDF filter: ${originalCount} → ${words.length} terms, dropped: ${dropped.join(', ')}`,
+    });
+  }
+
+  // Deduplicate (e.g., "recall" appeared multiple times in the raw query)
+  words = [...new Set(words.map(w => w.toLowerCase()))];
+
+  // After filtering, may have 0-2 words left
+  if (words.length === 0) {
+    // All words were high-frequency — fall back to rarest 5 from original
+    const originalWords = [...new Set(
+      balanced.replace(SPECIAL_CHARS, '').replace(/"/g, '')
+        .split(/\s+/).filter(Boolean).map(w => w.toLowerCase()),
+    )];
+    const withDf = originalWords.map(w => ({ word: w, df: getTermDocFrequency(w) }));
+    withDf.sort((a, b) => a.df - b.df);
+    words = withDf.slice(0, 5).map(x => x.word);
+    log({
+      source: 'query-sanitizer',
+      level: 'debug',
+      summary: `IDF filter: all terms dropped, fallback to rarest 5: ${words.join(', ')}`,
+    });
+  }
+
+  if (words.length === 1) return words[0]!;
+  if (words.length <= 2) return words.map((w) => `"${w}"`).join(' ');
+
+  // 3+ words — implicit OR (recall over precision; BM25 ranks multi-word matches higher)
+  return words.map((w) => `"${w}"`).join(' OR ');
+}
