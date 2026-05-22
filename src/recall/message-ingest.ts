@@ -201,8 +201,10 @@ export async function ingestSessionMessages(
 
 /** Max characters to embed per message. Nomic's 8192 token context at ~1.9
  *  chars/token (worst case for dense code) = ~15,500 chars. 14,000 gives
- *  comfortable headroom (~7,400 tokens worst case). */
-const MAX_EMBED_CHARS = 14_000;
+ *  comfortable headroom (~7,400 tokens worst case). Exported so backfill
+ *  scripts share the same limit — earlier versions had a stale 32K copy
+ *  that produced >8192-token inputs on transcript-dense messages. */
+export const MAX_EMBED_CHARS = 14_000;
 
 /** Max messages to embed per call. Smaller batches give the parent more
  *  opportunities to check RSS between calls, limiting ONNX memory leak

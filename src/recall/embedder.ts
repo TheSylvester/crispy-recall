@@ -965,6 +965,13 @@ async function embedViaProcess(texts: string[], modelPath: string): Promise<Floa
       '-m', modelPath,
       '--embd-output-format', 'array',
       '-c', '8192',
+      // Match the YaRN flags on the llama-server batch path — nomic-embed-text-v1.5
+      // is trained at 2048 ctx and extends to 8192 via Dynamic NTK-aware RoPE.
+      // Without these, newer llama.cpp (b9253+) refuses inputs >2048 tokens here
+      // too, and older versions silently raw-extrapolate (lower quality on long
+      // single-text embeds, including interactive search queries).
+      '--rope-scaling', 'yarn',
+      '--rope-freq-scale', '0.75',
     ];
 
     // Always set separator — without it, llama-embedding splits on newlines
