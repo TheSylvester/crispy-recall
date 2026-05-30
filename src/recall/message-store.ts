@@ -62,15 +62,32 @@ function ensureDir() {
 /**
  * Batch-insert messages into the messages table.
  * Uses a transaction for atomicity. FTS5 sync triggers fire automatically.
+ *
+ * When `opts.replaceSessionId` is set, the existing rows for that session are
+ * deleted inside the SAME transaction as the insert, so a force re-ingest can
+ * never leave the session transiently empty in the index on a crash/rollback.
  */
-export function insertMessages(messages: MessageRecord[]): void {
-  if (messages.length === 0) return;
+export function insertMessages(
+  messages: MessageRecord[],
+  opts?: { replaceSessionId?: string },
+): void {
+  if (messages.length === 0 && !opts?.replaceSessionId) return;
 
   ensureDir();
   const d = db();
 
   d.exec('BEGIN');
   try {
+    if (opts?.replaceSessionId) {
+      // Delete vectors explicitly (belt-and-suspenders with the CASCADE), then
+      // messages — the messages_fts delete trigger fires automatically.
+      d.run(
+        `DELETE FROM message_vectors WHERE message_id IN
+         (SELECT message_id FROM messages WHERE session_id = ?)`,
+        [opts.replaceSessionId],
+      );
+      d.run('DELETE FROM messages WHERE session_id = ?', [opts.replaceSessionId]);
+    }
     const stmt = d.prepare(
       `INSERT OR IGNORE INTO messages
        (message_id, session_id, message_seq, message_text, project_id, created_at, message_role)

@@ -43,8 +43,16 @@ const HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000;
   const sessionId = process.argv[2]; // optional; informational only
   if (!tryAcquireEmbedLock()) process.exit(0);
   process.on("exit", releaseEmbedLock);
-  process.on("SIGINT", () => { releaseEmbedLock(); process.exit(0); });
-  process.on("SIGTERM", () => { releaseEmbedLock(); process.exit(0); });
+  // On a signal, kill the llama-server BEFORE releasing the lock and exiting.
+  // process.exit() bypasses the finally block, so without this a SIGINT/SIGTERM
+  // would orphan the ~1.5 GB resident server.
+  const onSignal = async () => {
+    try { await disposeEmbedder(); } catch { /* ignore */ }
+    releaseEmbedLock();
+    process.exit(0);
+  };
+  process.on("SIGINT", onSignal);
+  process.on("SIGTERM", onSignal);
 
   // Heartbeat: touch the lockfile mtime so a long backfill (>30 min) doesn't
   // look stale to a competing child. unref() so the interval doesn't keep
@@ -58,20 +66,29 @@ const HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000;
     // Embed the named session first (if provided), then sweep ALL unvectorized
     // messages cross-session — the query in getUnembeddedMessages isn't
     // session-scoped, so we naturally cover other sessions' gaps.
-    if (sessionId) {
-      await embedSessionMessages(sessionId);
-    }
-    // Sweep loop: keep going while there's work and failures stay low.
-    let consecutiveFailures = 0;
-    while (consecutiveFailures < MAX_CONSECUTIVE_FAILURES) {
-      const batch = getUnembeddedMessages(CATCHUP_BATCH_SIZE);
-      if (batch.length === 0) break;
-      try {
-        await embedMessageBatch(batch);
-        consecutiveFailures = 0;
-      } catch {
-        consecutiveFailures++;
+    //
+    // Guard the whole embed phase: if the embedder is unavailable (e.g. the
+    // binary/model isn't downloaded yet — the exact cold-install window where
+    // catch-up matters most), the throw must NOT skip the T2 mtimeScan below.
+    try {
+      if (sessionId) {
+        await embedSessionMessages(sessionId);
       }
+      // Sweep loop: keep going while there's work and failures stay low.
+      let consecutiveFailures = 0;
+      while (consecutiveFailures < MAX_CONSECUTIVE_FAILURES) {
+        const batch = getUnembeddedMessages(CATCHUP_BATCH_SIZE);
+        if (batch.length === 0) break;
+        try {
+          await embedMessageBatch(batch);
+          consecutiveFailures = 0;
+        } catch {
+          consecutiveFailures++;
+        }
+      }
+    } catch {
+      // Embedder unavailable — fall through to the T2 mtimeScan so FTS5
+      // catch-up still runs while we hold the lock.
     }
 
     // T2: opportunistic mtime-scan while we still hold the lock.

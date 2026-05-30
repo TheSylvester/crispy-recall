@@ -28,7 +28,6 @@ import { stripToolContent } from './transcript-utils.js';
 import {
   insertMessages,
   insertMessageVectors,
-  deleteSessionMessages,
 } from './message-store.js';
 import type { MessageRecord, MessageVectorRecord } from './message-store.js';
 import { getDb } from '../db.js';
@@ -171,14 +170,11 @@ export async function ingestSessionMessages(
     return { sessionId, chunksCreated: 0, skipped: true };
   }
 
-  // 6. If force, clear existing messages first (delete is idempotent)
-  if (options?.force) {
-    deleteSessionMessages(sessionId);
-  }
-
-  // 7. Batch insert messages
+  // 6 & 7. Batch insert messages. When force is set, the session's existing
+  // rows are cleared inside the SAME transaction as the insert (atomic replace)
+  // so a crash can't leave the session transiently empty in the index.
   try {
-    insertMessages(records);
+    insertMessages(records, options?.force ? { replaceSessionId: sessionId } : undefined);
   } catch (err) {
     return {
       sessionId,

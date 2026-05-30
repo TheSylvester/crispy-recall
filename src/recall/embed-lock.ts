@@ -25,22 +25,33 @@ function isAlive(pid: number): boolean {
 
 /** Attempt to acquire the embed lock. Returns true on success. */
 export function tryAcquireEmbedLock(): boolean {
-  try {
-    writeFileSync(LOCK_PATH, String(process.pid), { flag: 'wx' });
-    return true;
-  } catch {
-    // Lock exists — check liveness + age
+  // Two passes: a stale-lock takeover is performed by REMOVING the stale lock
+  // and retrying the atomic O_EXCL (`wx`) create — so only one racer's create
+  // can win. An unconditional overwrite (the previous approach) let every racer
+  // that saw the lock as stale "win" simultaneously, spawning duplicate
+  // ~1.5 GB llama-servers. A vanishingly small window remains (a racer's
+  // unlink landing just after another's fresh create); the cost is one
+  // transient extra server, self-healed on the next sweep, never corruption.
+  for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      const heldPid = parseInt(readFileSync(LOCK_PATH, 'utf8'), 10);
-      const ageMs = Date.now() - statSync(LOCK_PATH).mtimeMs;
-      if (isAlive(heldPid) && ageMs < STALE_MS) return false; // legitimate owner
-      // Stale — take over
-      writeFileSync(LOCK_PATH, String(process.pid));
+      writeFileSync(LOCK_PATH, String(process.pid), { flag: 'wx' });
       return true;
     } catch {
-      return false; // race; let the other process win
+      // Lock exists — check liveness + age.
+      let heldPid: number;
+      let ageMs: number;
+      try {
+        heldPid = parseInt(readFileSync(LOCK_PATH, 'utf8'), 10);
+        ageMs = Date.now() - statSync(LOCK_PATH).mtimeMs;
+      } catch {
+        continue; // lock vanished mid-check — retry the create
+      }
+      if (isAlive(heldPid) && ageMs < STALE_MS) return false; // legitimate owner
+      // Stale — drop it so the next iteration's exclusive create decides one winner.
+      try { unlinkSync(LOCK_PATH); } catch { /* another racer already took over */ }
     }
   }
+  return false;
 }
 
 /** Release the embed lock if it still belongs to this process. */
