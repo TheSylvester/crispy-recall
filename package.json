@@ -4,13 +4,32 @@
   "description": "Local session transcript memory for Claude Code and Codex — search past sessions with FTS5 + semantic vectors.",
   "license": "MIT",
   "author": "Sylvester Wong",
+  "homepage": "https://github.com/TheSylvester/crispy-recall#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/TheSylvester/crispy-recall.git"
+  },
+  "keywords": [
+    "claude-code",
+    "codex",
+    "transcript",
+    "memory",
+    "recall",
+    "fts5",
+    "embeddings",
+    "semantic-search",
+    "sqlite"
+  ],
   "bin": {
     "recall": "./dist/recall.js",
     "recall-stop-hook": "./dist/stop-hook.js"
   },
   "files": [
     "dist/",
-    "skill/"
+    "skill/",
+    "README.md",
+    "LICENSE",
+    "THIRD-PARTY-LICENSES"
   ],
   "engines": {
     "node": ">=20"
