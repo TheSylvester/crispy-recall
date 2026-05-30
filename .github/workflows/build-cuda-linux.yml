@@ -75,10 +75,14 @@ jobs:
             -DGGML_NATIVE=OFF \
             -DBUILD_SHARED_LIBS=ON \
             -DLLAMA_CURL=OFF \
-            -DCMAKE_CUDA_ARCHITECTURES="61;70;75;80;86;89"
+            -DCMAKE_CUDA_ARCHITECTURES="75;80;86;89"
 
+      # Trimmed to Turing→Ada (sm_75/80/86/89: RTX 20/30/40, A100) and capped at
+      # -j2: compiling ggml-cuda for many arches with -j$(nproc) OOM-kills nvcc on
+      # the 7 GB GitHub runner ("nvcc: Terminated"). Pascal/Volta dropped — those
+      # users fall back to CPU; revisit on a larger runner if there's demand.
       - name: Build ggml-cuda
-        run: cmake --build llama.cpp/build --config Release --target ggml-cuda -j
+        run: cmake --build llama.cpp/build --config Release --target ggml-cuda -j2
 
       - name: Collect libggml-cuda.so
         run: |
