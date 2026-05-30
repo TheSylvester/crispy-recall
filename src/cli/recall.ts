@@ -22,7 +22,8 @@
  */
 
 import { dualPathSearch } from '../recall/vector-search.js';
-import { getDb } from '../db.js';
+import { disposeEmbedder } from '../recall/embedder.js';
+import { getDb, closeDb } from '../db.js';
 import { getDbPath, listSessions } from '../recall/memory-queries.js';
 import { readSessionMessages, getMessageByUuid } from '../recall/message-store.js';
 import { normalizePath } from '../url-path-resolver.js';
@@ -79,6 +80,23 @@ const projectFlag = flagValue('--project');
 const allProjects = hasFlag('--all');
 const reverse = hasFlag('--reverse');
 const recent = hasFlag('--recent');
+
+/**
+ * Clean termination WITHOUT exit(). On Windows, exit() aborts
+ * with a libuv `UV_HANDLE_CLOSING` assertion (exit 0xC0000409) when
+ * node-sqlite3-wasm's Emscripten runtime still holds an async handle — closing
+ * the DB does NOT help; only letting the event loop drain naturally does. So we
+ * set the exit code and throw a sentinel that unwinds to main()'s handler,
+ * which disposes the embedder + DB and returns, letting the process exit on its
+ * own. The 3 try/catch blocks in this file do not wrap any exit() site.
+ */
+class ExitSignal extends Error {
+  constructor(public readonly code: number) { super(`exit:${code}`); }
+}
+function exit(code: number): never {
+  process.exitCode = code;
+  throw new ExitSignal(code);
+}
 
 // Project scoping: default to CWD (inherited from parent session's projectPath),
 // --project overrides, --all disables scoping entirely.
@@ -190,12 +208,12 @@ function resolveSessionId(prefix: string): string {
   ) as { session_id: string }[];
   if (rows.length === 0) {
     console.error(`No session found matching prefix: ${prefix}`);
-    process.exit(1);
+    exit(1);
   }
   if (rows.length > 1) {
     console.error(`Ambiguous prefix "${prefix}" — matches multiple sessions:`);
     for (const r of rows) console.error(`  ${r.session_id}`);
-    process.exit(1);
+    exit(1);
   }
   return rows[0]!.session_id;
 }
@@ -210,12 +228,12 @@ function resolveMessageId(sessionId: string, prefix: string): string {
   ) as { message_id: string }[];
   if (rows.length === 0) {
     console.error(`No message found in session ${sessionId.slice(0, 8)} matching prefix: ${prefix}`);
-    process.exit(1);
+    exit(1);
   }
   if (rows.length > 1) {
     console.error(`Ambiguous message ID prefix "${prefix}" — matches multiple messages:`);
     for (const r of rows) console.error(`  ${r.message_id}`);
-    process.exit(1);
+    exit(1);
   }
   return rows[0]!.message_id;
 }
@@ -318,7 +336,7 @@ function runReadSession(sessionId: string) {
 
   if (!page) {
     console.error(`No messages found for session ${sessionId}`);
-    process.exit(1);
+    exit(1);
   }
 
   if (raw) {
@@ -341,7 +359,7 @@ function runReadTurn(sessionId: string, messageId: string) {
   const record = getMessageByUuid(sessionId, messageId);
   if (!record) {
     console.error(`Message ${messageId} not found in session ${sessionId}`);
-    process.exit(1);
+    exit(1);
   }
 
   // Fetch a generous batch centered on the match
@@ -350,7 +368,7 @@ function runReadTurn(sessionId: string, messageId: string) {
 
   if (!page) {
     console.error(`No messages found for session ${sessionId}`);
-    process.exit(1);
+    exit(1);
   }
 
   if (raw) {
@@ -469,7 +487,7 @@ async function runSearch(query: string) {
       });
     } else {
       console.error(`Invalid --since date: "${since}" (expected ISO-8601)`);
-      process.exit(1);
+      exit(1);
     }
   }
 
@@ -482,7 +500,7 @@ async function runSearch(query: string) {
       });
     } else {
       console.error(`Invalid --until date: "${until}" (expected ISO-8601)`);
-      process.exit(1);
+      exit(1);
     }
   }
 
@@ -656,7 +674,7 @@ function parseVendors(): ('claude' | 'codex')[] | undefined {
   if (!v) return undefined;
   if (v === 'claude' || v === 'codex') return [v];
   console.error(`Invalid --vendor "${v}" (expected "claude" or "codex")`);
-  process.exit(1);
+  exit(1);
 }
 
 async function runBackfill() {
@@ -690,7 +708,7 @@ async function runBackfill() {
     }
     child.unref();
     process.stderr.write(`[recall] backfill detached (pid=${child.pid}, log=${logPath})\n`);
-    process.exit(0);
+    exit(0);
   }
 
   const autoEmbed = hasFlag('--auto-embed');
@@ -752,7 +770,7 @@ async function runInstallerSubcommand(cmd: string): Promise<void> {
       json,
     });
     if (json) console.log(JSON.stringify(res, null, 2));
-    process.exit(res.aborted ? 1 : 0);
+    exit(res.aborted ? 1 : 0);
   }
 
   if (cmd === 'uninstall') {
@@ -760,52 +778,52 @@ async function runInstallerSubcommand(cmd: string): Promise<void> {
     const res = runUninstall({ purge: hasFlag('--purge'), json });
     if (json) console.log(JSON.stringify(res, null, 2));
     else console.log(`recall uninstalled — removed ${res.removed.length} target(s)${res.purged ? ' (purged ~/.recall)' : ''}.`);
-    process.exit(0);
+    exit(0);
   }
 
   if (cmd === 'status') {
     const { printStatus } = await import('../installer/status.js');
     printStatus(json);
-    process.exit(0);
+    exit(0);
   }
 
   if (cmd === 'doctor') {
     const { runDoctor } = await import('../installer/doctor.js');
     const code = await runDoctor({ json, integrity: hasFlag('--integrity'), offline: hasFlag('--offline') });
-    process.exit(code);
+    exit(code);
   }
 
   if (cmd === 'repair') {
     const { repairFts, repairVectors, repairFull } = await import('../installer/repair.js');
-    if (hasFlag('--fts')) { repairFts(); console.log('FTS5 index rebuilt.'); process.exit(0); }
-    if (hasFlag('--vectors')) { repairVectors(); console.log('Vectors cleared — they re-embed on the next sweep.'); process.exit(0); }
-    if (hasFlag('--full')) { await repairFull({ yes: hasFlag('--yes') }); process.exit(0); }
+    if (hasFlag('--fts')) { repairFts(); console.log('FTS5 index rebuilt.'); exit(0); }
+    if (hasFlag('--vectors')) { repairVectors(); console.log('Vectors cleared — they re-embed on the next sweep.'); exit(0); }
+    if (hasFlag('--full')) { await repairFull({ yes: hasFlag('--yes') }); exit(0); }
     console.error('recall repair: specify --fts, --vectors, or --full');
-    process.exit(1);
+    exit(1);
   }
 }
 
 async function main() {
   if (showVersion) {
     console.log(getVersion());
-    process.exit(0);
+    exit(0);
   }
 
   if (showHelp) {
     printHelp();
-    process.exit(0);
+    exit(0);
   }
 
   // Backfill subcommand — skip T1 (it covers everything itself).
   if (positional[0] === 'backfill') {
     await runBackfill();
-    process.exit(0);
+    exit(0);
   }
 
   // Installer subcommands — skip T1 (they manage their own DB/lifecycle).
   if (positional[0] && INSTALLER_SUBCOMMANDS.has(positional[0])) {
     await runInstallerSubcommand(positional[0]);
-    process.exit(0);
+    exit(0);
   }
 
   // Opportunistic catch-up for everything that touches the DB.
@@ -813,7 +831,7 @@ async function main() {
 
   if (listMode) {
     runList();
-    process.exit(0);
+    exit(0);
   }
 
   // Two UUID-like positional args → turn read
@@ -822,25 +840,37 @@ async function main() {
     const sessionId = resolveSessionId(positional[0]!);
     const messageId = resolveMessageId(sessionId, positional[1]!);
     runReadTurn(sessionId, messageId);
-    process.exit(0);
+    exit(0);
   }
 
   // Single UUID-like positional arg → session read
   if (positional.length === 1 && UUID_PREFIX.test(positional[0]!)) {
     initDb();
     runReadSession(resolveSessionId(positional[0]!));
-    process.exit(0);
+    exit(0);
   }
 
   // Otherwise → search query
   const query = positional.join(' ');
   if (!query) {
     console.error('No query provided. Use --help for usage.');
-    process.exit(1);
+    exit(1);
   }
 
   await runSearch(query);
-  process.exit(0);
+  exit(0);
 }
 
-main();
+main()
+  .catch((e) => {
+    if (e instanceof ExitSignal) return; // intentional termination; exitCode already set
+    console.error(e);
+    process.exitCode = 1;
+  })
+  .finally(async () => {
+    // Release the resident embedder (kills any llama-server + clears its idle
+    // timer) and close the DB so the event loop drains and the process exits
+    // naturally — avoiding the Windows process.exit() libuv assertion.
+    try { await disposeEmbedder(); } catch { /* ignore */ }
+    try { closeDb(); } catch { /* ignore */ }
+  });
