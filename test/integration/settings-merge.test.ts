@@ -5,7 +5,7 @@
  * of existing entries / line endings / indentation, and stale-path auto-heal.
  */
 import { afterEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { mergeStopHook, removeStopHook } from '../../src/installer/settings-merge.js';
@@ -86,6 +86,22 @@ describe('settings-merge', () => {
     expect(parsed.hooks.Stop[0].hooks[0].command).toBe(CMD);
     // SubagentStop created with the recall entry alongside
     expect(recallEntries(parsed.hooks.SubagentStop)).toHaveLength(1);
+  });
+
+  it('writes atomically — correct content and no leftover *.tmp.* file', () => {
+    const p = setup(JSON.stringify({ hooks: { Stop: [] } }, null, 2));
+    const r = mergeStopHook(p, HOOK);
+    expect(r.changed).toBe(true);
+
+    // (a) target content is valid + correct
+    const parsed = JSON.parse(readFileSync(p, 'utf-8'));
+    expect(recallEntries(parsed.hooks.Stop)).toHaveLength(1);
+    expect(recallEntries(parsed.hooks.SubagentStop)).toHaveLength(1);
+    expect(recallEntries(parsed.hooks.Stop)[0].hooks[0].command).toBe(CMD);
+
+    // (b) the write-to-temp-then-rename left no temp file behind
+    const leftovers = readdirSync(dir).filter((f) => /\.tmp\./.test(f));
+    expect(leftovers).toEqual([]);
   });
 
   it('uninstall removes recall entries (path-independent) and drops empty arrays', () => {

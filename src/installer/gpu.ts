@@ -24,7 +24,7 @@
  */
 
 import { execFile } from 'node:child_process';
-import { createWriteStream, existsSync, mkdirSync } from 'node:fs';
+import { createWriteStream, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { platform as osPlatform, arch as osArch, tmpdir } from 'node:os';
@@ -44,12 +44,45 @@ const DEFAULT_NGL = 999;
 /**
  * Our version-matched prebuilt Linux CUDA backend lib, built in CI
  * (.github/workflows/build-cuda-linux.yml) from llama.cpp at the SAME tag as the
- * CPU binary (b5300) so the ABI matches. `releases/latest/download` resolves
- * once the first release carrying the asset is published (Day 7 publish — the
- * URL repo must match the actual release repo).
+ * CPU binary (b5300) so the ABI matches.
+ *
+ * The asset URL is PINNED to the package's own version tag
+ * (`releases/download/v<version>/`) rather than `releases/latest/`. A pinned URL
+ * is reproducible (a given recall version always fetches the asset built for it)
+ * and never silently picks up a mismatched newer release. It 404s fast until the
+ * matching release publishes the asset, at which point `downloadFile` succeeds;
+ * a 404 before then simply falls back to CPU (which is correct and safe).
  */
 const CUDA_ASSET_NAME = 'recall-libggml-cuda-linux-x64-b5300.zip';
-const CUDA_ASSET_URL = `https://github.com/TheSylvester/crispy-recall/releases/latest/download/${CUDA_ASSET_NAME}`;
+
+/** Resolve owner/repo + version from package.json so the asset URL stays pinned. */
+function cudaAssetUrl(): string {
+  let owner = 'TheSylvester';
+  let repo = 'crispy-recall';
+  let version = '';
+  try {
+    // gpu.ts is bundled into dist/recall.js (cjs), so __dirname is dist/ and the
+    // package.json sits one level up (same lookup as cli/recall.ts getVersion).
+    const pkgPath = join(__dirname, '..', 'package.json');
+    const pkg = JSON.parse(readFileSync(pkgPath, 'utf8')) as {
+      version?: string;
+      repository?: { url?: string } | string;
+    };
+    version = typeof pkg.version === 'string' ? pkg.version : '';
+    const repoUrl = typeof pkg.repository === 'string' ? pkg.repository : pkg.repository?.url;
+    const m = repoUrl?.match(/github\.com[/:]([^/]+)\/([^/.]+)/);
+    if (m) {
+      owner = m[1];
+      repo = m[2];
+    }
+  } catch {
+    /* fall back to hardcoded owner/repo; version stays '' → unpinned-but-tagged */
+  }
+  const tag = version ? `download/v${version}` : 'latest/download';
+  return `https://github.com/${owner}/${repo}/releases/${tag}/${CUDA_ASSET_NAME}`;
+}
+
+const CUDA_ASSET_URL = cudaAssetUrl();
 const STAGE_DOWNLOAD_TIMEOUT_MS = 5 * 60 * 1000;
 
 export type CudaAvailability = 'prebuilt' | 'reuse-existing' | 'metal' | 'none';
@@ -274,7 +307,13 @@ export async function runGpuPhase(opts: GpuPhaseOptions = {}): Promise<GpuPhaseR
     const stage = opts.stage ?? defaultStage;
     libDir = await stage({ platform: p, arch: opts.arch ?? osArch(), offline: opts.offline ?? false });
     if (!libDir) {
-      return persist('cpu', null, 'could not stage prebuilt CUDA libs (offline or download/extract failed)');
+      return persist(
+        'cpu',
+        null,
+        'GPU unavailable: could not stage the prebuilt CUDA backend (offline, or the version-matched ' +
+          `${CUDA_ASSET_NAME} is not yet published for this release / download failed). ` +
+          'GPU offload requires BOTH the published prebuilt asset AND a system CUDA runtime (libcudart/libcublas).',
+      );
     }
   } else {
     libDir = null;
@@ -289,7 +328,15 @@ export async function runGpuPhase(opts: GpuPhaseOptions = {}): Promise<GpuPhaseR
     if (result.cudaInit && result.vectorOk) {
       return persist('gpu', libDir);
     }
-    return persist('cpu', null, `live offload test failed (ggml_cuda_init=${result.cudaInit}, vector=${result.vectorOk})`);
+    const cudaRuntimeHint =
+      p === 'linux' && info.cudaAvailable === 'prebuilt'
+        ? ' — the prebuilt libggml-cuda.so staged but offload failed; this host likely lacks the system CUDA runtime (libcudart/libcublas), which the NVIDIA driver alone does not provide'
+        : '';
+    return persist(
+      'cpu',
+      null,
+      `live offload test failed (ggml_cuda_init=${result.cudaInit}, vector=${result.vectorOk})${cudaRuntimeHint}`,
+    );
   } catch (err) {
     return persist('cpu', null, `live offload test errored: ${(err as Error).message}`);
   }

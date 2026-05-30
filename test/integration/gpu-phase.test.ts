@@ -85,6 +85,10 @@ describe('gpu-phase', () => {
     expect(res.cudaAvailable).toBe('prebuilt');
     expect(res.mode).toBe('cpu');
     expect(res.reason).toBeTruthy();
+    // M3: the persisted reason is honest about WHY GPU did not engage — it needs
+    // both the published prebuilt asset and a system CUDA runtime.
+    expect(res.reason).toMatch(/published|prebuilt/i);
+    expect(res.reason).toMatch(/libcudart|libcublas|CUDA runtime/i);
     expect(probed).toBe(false); // never probes when staging failed
     expect(readConfig()?.embedder.mode).toBe('cpu');
   });

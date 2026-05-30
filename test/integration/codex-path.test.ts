@@ -18,6 +18,7 @@ import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 
 import { adaptCodexJsonlRecords } from '../../src/adapters/codex/codex-jsonl-adapter.js';
+import { vendorForTranscript } from '../../src/hooks/stop-hook.js';
 import { ingestSessionMessages } from '../../src/recall/message-ingest.js';
 import { mergeStopHook, removeStopHook } from '../../src/installer/settings-merge.js';
 import { _setTestRoot, dbPath } from '../../src/paths.js';
@@ -77,6 +78,23 @@ describe('codex JSONL adapter', () => {
 
     // developer message must NOT appear anywhere
     expect(entries.some((e) => textOf(e).includes('internal system reminder'))).toBe(false);
+  });
+});
+
+describe('codex vendor detection (stop-hook path classification)', () => {
+  it('routes a POSIX .codex transcript to codex', () => {
+    expect(vendorForTranscript('/home/u/.codex/sessions/2026/rollout.jsonl')).toBe('codex');
+  });
+
+  it('routes a Windows-native backslash .codex transcript to codex', () => {
+    // On Windows-native the harness supplies backslash paths; the substring
+    // test must normalize separators or every Codex session misroutes to claude.
+    expect(vendorForTranscript('C:\\Users\\u\\.codex\\sessions\\2026\\rollout.jsonl')).toBe('codex');
+  });
+
+  it('routes a non-codex transcript to claude', () => {
+    expect(vendorForTranscript('C:\\Users\\u\\.claude\\projects\\p\\sess.jsonl')).toBe('claude');
+    expect(vendorForTranscript('/home/u/.claude/projects/p/sess.jsonl')).toBe('claude');
   });
 });
 

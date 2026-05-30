@@ -176,4 +176,38 @@ describe('mtime-scan gap recovery', () => {
     ) as { last_mtime: number } | undefined;
     expect(watermarkPost!.last_mtime).toBe(Math.floor(afterStat.mtimeMs));
   });
+
+  it('does NOT advance the watermark when ingest returns a soft error', async () => {
+    // Build a Codex transcript whose first response_item line is missing its
+    // `payload` field. parseCodexJsonlFile accepts it (valid JSON), but the
+    // adapter's index pass dereferences `record.payload.type`, throwing a
+    // TypeError that ingestSessionMessages catches and reports as a returned
+    // { error } (a soft failure — NOT a thrown exception). The scan must treat
+    // that as a failure: leave the watermark unwritten and count it as failed.
+    const codexRoot = process.env['CODEX_HOME']!;
+    const dayDir = join(codexRoot, 'sessions', '2026', '01', '01');
+    mkdirSync(dayDir, { recursive: true });
+    const uuid = '019c3ae2-9a7f-7f30-9717-d3ccfb7bac63';
+    const corruptPath = join(dayDir, `rollout-2026-01-01T00-00-00-${uuid}.jsonl`);
+    // A response_item record with no `payload` → adapter throws on .payload.type.
+    writeFileSync(corruptPath, JSON.stringify({ type: 'response_item', timestamp: '2026-01-01T00:00:00Z' }) + '\n');
+
+    const db = getDb(dbPath());
+    const before = db.get(
+      'SELECT last_mtime FROM ingest_watermark WHERE transcript_path = ?',
+      [corruptPath],
+    );
+    expect(before == null).toBe(true);
+
+    const scan = await mtimeScan({ vendors: ['codex'] });
+
+    // The corrupt file must be counted as failed...
+    expect(scan.failed).toBeGreaterThanOrEqual(1);
+    // ...and its watermark must NOT have been written (so the next scan retries).
+    const after = db.get(
+      'SELECT last_mtime FROM ingest_watermark WHERE transcript_path = ?',
+      [corruptPath],
+    );
+    expect(after == null).toBe(true);
+  });
 });

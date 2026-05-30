@@ -17,7 +17,29 @@ import { appendFileSync, mkdirSync } from "fs";
 import { spawn } from "child_process";
 import { join } from "path";
 
-(async () => {
+/**
+ * Decide the vendor from a transcript path.
+ *
+ * Normalizes separators to forward slashes first so the `/.codex/` substring
+ * test works regardless of native separator — on Windows-native the harness
+ * supplies backslash paths (`C:\Users\..\.codex\sessions\..`), which would
+ * otherwise misroute every Codex session to the Claude adapter. Mirrors the
+ * normalization in src/url-path-resolver.ts.
+ */
+export function vendorForTranscript(transcriptPath: string): 'claude' | 'codex' {
+  const p = transcriptPath.replace(/\\/g, '/');
+  return p.includes("/.codex/") ? "codex" : "claude";
+}
+
+/** Append a line to the stop-hook log, swallowing any error (must never throw). */
+function logStopHook(line: string): void {
+  try {
+    mkdirSync(logsDir(), { recursive: true });
+    appendFileSync(join(logsDir(), "stop-hook.log"), line);
+  } catch {} // never let logging throw — must exit 0
+}
+
+async function runStopHook(): Promise<void> {
   let data = "";
   for await (const chunk of process.stdin) data += chunk;
   let payload: { session_id?: string; transcript_path?: string; cwd?: string; stop_hook_active?: boolean };
@@ -25,29 +47,33 @@ import { join } from "path";
   if (!payload?.session_id || !payload?.transcript_path) process.exit(0);
   if (payload.stop_hook_active) process.exit(0); // recursion guard
 
-  // 500 ms busy_timeout for hook DB writes — multi-process contention defers
-  // to T1 mtime-scan rather than blocking Claude Code on the writer lock.
-  // (Other recall connections keep the 5000 ms default set in db.ts.)
-  getDb(dbPath()).exec("PRAGMA busy_timeout = 500;");
-
-  const vendor: 'claude' | 'codex' =
-    payload.transcript_path.includes("/.codex/") ? "codex" : "claude";
-
   try {
-    await ingestSessionMessages(
+    // 500 ms busy_timeout for hook DB writes — multi-process contention defers
+    // to T1 mtime-scan rather than blocking Claude Code on the writer lock.
+    // (Other recall connections keep the 5000 ms default set in db.ts.) Inside
+    // the try so a DB open/init failure is logged and swallowed — the hook must
+    // always exit 0 and never block the user's turn.
+    getDb(dbPath()).exec("PRAGMA busy_timeout = 500;");
+
+    const vendor = vendorForTranscript(payload.transcript_path);
+
+    const result = await ingestSessionMessages(
       payload.session_id,
       payload.transcript_path,
       vendor,
       { projectId: payload.cwd ?? undefined },
     );
-  } catch (e) {
-    try {
-      mkdirSync(logsDir(), { recursive: true });
-      appendFileSync(
-        join(logsDir(), "stop-hook.log"),
-        `${new Date().toISOString()} ingest-failed sid=${payload.session_id} err=${(e as Error).message}\n`,
+    // ingestSessionMessages reports soft failures via { error } rather than
+    // throwing — log those too, else they vanish silently.
+    if (result?.error) {
+      logStopHook(
+        `${new Date().toISOString()} ingest-failed sid=${payload.session_id} err=${result.error}\n`,
       );
-    } catch {} // never let logging throw — must exit 0
+    }
+  } catch (e) {
+    logStopHook(
+      `${new Date().toISOString()} ingest-failed sid=${payload.session_id} err=${(e as Error).message}\n`,
+    );
   }
 
   // Detach an embed-pending child to vectorize anything still missing.
@@ -64,4 +90,15 @@ import { join } from "path";
   ).unref();
 
   process.exit(0);
-})();
+}
+
+// Only consume stdin / exit when invoked as the Stop hook entry point. When the
+// module is imported (e.g. unit tests for vendorForTranscript), the IIFE must
+// NOT run — otherwise it would block on stdin and call process.exit. In the
+// esbuild CJS bundle `require.main === module` is true only for the direct
+// `node dist/stop-hook.js` invocation.
+declare const require: NodeJS.Require | undefined;
+declare const module: NodeJS.Module | undefined;
+if (typeof require !== "undefined" && typeof module !== "undefined" && require.main === module) {
+  void runStopHook();
+}

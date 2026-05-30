@@ -114,7 +114,10 @@ export function listSessions(
  * Codex transcripts live under ~/.codex/ or contain /codex/ in the path.
  */
 export function readTurnContent(file: string, offset: number): TurnContent | null {
-  if (file.includes('/.codex/') || file.includes('/codex/')) {
+  // Normalize separators so the codex-path test works on Windows-native paths
+  // (backslash) as well as POSIX. Mirrors src/url-path-resolver.ts.
+  const p = file.replace(/\\/g, '/');
+  if (p.includes('/.codex/') || p.includes('/codex/')) {
     const result = readCodexTurnContent(file, offset);
     if (!result) return null;
     return { userPrompt: result.userPrompt, assistantResponse: result.assistantResponse };

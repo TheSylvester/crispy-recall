@@ -54,9 +54,18 @@ export function getDb(dbPath: string): Database {
   // causes B-tree corruption from unsynchronized concurrent writes.
   clearStaleLock(dbPath);
 
+  // Record ownership before opening the connection. NOTE: the `${dbPath}.lock`
+  // directory is NOT created here — node-sqlite3-wasm acquires it transiently
+  // per write transaction (its VFS xLock does mkdirSync, xUnlock does rmdirSync),
+  // so it exists only while some process is mid-write. clearStaleLock removes a
+  // `.lock` left behind by a crashed writer; the `.owner` file (PID + start-token)
+  // is what lets it tell a live holder from a dead one. We write the owner before
+  // any DB work so this process is identifiable as early as possible; writing it
+  // before a `.lock` dir can exist is harmless — clearStaleLock early-returns when
+  // there is no `.lock` dir.
+  writeOwnerFile(dbPath);
   db = new DatabaseConstructor(dbPath);
   currentDbPath = dbPath;
-  writeOwnerFile(dbPath);
 
   // Multi-process concurrency (plan §5.4 / §5.13 justified deviation #1):
   // the standalone has several OS processes hitting the same DB.
@@ -104,9 +113,38 @@ function ownerFilePath(dbPath: string): string {
   return `${dbPath}.owner`;
 }
 
+/**
+ * Best-effort process start-identity token for a PID.
+ *
+ * Used to defeat PID reuse: a recycled PID belonging to an unrelated live
+ * process will not match the token recorded when the lock was taken. On
+ * Linux we read field 22 (starttime, in clock ticks since boot) from
+ * /proc/<pid>/stat. On any other platform, or on any error (no /proc,
+ * permissions, race with process exit), we return '' (unknown), which makes
+ * the comparison degrade gracefully to PID-only behavior. Never throws.
+ */
+function processStartToken(pid: number): string {
+  if (process.platform !== 'linux') return '';
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf-8');
+    // comm (field 2) is parenthesized and may contain spaces/parens, so split
+    // after the final ')' to keep field indexing stable.
+    const close = stat.lastIndexOf(')');
+    if (close === -1) return '';
+    const rest = stat.slice(close + 2).trim().split(/\s+/);
+    // After comm, fields start at #3 (state). starttime is field 22, i.e.
+    // index (22 - 3) = 19 into `rest`.
+    const starttime = rest[19];
+    return starttime ?? '';
+  } catch {
+    return '';
+  }
+}
+
 function writeOwnerFile(dbPath: string): void {
   try {
-    writeFileSync(ownerFilePath(dbPath), String(process.pid), 'utf-8');
+    const token = processStartToken(process.pid);
+    writeFileSync(ownerFilePath(dbPath), `${process.pid}:${token}`, 'utf-8');
   } catch {
     // Best-effort
   }
@@ -140,9 +178,21 @@ function clearStaleLock(dbPath: string): void {
   const ownerFile = ownerFilePath(dbPath);
   if (existsSync(ownerFile)) {
     try {
-      const pid = parseInt(readFileSync(ownerFile, 'utf-8').trim(), 10);
+      // Owner record is `pid:startToken` (token may be empty on non-Linux or
+      // when unknown). Backward-compatible with a bare `pid` from older runs.
+      const raw = readFileSync(ownerFile, 'utf-8').trim();
+      const sep = raw.indexOf(':');
+      const pidStr = sep === -1 ? raw : raw.slice(0, sep);
+      const storedToken = sep === -1 ? '' : raw.slice(sep + 1);
+      const pid = parseInt(pidStr, 10);
+      // The owner is only considered ALIVE if the PID is alive AND either the
+      // stored token is empty (unknown — degrade to PID-only) or it matches
+      // the live process's current start token. A mismatch means the PID was
+      // recycled, so the recorded holder is gone and the lock is stale.
       if (!isNaN(pid) && isProcessAlive(pid)) {
-        return;
+        if (storedToken === '' || storedToken === processStartToken(pid)) {
+          return;
+        }
       }
     } catch {
       // Fall through to remove the lock

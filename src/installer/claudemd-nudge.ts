@@ -12,8 +12,8 @@
  * @module installer/claudemd-nudge
  */
 
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
-import { backupFile } from './settings-merge.js';
+import { existsSync, readFileSync } from 'node:fs';
+import { backupFile, writeFileAtomic } from './settings-merge.js';
 
 const RECALL_BLOCK = [
   '',
@@ -41,7 +41,7 @@ export function applyNudge(filePath: string): { changed: boolean; backup?: strin
 
   let backup: string | undefined;
   if (exists) backup = backupFile(filePath);
-  writeFileSync(filePath, next.endsWith(ending) ? next : next + ending);
+  writeFileAtomic(filePath, next.endsWith(ending) ? next : next + ending);
   return backup ? { changed: true, backup } : { changed: true };
 }
 
@@ -79,6 +79,6 @@ export function removeNudge(filePath: string): { changed: boolean; backup?: stri
   if (next.length > 0 && !next.endsWith(ending)) next += ending;
 
   const backup = backupFile(filePath);
-  writeFileSync(filePath, next);
+  writeFileAtomic(filePath, next);
   return { changed: true, backup };
 }

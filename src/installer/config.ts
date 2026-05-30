@@ -15,10 +15,11 @@
  * @module installer/config
  */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { existsSync, readFileSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { recallRoot } from '../paths.js';
 import { log } from '../log.js';
+import { writeFileAtomic } from './settings-merge.js';
 
 export interface EmbedderConfig {
   /** Resolved backend: 'gpu' = pass -ngl, 'cpu' = plain CPU embedding. */
@@ -67,7 +68,7 @@ export function writeEmbedderConfig(embedder: EmbedderConfig): RecallConfig {
   mkdirSync(dirname(p), { recursive: true });
   const existing = readConfig() ?? {};
   const merged: RecallConfig = { ...existing, embedder };
-  writeFileSync(p, JSON.stringify(merged, null, 2) + '\n', 'utf-8');
+  writeFileAtomic(p, JSON.stringify(merged, null, 2) + '\n');
   log({
     source: 'installer/config',
     level: 'info',

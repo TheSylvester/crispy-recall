@@ -25,6 +25,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { getDb } from '../db.js';
 import { dbPath } from '../paths.js';
+import { log } from '../log.js';
 import { ingestSessionMessages } from './message-ingest.js';
 
 interface WatermarkRow {
@@ -73,7 +74,22 @@ export async function mtimeScan(opts?: { vendors?: ('claude' | 'codex')[] }): Pr
       }
       const sessionId = sessionIdFromPath(file, vendor);
       try {
-        await ingestSessionMessages(sessionId, file, vendor);
+        // ingestSessionMessages signals load/parse and DB-insert failures via a
+        // returned `error` field (soft errors), not by throwing. Treat those as
+        // failures too — otherwise the watermark would advance past a file that
+        // never actually ingested, marking a corrupt transcript permanently
+        // clean (it would only be retried if its mtime/size later changed).
+        const ingestResult = await ingestSessionMessages(sessionId, file, vendor);
+        if (ingestResult.error) {
+          result.failed++;
+          log({
+            level: 'warn',
+            source: 'recall:mtime-scan',
+            summary: `Ingest failed, watermark not advanced: ${file}`,
+            data: { path: file, vendor, error: ingestResult.error },
+          });
+          continue;
+        }
         // Watermark advances ONLY after a successful ingest. On failure, the
         // next scan retries — advance-then-ingest would silently drop missed
         // turns on partial failure.

@@ -10,9 +10,32 @@
  * @module installer/settings-merge
  */
 
-import { existsSync, readFileSync, writeFileSync, copyFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, copyFileSync, renameSync, unlinkSync } from 'node:fs';
 
 const HOOK_ARRAYS = ['Stop', 'SubagentStop'] as const;
+
+/**
+ * Write `contents` to `path` atomically: write a sibling temp file on the same
+ * filesystem, then `renameSync` it into place (atomic on POSIX/Windows). A
+ * crash or ENOSPC mid-write corrupts only the temp file, never the target —
+ * critical for files like ~/.claude/settings.json that gate app startup. On
+ * any failure the temp file is best-effort removed. The caller keeps owning
+ * the `.bak` backup; this only changes the final write to be crash-safe.
+ */
+export function writeFileAtomic(path: string, contents: string): void {
+  const tmp = `${path}.tmp.${process.pid}`;
+  try {
+    writeFileSync(tmp, contents);
+    renameSync(tmp, path);
+  } catch (err) {
+    try {
+      if (existsSync(tmp)) unlinkSync(tmp);
+    } catch {
+      /* best-effort cleanup */
+    }
+    throw err;
+  }
+}
 
 interface HookCommand { type?: string; command?: string }
 interface HookEntry { matcher?: string; hooks?: HookCommand[] }
@@ -129,7 +152,7 @@ export function mergeStopHook(filePath: string, hookScriptPath: string): MergeRe
 
   let backup: string | undefined;
   if (exists) backup = backupFile(filePath);
-  writeFileSync(filePath, serialize(obj, raw));
+  writeFileAtomic(filePath, serialize(obj, raw));
   return backup ? { changed: true, backup } : { changed: true };
 }
 
@@ -163,6 +186,6 @@ export function removeStopHook(filePath: string): MergeResult {
 
   if (!changed) return { changed: false };
   const backup = backupFile(filePath);
-  writeFileSync(filePath, serialize(obj, raw));
+  writeFileAtomic(filePath, serialize(obj, raw));
   return { changed: true, backup };
 }
