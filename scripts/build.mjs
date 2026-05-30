@@ -60,4 +60,15 @@ try {
   console.warn(`Warning: failed to copy node-sqlite3-wasm runtime: ${err.message}`);
 }
 
+// Copy the recall SKILL.md template next to the bundle so the installer can
+// resolve it at runtime regardless of how the package is laid out on disk.
+try {
+  copyFileSync(
+    join(root, 'skill/SKILL.md.template'),
+    join(root, 'dist/SKILL.md.template'),
+  );
+} catch (err) {
+  console.warn(`Warning: failed to copy SKILL.md.template: ${err.message}`);
+}
+
 console.log('Built dist/recall.js, dist/stop-hook.js, dist/embed-pending.js');

@@ -5,7 +5,8 @@
   "license": "MIT",
   "author": "Sylvester Wong",
   "bin": {
-    "recall": "./dist/recall.js"
+    "recall": "./dist/recall.js",
+    "recall-stop-hook": "./dist/stop-hook.js"
   },
   "files": [
     "dist/",

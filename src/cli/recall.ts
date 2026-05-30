@@ -88,6 +88,9 @@ const FLAG_WITH_VALUE = new Set(['--limit', '--offset', '--since', '--until', '-
 const FLAG_BOOLEAN = new Set([
   '--raw', '--help', '-h', '--list', '--all', '--reverse', '--recent',
   '--no-catchup', '--auto-embed', '--detach',
+  // installer subcommand flags
+  '--yes', '--offline', '--json', '--purge', '--integrity',
+  '--fts', '--vectors', '--full', '--no-claudemd', '--no-backfill', '--auto-backfill',
 ]);
 
 const positional: string[] = [];
@@ -715,6 +718,59 @@ async function maybeRunT1() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Installer subcommands (install / uninstall / status / doctor / repair)
+// ---------------------------------------------------------------------------
+
+const INSTALLER_SUBCOMMANDS = new Set(['install', 'uninstall', 'status', 'doctor', 'repair']);
+
+async function runInstallerSubcommand(cmd: string): Promise<void> {
+  const json = hasFlag('--json');
+
+  if (cmd === 'install') {
+    const { runInstall } = await import('../installer/install.js');
+    const res = await runInstall({
+      yes: hasFlag('--yes'),
+      offline: hasFlag('--offline'),
+      noClaudemd: hasFlag('--no-claudemd'),
+      noBackfill: hasFlag('--no-backfill'),
+      autoBackfill: hasFlag('--auto-backfill'),
+      json,
+    });
+    if (json) console.log(JSON.stringify(res, null, 2));
+    process.exit(res.aborted ? 1 : 0);
+  }
+
+  if (cmd === 'uninstall') {
+    const { runUninstall } = await import('../installer/uninstall.js');
+    const res = runUninstall({ purge: hasFlag('--purge'), json });
+    if (json) console.log(JSON.stringify(res, null, 2));
+    else console.log(`recall uninstalled — removed ${res.removed.length} target(s)${res.purged ? ' (purged ~/.recall)' : ''}.`);
+    process.exit(0);
+  }
+
+  if (cmd === 'status') {
+    const { printStatus } = await import('../installer/status.js');
+    printStatus(json);
+    process.exit(0);
+  }
+
+  if (cmd === 'doctor') {
+    const { runDoctor } = await import('../installer/doctor.js');
+    const code = await runDoctor({ json, integrity: hasFlag('--integrity'), offline: hasFlag('--offline') });
+    process.exit(code);
+  }
+
+  if (cmd === 'repair') {
+    const { repairFts, repairVectors, repairFull } = await import('../installer/repair.js');
+    if (hasFlag('--fts')) { repairFts(); console.log('FTS5 index rebuilt.'); process.exit(0); }
+    if (hasFlag('--vectors')) { repairVectors(); console.log('Vectors cleared — they re-embed on the next sweep.'); process.exit(0); }
+    if (hasFlag('--full')) { await repairFull({ yes: hasFlag('--yes') }); process.exit(0); }
+    console.error('recall repair: specify --fts, --vectors, or --full');
+    process.exit(1);
+  }
+}
+
 async function main() {
   if (showHelp) {
     printHelp();
@@ -724,6 +780,12 @@ async function main() {
   // Backfill subcommand — skip T1 (it covers everything itself).
   if (positional[0] === 'backfill') {
     await runBackfill();
+    process.exit(0);
+  }
+
+  // Installer subcommands — skip T1 (they manage their own DB/lifecycle).
+  if (positional[0] && INSTALLER_SUBCOMMANDS.has(positional[0])) {
+    await runInstallerSubcommand(positional[0]);
     process.exit(0);
   }
 
