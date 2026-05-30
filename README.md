@@ -17,10 +17,12 @@ recall install
 
 `recall install` is the resident setup step. It scaffolds `~/.recall/` (the
 llama embedding binary, the model, and the SQLite DB), wires a Stop hook into
-Claude Code (and Codex, if detected) so your transcripts are indexed
-automatically as sessions end, and installs the `recall` skill. After that,
-recall runs passively — you only invoke `recall` directly for `status`,
-`doctor`, `repair`, or `uninstall`.
+Claude Code so your transcripts are indexed automatically as sessions end, and
+installs the `recall` skill. If Codex is detected it also gets the `recall`
+skill (so the agent can search), but not an automatic per-turn hook in v0.1.0 —
+index Codex history with `recall backfill --vendor codex`. After that, recall
+runs passively — you only invoke `recall` directly for `status`, `doctor`,
+`repair`, or `uninstall`.
 
 Run it in the environment where you actually use Claude Code: **WSL and
 Windows-native are separate installs.** If you use both, run the install in each
@@ -32,15 +34,18 @@ Windows-native are separate installs.** If you use both, run the install in each
 > installed skill's command contract have nothing to call. Use the global
 > install above.
 
-Prerequisites: Node ≥ 20 and Claude Code installed. Codex support is opt-in —
-detected automatically if `~/.codex/` exists.
+Prerequisites: Node ≥ 20 and Claude Code installed. If Codex is detected
+(`~/.codex/` exists), recall installs the `recall` skill into Codex (so the
+agent can search) and you can index your Codex history with
+`recall backfill --vendor codex`. Real-time per-turn Codex indexing is **not**
+in v0.1.0.
 
 ## What it does
 
 - A **Stop hook** ingests every turn into a local SQLite DB the moment a session ends — no daemon, no background polling.
 - The CLI **searches** your history two ways at once: FTS5 full-text and semantic vectors (Nomic Embed Text v1.5, run locally via llama.cpp).
 - A **`recall` skill** is dropped into Claude Code so the agent discovers and invokes it on its own — you rarely type `recall` yourself.
-- Works in **any project**, across both Claude Code and Codex.
+- Works in **any project**. Claude Code sessions are indexed automatically; Codex transcripts are searchable too via `recall backfill --vendor codex`.
 
 ## How an agent uses it
 

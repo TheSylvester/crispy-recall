@@ -236,14 +236,11 @@ function checkCodex(report: PreflightReport): void {
   const hooks = codexHooksPath();
   const agents = codexAgentsPath();
   const paths = { dir, hooks, agents };
-  let ok = true;
-  let status = 'ready';
-  if (existsSync(hooks) && !canWrite(hooks)) {
-    ok = false;
-    status = 'hooks-readonly';
-    report.warnings.push({ check: 'codex.hooks.writable', severity: 'WARN', message: `${hooks} not writable — Codex hook setup will be skipped.` });
-  }
-  report.codex = { ok, status, paths };
+  // v0.1.0 no longer installs a Codex Stop hook (Codex doesn't consume a
+  // Claude-shaped hooks.json) — only the recall skill + AGENTS.md nudge are
+  // written, and uninstall still cleans up any legacy hooks.json. So there is
+  // no hooks-writability precondition to check here.
+  report.codex = { ok: true, status: 'ready', paths };
 }
 
 function checkDisk(): { disk: string; issue?: PreflightIssue } {
@@ -268,11 +265,8 @@ function checkDisk(): { disk: string; issue?: PreflightIssue } {
 function checkNode(): { node: string; issue?: PreflightIssue } {
   const node = process.version;
   const major = parseInt(node.replace(/^v/, '').split('.')[0] ?? '0', 10);
-  if (major < 18) {
-    return { node, issue: { check: 'runtime.node', severity: 'FAIL', message: `Node ${node} < 18 is unsupported.`, remediation: 'Upgrade to Node ≥20.' } };
-  }
   if (major < 20) {
-    return { node, issue: { check: 'runtime.node', severity: 'WARN', message: `Node ${node} works but ≥20 is recommended.` } };
+    return { node, issue: { check: 'runtime.node', severity: 'FAIL', message: `Node ${node} < 20 is unsupported (package.json engines requires Node ≥20).`, remediation: 'Upgrade to Node ≥20.' } };
   }
   return { node };
 }

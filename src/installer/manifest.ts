@@ -62,13 +62,6 @@ export function buildManifest(report: PreflightReport): ManifestItem[] {
   // ---- MANDATORY (Codex, only if detected) ----
   if (report.codex) {
     items.push({
-      key: 'codex-hook',
-      label: 'Add the Stop hook to ~/.codex/hooks.json',
-      detail: 'Codex harness detected',
-      mandatory: true,
-      defaultSelected: true,
-    });
-    items.push({
       key: 'codex-skill',
       label: 'Install the recall skill into ~/.codex/skills/recall/',
       detail: 'Codex harness detected',

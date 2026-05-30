@@ -26,7 +26,7 @@ import { getDb } from '../db.js';
 import {
   runPreflight, preflightPassed, acquireInstallLock, releaseInstallLock,
   claudeRecallSkillPath, claudeSettingsPath, claudeMdPath,
-  codexHooksPath, codexAgentsPath, codexRecallSkillPath,
+  codexAgentsPath, codexRecallSkillPath,
   type PreflightReport,
 } from './preflight.js';
 import { buildManifest, renderManifest } from './manifest.js';
@@ -232,10 +232,6 @@ export async function runInstall(opts: InstallOptions = {}): Promise<InstallResu
     if (selected.has('stop-hook')) {
       const r = mergeStopHook(claudeSettingsPath(), hookScript);
       if (r.changed) filesWritten.push(claudeSettingsPath());
-    }
-    if (report.codex && selected.has('codex-hook')) {
-      const r = mergeStopHook(codexHooksPath(), hookScript);
-      if (r.changed) filesWritten.push(codexHooksPath());
     }
     if (report.codex && selected.has('codex-skill')) {
       if (writeSkill(codexRecallSkillPath(), templatePath, runnable)) filesWritten.push(codexRecallSkillPath());
