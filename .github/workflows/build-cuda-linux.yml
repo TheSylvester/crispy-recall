@@ -9,7 +9,7 @@
 # llama.cpp build the CPU binary came from — hence we pin the EXACT same tag the
 # installer uses (LLAMA_RELEASE_TAG = 'b5300' in src/recall/embedder.ts).
 #
-# OUTPUT: recall-libggml-cuda-linux-x64-b5300.tar.gz (contains libggml-cuda.so),
+# OUTPUT: recall-libggml-cuda-linux-x64-b5300.zip (contains libggml-cuda.so),
 # uploaded as a build artifact and, on a published release, attached to it.
 # The installer's Linux x64 'prebuilt' path fetches this asset (Day 7).
 

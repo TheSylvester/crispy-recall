@@ -12,11 +12,10 @@ Bundled-via-download artifacts (not npm packages):
   - SQLite (compiled into node-sqlite3-wasm) ............... Public Domain
   - libggml-cuda.so (built from llama.cpp @ b5300, GPU only)  MIT
 
-NOTE: regenerate this file at publish time (Day 7) after the final dependency
-set is installed — run:
+Regenerate after a production-dependency change with:
   npx license-checker-rseidelsohn --production --out THIRD-PARTY-LICENSES
 
-npm production dependencies (146 packages):
+npm production dependencies (transitive closure):
   @anthropic-ai/claude-agent-sdk-linux-x64-musl@0.2.114  —  Custom: LICENSE.md
   @anthropic-ai/claude-agent-sdk-linux-x64@0.2.114  —  Custom: LICENSE.md
   @anthropic-ai/claude-agent-sdk@0.2.114  —  Custom: README.md

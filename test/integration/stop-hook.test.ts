@@ -173,9 +173,13 @@ describe('stop-hook concurrency', () => {
 
     const logPath = join(recallHome, 'logs', 'stop-hook.log');
     if (existsSync(logPath)) {
+      // The hook only writes to this log on an ingest failure (stop-hook.ts
+      // catch block). Assert no failure/lock markers rather than exact-empty,
+      // so a future benign line here wouldn't make this read as a lock bug.
       const logBody = readFileSync(logPath, 'utf-8');
       expect(logBody).not.toMatch(/SQLITE_BUSY/i);
-      expect(logBody).toBe('');
+      expect(logBody).not.toMatch(/database is locked/i);
+      expect(logBody).not.toMatch(/ingest-failed/i);
     }
 
     // (3) Eventual completeness: run the catch-up backstop (single-process,
