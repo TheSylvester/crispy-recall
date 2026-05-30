@@ -213,6 +213,7 @@ export async function runInstall(opts: InstallOptions = {}): Promise<InstallResu
     gpu = await runGpuPhase({
       ...(opts.gpuDetect ? { detect: opts.gpuDetect } : {}),
       ...(opts.gpuProbe ? { probe: opts.gpuProbe } : {}),
+      ...(opts.offline ? { offline: true } : {}),
     });
     say(gpu.mode === 'gpu' ? `GPU acceleration enabled (${gpu.cudaAvailable})` : `using CPU embeddings${gpu.reason ? ` (${gpu.reason})` : ''}`);
 

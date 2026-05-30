@@ -59,16 +59,46 @@ describe('gpu-phase', () => {
     expect(readConfig()?.embedder.mode).toBe('cpu');
   });
 
-  it('Linux without a bin-cuda build → CPU, never fetches a (nonexistent) prebuilt', async () => {
+  it("Linux + GPU, no bin-cuda → 'prebuilt': stages our lib, then adopts on a good probe", async () => {
+    // Part B: a fresh CUDA box (no ~/.recall/bin-cuda/) now fetches the version-
+    // matched prebuilt instead of silently staying CPU. Stub the stager.
+    const res = await runGpuPhase({
+      platform: 'linux', arch: 'x64',
+      detect: async () => true,
+      stage: async () => { const d = binCudaDir(); mkdirSync(d, { recursive: true }); return d; },
+      probe: okProbe,
+    });
+    expect(res.cudaAvailable).toBe('prebuilt');
+    expect(res.mode).toBe('gpu');
+    expect(res.libDir).toContain('bin-cuda');
+    expect(readConfig()?.embedder.mode).toBe('gpu');
+  });
+
+  it("Linux 'prebuilt' staging unavailable (offline / download fails) → silent CPU, no probe", async () => {
     let probed = false;
     const res = await runGpuPhase({
       platform: 'linux', arch: 'x64',
-      detect: async () => true, // GPU detected …
+      detect: async () => true,
+      stage: async () => null, // could not fetch the asset
       probe: async () => { probed = true; return { cudaInit: true, vectorOk: true, stderr: '' }; },
     });
-    // … but no ~/.recall/bin-cuda/ → no usable CUDA libs → CPU, no probe/fetch.
+    expect(res.cudaAvailable).toBe('prebuilt');
     expect(res.mode).toBe('cpu');
-    expect(res.cudaAvailable).toBe('none');
+    expect(res.reason).toBeTruthy();
+    expect(probed).toBe(false); // never probes when staging failed
+    expect(readConfig()?.embedder.mode).toBe('cpu');
+  });
+
+  it("offline + GPU + no pre-staged lib → CPU via defaultStage (no network, no probe)", async () => {
+    let probed = false;
+    const res = await runGpuPhase({
+      platform: 'linux', arch: 'x64',
+      offline: true,
+      detect: async () => true,
+      // no stage stub → exercises defaultStage, which returns null offline-absent
+      probe: async () => { probed = true; return { cudaInit: true, vectorOk: true, stderr: '' }; },
+    });
+    expect(res.mode).toBe('cpu');
     expect(probed).toBe(false);
     expect(readConfig()?.embedder.mode).toBe('cpu');
   });

@@ -24,10 +24,12 @@
  */
 
 import { execFile } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { createWriteStream, existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
-import { platform as osPlatform, arch as osArch } from 'node:os';
+import { platform as osPlatform, arch as osArch, tmpdir } from 'node:os';
+import { get as httpsGet } from 'node:https';
+import extract from 'extract-zip';
 import { hasNvidiaGpu, getBinaryPath, getModelPath } from '../recall/embedder.js';
 import { binDir, recallRoot } from '../paths.js';
 import { writeEmbedderConfig, readConfig } from './config.js';
@@ -38,6 +40,17 @@ const execFileAsync = promisify(execFile);
 const EXPECTED_DIMS = 768;
 const OFFLOAD_TIMEOUT_MS = 15_000;
 const DEFAULT_NGL = 999;
+
+/**
+ * Our version-matched prebuilt Linux CUDA backend lib, built in CI
+ * (.github/workflows/build-cuda-linux.yml) from llama.cpp at the SAME tag as the
+ * CPU binary (b5300) so the ABI matches. `releases/latest/download` resolves
+ * once the first release carrying the asset is published (Day 7 publish — the
+ * URL repo must match the actual release repo).
+ */
+const CUDA_ASSET_NAME = 'recall-libggml-cuda-linux-x64-b5300.zip';
+const CUDA_ASSET_URL = `https://github.com/TheSylvester/crispy-recall/releases/latest/download/${CUDA_ASSET_NAME}`;
+const STAGE_DOWNLOAD_TIMEOUT_MS = 5 * 60 * 1000;
 
 export type CudaAvailability = 'prebuilt' | 'reuse-existing' | 'metal' | 'none';
 
@@ -65,6 +78,13 @@ export interface GpuProbeArgs {
   platform: NodeJS.Platform;
 }
 
+/** Args handed to the Linux 'prebuilt' staging step. */
+export interface StageArgs {
+  platform: NodeJS.Platform;
+  arch: string;
+  offline: boolean;
+}
+
 export interface GpuPhaseOptions {
   platform?: NodeJS.Platform;
   arch?: string;
@@ -72,6 +92,10 @@ export interface GpuPhaseOptions {
   detect?: () => Promise<boolean>;
   /** Injectable live-offload probe (defaults to a real llama-embedding run). */
   probe?: (args: GpuProbeArgs) => Promise<OffloadProbeResult>;
+  /** Injectable Linux 'prebuilt' staging (defaults to fetch + extract our CUDA asset). */
+  stage?: (args: StageArgs) => Promise<string | null>;
+  /** Offline: never hit the network during staging — only use pre-staged libs. */
+  offline?: boolean;
   binaryPath?: string;
   modelPath?: string;
 }
@@ -134,11 +158,17 @@ export async function detectGpu(opts: GpuPhaseOptions = {}): Promise<GpuInfo> {
     return { ...base, cudaAvailable: 'prebuilt', plannedMode: 'gpu' };
   }
   if (p === 'linux' && a === 'x64' && existsSync(binCudaDir())) {
-    // Reuse a previously-built CUDA stack; no prebuilt Linux artifact exists.
+    // Reuse a previously built/staged CUDA stack — the higher-priority shortcut.
     return { ...base, cudaAvailable: 'reuse-existing', plannedMode: 'gpu' };
   }
-  // Linux x64 without a bin-cuda build, or any other arch: no usable CUDA libs.
-  // Build-from-source is out of scope (see module header / §8).
+  if (p === 'linux' && a === 'x64') {
+    // No local build → fetch our version-matched prebuilt libggml-cuda.so
+    // (build-cuda-linux.yml). The live offload test still gates adoption; a
+    // missing asset / offline / failed offload silently falls back to CPU.
+    // (Build-from-source is still out of scope — this is a fetch, not a compile.)
+    return { ...base, cudaAvailable: 'prebuilt', plannedMode: 'gpu' };
+  }
+  // Any other arch (e.g. linux arm64): no usable CUDA libs.
   return { ...base, cudaAvailable: 'none', plannedMode: 'cpu' };
 }
 
@@ -232,11 +262,23 @@ export async function runGpuPhase(opts: GpuPhaseOptions = {}): Promise<GpuPhaseR
   }
 
   // Resolve the staged lib dir for the live test.
-  const libDir = info.cudaAvailable === 'reuse-existing'
-    ? binCudaDir()
-    : info.cudaAvailable === 'prebuilt'
-      ? binDir() // Windows: CUDA libs staged adjacent to the binary by ensureBinary
-      : null;
+  let libDir: string | null;
+  if (info.cudaAvailable === 'reuse-existing') {
+    libDir = binCudaDir();
+  } else if (info.cudaAvailable === 'prebuilt' && p === 'win32') {
+    // Windows: the prebuilt CUDA libs are staged adjacent to the binary by
+    // embedder.ensureBinary (cuda candidate first when a GPU is present).
+    libDir = binDir();
+  } else if (info.cudaAvailable === 'prebuilt') {
+    // Linux: fetch + extract our version-matched libggml-cuda.so before testing.
+    const stage = opts.stage ?? defaultStage;
+    libDir = await stage({ platform: p, arch: opts.arch ?? osArch(), offline: opts.offline ?? false });
+    if (!libDir) {
+      return persist('cpu', null, 'could not stage prebuilt CUDA libs (offline or download/extract failed)');
+    }
+  } else {
+    libDir = null;
+  }
 
   const probe = opts.probe ?? defaultProbe;
   const binaryPath = opts.binaryPath ?? getBinaryPath();
@@ -251,4 +293,52 @@ export async function runGpuPhase(opts: GpuPhaseOptions = {}): Promise<GpuPhaseR
   } catch (err) {
     return persist('cpu', null, `live offload test errored: ${(err as Error).message}`);
   }
+}
+
+/**
+ * Default Linux 'prebuilt' staging: ensure `libggml-cuda.so` is present in
+ * ~/.recall/bin-cuda/. Staging there means a future install's 'reuse-existing'
+ * shortcut picks it up. Returns the dir, or null on any failure / offline-absent.
+ *
+ * cudart/cublas are NOT fetched here — they are validated by the subsequent LIVE
+ * offload probe (a CUDA host normally has them system-wide). A host missing the
+ * CUDA runtime simply fails the probe and falls back to CPU, which is correct.
+ */
+async function defaultStage(args: StageArgs): Promise<string | null> {
+  const target = binCudaDir();
+  const libPath = join(target, 'libggml-cuda.so');
+  if (existsSync(libPath)) return target; // already staged (prior install or offline pre-stage)
+  if (args.offline) return null;          // offline + absent: no network, fall back to CPU
+
+  try {
+    mkdirSync(target, { recursive: true });
+    const zipPath = join(tmpdir(), CUDA_ASSET_NAME);
+    await downloadFile(CUDA_ASSET_URL, zipPath);
+    await extract(zipPath, { dir: target });
+    return existsSync(libPath) ? target : null;
+  } catch (err) {
+    log({ source: 'installer/gpu', level: 'info', summary: `prebuilt CUDA staging failed: ${(err as Error).message}` });
+    return null;
+  }
+}
+
+/** Minimal URL→file download, following redirects (GitHub release pattern). */
+function downloadFile(url: string, destPath: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const to = setTimeout(() => reject(new Error('download timeout')), STAGE_DOWNLOAD_TIMEOUT_MS);
+    const done = (err?: Error) => { clearTimeout(to); err ? reject(err) : resolve(); };
+    const pipeTo = (res: import('node:http').IncomingMessage) => {
+      const status = res.statusCode ?? 0;
+      if (status >= 300 && status < 400 && res.headers.location) {
+        httpsGet(res.headers.location, { headers: { 'User-Agent': 'recall' } }, pipeTo).on('error', done);
+        return;
+      }
+      if (status !== 200) { done(new Error(`HTTP ${status}`)); return; }
+      const file = createWriteStream(destPath);
+      res.pipe(file);
+      file.on('finish', () => file.close(() => done()));
+      file.on('error', done);
+    };
+    httpsGet(url, { headers: { 'User-Agent': 'recall' } }, pipeTo).on('error', done);
+  });
 }
