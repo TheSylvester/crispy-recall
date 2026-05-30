@@ -25,7 +25,10 @@ env:
   # binary's llama.cpp tag, bump this in the same commit or the ABI won't match.
   LLAMA_TAG: b5300
   CUDA_MAJOR_MINOR: "12.4"
-  ASSET: recall-libggml-cuda-linux-x64-b5300.tar.gz
+  # .zip (not .tar.gz): the installer stages it with extract-zip, already a dep —
+  # avoids adding a tar/gzip extractor to the runtime. Keep in sync with
+  # CUDA_ASSET_NAME in src/installer/gpu.ts.
+  ASSET: recall-libggml-cuda-linux-x64-b5300.zip
 
 jobs:
   build:
@@ -85,7 +88,7 @@ jobs:
           echo "Found: $LIB ($(du -h "$LIB" | cut -f1))"
           mkdir -p out
           cp "$LIB" out/
-          tar -czf "$ASSET" -C out libggml-cuda.so
+          ( cd out && zip -9 "../$ASSET" libggml-cuda.so )
           echo "Packaged $ASSET ($(du -h "$ASSET" | cut -f1))"
 
       - name: Upload build artifact
