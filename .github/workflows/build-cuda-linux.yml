@@ -51,8 +51,12 @@ jobs:
         id: cuda
         with:
           cuda: "12.4.1"
-          method: network
-          sub-packages: '["nvcc", "cudart", "cublas", "cublas-dev"]'
+          # 'local' installs the full toolkit (nvcc + cudart + cublas + headers)
+          # in one shot. The 'network' method blindly prefixes 'cuda-' to each
+          # sub-package, producing the nonexistent 'cuda-cublas-12-4'
+          # (NVIDIA ships these as 'libcublas-*'), which fails apt with exit 100.
+          method: local
+          linux-local-args: '["--toolkit"]'
 
       - name: Checkout llama.cpp @ ${{ env.LLAMA_TAG }}
         uses: actions/checkout@v4
