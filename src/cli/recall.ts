@@ -33,7 +33,7 @@ import {
   clearCancelFlag,
 } from '../recall/catchup.js';
 import { logsDir, runDir } from '../paths.js';
-import { mkdirSync, openSync, writeFileSync } from 'node:fs';
+import { mkdirSync, openSync, writeFileSync, readFileSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { join } from 'node:path';
 
@@ -68,6 +68,7 @@ function flagInt(name: string, fallback: number): number {
 
 const raw = hasFlag('--raw');
 const showHelp = hasFlag('--help') || hasFlag('-h');
+const showVersion = hasFlag('--version') || hasFlag('-v');
 const listMode = hasFlag('--list');
 const limit = flagInt('--limit', -1);   // -1 = use mode default
 const offset = flagInt('--offset', 0);
@@ -86,7 +87,7 @@ const effectiveProject = allProjects ? undefined : normalizePath(projectFlag ?? 
 // Collect positional args (skip flags and their values)
 const FLAG_WITH_VALUE = new Set(['--limit', '--offset', '--since', '--until', '--project', '--vendor']);
 const FLAG_BOOLEAN = new Set([
-  '--raw', '--help', '-h', '--list', '--all', '--reverse', '--recent',
+  '--raw', '--help', '-h', '--version', '-v', '--list', '--all', '--reverse', '--recent',
   '--no-catchup', '--auto-embed', '--detach',
   // installer subcommand flags
   '--yes', '--offline', '--json', '--purge', '--integrity',
@@ -104,6 +105,18 @@ for (let i = 0; i < argv.length; i++) {
 // ---------------------------------------------------------------------------
 // Help
 // ---------------------------------------------------------------------------
+
+/** Read the package version from the bundle's sibling package.json. */
+function getVersion(): string {
+  try {
+    const pkg = JSON.parse(
+      readFileSync(join(__dirname, '..', 'package.json'), 'utf8'),
+    ) as { version?: string };
+    return pkg.version ?? 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
 
 function printHelp() {
   console.log(`
@@ -134,6 +147,7 @@ FLAGS
   --list           List sessions mode
   --no-catchup     Skip the per-invocation mtime catch-up scan (T1)
   --help, -h       Show this help
+  --version, -v    Print the recall version
 
 BACKFILL FLAGS (with 'recall backfill')
   --auto-embed     Skip the interactive prompt for large embedding gaps
@@ -772,6 +786,11 @@ async function runInstallerSubcommand(cmd: string): Promise<void> {
 }
 
 async function main() {
+  if (showVersion) {
+    console.log(getVersion());
+    process.exit(0);
+  }
+
   if (showHelp) {
     printHelp();
     process.exit(0);
