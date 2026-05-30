@@ -1,0 +1,104 @@
+# Builds a version-matched libggml-cuda.so for Linux x64 so the installer can
+# offer GPU-accelerated embeddings without compiling on the user's machine.
+#
+# WHY THIS EXISTS: llama.cpp publishes a prebuilt CUDA archive for Windows but
+# NOT for Linux. The CPU `llama-embedding` binary the installer downloads
+# dlopen()s `libggml-cuda.so` at runtime when present, so "GPU support" on Linux
+# is just staging this one ~26 MB lib (+ cudart/cublas from NVIDIA redist, which
+# the installer fetches separately). The ABI of this lib MUST match the
+# llama.cpp build the CPU binary came from — hence we pin the EXACT same tag the
+# installer uses (LLAMA_RELEASE_TAG = 'b5300' in src/recall/embedder.ts).
+#
+# OUTPUT: recall-libggml-cuda-linux-x64-b5300.tar.gz (contains libggml-cuda.so),
+# uploaded as a build artifact and, on a published release, attached to it.
+# The installer's Linux x64 'prebuilt' path fetches this asset (Day 7).
+
+name: build-cuda-linux
+
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+env:
+  # MUST equal LLAMA_RELEASE_TAG in src/recall/embedder.ts. If you bump the CPU
+  # binary's llama.cpp tag, bump this in the same commit or the ABI won't match.
+  LLAMA_TAG: b5300
+  CUDA_MAJOR_MINOR: "12.4"
+  ASSET: recall-libggml-cuda-linux-x64-b5300.tar.gz
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Guard — LLAMA_TAG matches embedder.ts
+        uses: actions/checkout@v4
+      - name: Verify tag pin is in sync with the CPU binary
+        run: |
+          set -euo pipefail
+          PINNED=$(grep -oE "LLAMA_RELEASE_TAG\s*=\s*'[^']+'" src/recall/embedder.ts | grep -oE "b[0-9]+")
+          echo "embedder.ts pins: $PINNED ; workflow pins: $LLAMA_TAG"
+          if [ "$PINNED" != "$LLAMA_TAG" ]; then
+            echo "::error::libggml-cuda tag ($LLAMA_TAG) != embedder CPU-binary tag ($PINNED) — ABI mismatch risk. Sync them." >&2
+            exit 1
+          fi
+
+      - name: Install CUDA toolkit ${{ env.CUDA_MAJOR_MINOR }}
+        uses: Jimver/cuda-toolkit@v0.2.21
+        id: cuda
+        with:
+          cuda: "12.4.1"
+          method: network
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas-dev"]'
+
+      - name: Checkout llama.cpp @ ${{ env.LLAMA_TAG }}
+        uses: actions/checkout@v4
+        with:
+          repository: ggml-org/llama.cpp
+          ref: ${{ env.LLAMA_TAG }}
+          path: llama.cpp
+
+      - name: Configure (CUDA backend as a loadable shared lib)
+        run: |
+          set -euo pipefail
+          cmake -S llama.cpp -B llama.cpp/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_CUDA=ON \
+            -DGGML_BACKEND_DL=ON \
+            -DGGML_NATIVE=OFF \
+            -DBUILD_SHARED_LIBS=ON \
+            -DLLAMA_CURL=OFF \
+            -DCMAKE_CUDA_ARCHITECTURES="61;70;75;80;86;89"
+
+      - name: Build ggml-cuda
+        run: cmake --build llama.cpp/build --config Release --target ggml-cuda -j
+
+      - name: Collect libggml-cuda.so
+        run: |
+          set -euo pipefail
+          LIB=$(find llama.cpp/build -name 'libggml-cuda.so' -print -quit)
+          if [ -z "$LIB" ]; then
+            echo "::error::libggml-cuda.so not found in build output" >&2
+            find llama.cpp/build -name 'libggml*.so' || true
+            exit 1
+          fi
+          echo "Found: $LIB ($(du -h "$LIB" | cut -f1))"
+          mkdir -p out
+          cp "$LIB" out/
+          tar -czf "$ASSET" -C out libggml-cuda.so
+          echo "Packaged $ASSET ($(du -h "$ASSET" | cut -f1))"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ASSET }}
+          path: ${{ env.ASSET }}
+          if-no-files-found: error
+
+      # On a published release, attach the asset so the installer's Linux
+      # 'prebuilt' fetch (Day 7) has a stable download URL.
+      - name: Attach to release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ASSET }}
