@@ -22,7 +22,9 @@ const sharedOpts = {
   format: 'cjs',
   platform: 'node',
   target: 'node20',
-  sourcemap: true,
+  // No source maps in the published bundles — they add ~2.6 MB of dead weight
+  // to the tarball and the CLI ships readable CJS.
+  sourcemap: false,
   banner: { js: '#!/usr/bin/env node' },
   external: [],
   loader: { '.md': 'text' },

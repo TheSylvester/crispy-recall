@@ -26,7 +26,6 @@
   },
   "files": [
     "dist/",
-    "skill/",
     "README.md",
     "LICENSE",
     "THIRD-PARTY-LICENSES"
