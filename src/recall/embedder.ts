@@ -36,8 +36,34 @@ import { promisify } from 'node:util';
 import extract from 'extract-zip';
 import { log } from '../log.js';
 import { modelsDir, binDir, runDir } from '../paths.js';
+import { readEmbedderConfig } from '../installer/config.js';
 
 const execFileAsync = promisify(execFile);
+
+// ---------------------------------------------------------------------------
+// GPU offload (Day 5) — driven by ~/.recall/config.json (config.ts)
+// ---------------------------------------------------------------------------
+
+/** Resolved GPU runtime: { ngl, libDir } when config.embedder.mode==='gpu', else null. */
+let _gpuRuntime: { ngl: number; libDir: string | null } | null | undefined;
+
+/** Read the persisted embedder backend once. config.json is the single source
+ *  of truth — there is no env override (see installer/config.ts). */
+function gpuRuntime(): { ngl: number; libDir: string | null } | null {
+  if (_gpuRuntime === undefined) {
+    const cfg = readEmbedderConfig();
+    _gpuRuntime = cfg.mode === 'gpu'
+      ? { ngl: cfg.ngl > 0 ? cfg.ngl : 999, libDir: cfg.libDir }
+      : null;
+  }
+  return _gpuRuntime;
+}
+
+/** Prepend a staged GPU lib dir to an existing dynamic-library search path. */
+function withGpuLibDir(libDir: string, sep: string): string {
+  const gpu = gpuRuntime();
+  return gpu?.libDir ? `${gpu.libDir}${sep}${libDir}` : libDir;
+}
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -166,8 +192,10 @@ function getServerBinaryPath(): string {
   return join(binDir(), SERVER_BIN_NAME);
 }
 
-/** Detect NVIDIA GPU by checking if nvidia-smi exits successfully. */
-async function hasNvidiaGpu(): Promise<boolean> {
+/** Detect NVIDIA GPU by checking if nvidia-smi exits successfully.
+ *  Exported so the installer's pre-flight/GPU phase reuses the same probe
+ *  (bounded by the 5s execFile timeout). */
+export async function hasNvidiaGpu(): Promise<boolean> {
   try {
     await execFileAsync('nvidia-smi', [], { timeout: 5000, windowsHide: true });
     return true;
@@ -701,6 +729,11 @@ async function startServer(): Promise<string> {
   const libDir = join(serverBin, '..');
   const envKey = platform() === 'darwin' ? 'DYLD_LIBRARY_PATH' : 'LD_LIBRARY_PATH';
 
+  // GPU offload: when config.embedder.mode==='gpu', offload all layers and
+  // prepend the staged CUDA lib dir so llama-server dlopens libggml-cuda.so.
+  const gpu = gpuRuntime();
+  const nglArgs = gpu ? ['-ngl', String(gpu.ngl)] : [];
+
   const child = spawn(serverBin, [
     '-m', modelPath,
     '--embeddings',
@@ -716,11 +749,12 @@ async function startServer(): Promise<string> {
     '--rope-freq-scale', '0.75',
     '--parallel', '1',
     '--log-disable',
+    ...nglArgs,
   ], {
     stdio: 'ignore',
     detached: false,
     windowsHide: true,
-    env: { ...process.env, [envKey]: libDir },
+    env: { ...process.env, [envKey]: withGpuLibDir(libDir, ':') },
   });
 
   // Guard: only clear state if this child is still the active server —
@@ -974,6 +1008,10 @@ async function embedViaProcess(texts: string[], modelPath: string): Promise<Floa
       '--rope-freq-scale', '0.75',
     ];
 
+    // GPU offload (one-shot path): mirror the server path's -ngl pass-through.
+    const gpu = gpuRuntime();
+    if (gpu) args.push('-ngl', String(gpu.ngl));
+
     // Always set separator — without it, llama-embedding splits on newlines
     // by default, causing multi-line texts to produce extra vectors.
     args.push('--embd-separator', BATCH_SEPARATOR);
@@ -993,10 +1031,10 @@ async function embedViaProcess(texts: string[], modelPath: string): Promise<Floa
                  : 'LD_LIBRARY_PATH';
     const env = { ...process.env };
     if (platform() === 'win32') {
-      // On Windows, prepend to PATH for DLL search
-      env.PATH = `${libDir};${process.env.PATH || ''}`;
+      // On Windows, prepend to PATH for DLL search (CUDA DLLs staged in binDir).
+      env.PATH = withGpuLibDir(`${libDir};${process.env.PATH || ''}`, ';');
     } else {
-      env[envKey] = libDir;
+      env[envKey] = withGpuLibDir(libDir, ':');
     }
     const { stdout, stderr } = await execFileAsync(binaryPath, args, {
       maxBuffer: 2 * 1024 * 1024,
