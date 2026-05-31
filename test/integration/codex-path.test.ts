@@ -79,6 +79,32 @@ describe('codex JSONL adapter', () => {
     // developer message must NOT appear anywhere
     expect(entries.some((e) => textOf(e).includes('internal system reminder'))).toBe(false);
   });
+
+  // Regression: a function_call_output whose `output` is an ARRAY of content
+  // items (image/tool results, e.g. screenshots) must NOT crash the adapter.
+  // The declared `output: string` type is a lie at runtime for these; calling
+  // .match()/JSON.parse() on the array threw `output.match is not a function`,
+  // aborting the whole session ingest and pinning the watermark forever.
+  it('handles array-valued function_call_output (image result) without throwing', () => {
+    const envelopes: Array<Record<string, unknown>> = [
+      { timestamp: '2026-04-17T14:02:52.000Z', type: 'session_meta', payload: { id: SID, cwd: '/home/u/proj', cli_version: '0.92.0' } },
+      { timestamp: '2026-04-17T14:02:53.000Z', type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'screenshot the page' }] } },
+      { timestamp: '2026-04-17T14:02:54.000Z', type: 'response_item', payload: { type: 'function_call', call_id: 'call_img', name: 'browser_screenshot', arguments: '{}' } },
+      // output is an ARRAY, not a string — the crash trigger:
+      { timestamp: '2026-04-17T14:02:55.000Z', type: 'response_item', payload: { type: 'function_call_output', call_id: 'call_img', output: [{ type: 'input_image', image_url: 'data:image/png;base64,iVBORw0KGgo=' }] } },
+      { timestamp: '2026-04-17T14:02:56.000Z', type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Here is the screenshot.' }] } },
+    ];
+
+    let entries: any[] = [];
+    expect(() => { entries = adaptCodexJsonlRecords(envelopes as any, SID) as any[]; }).not.toThrow();
+
+    // The session still ingests: user + assistant text survive.
+    expect(entries.some((e) => textOf(e).includes('screenshot the page'))).toBe(true);
+    expect(entries.some((e) => textOf(e).includes('Here is the screenshot'))).toBe(true);
+    // The image tool result maps to an empty (non-crashing) body.
+    const result = entries.find((e) => e.type === 'result' && e.uuid === 'call_img-result');
+    expect(result).toBeDefined();
+  });
 });
 
 describe('codex vendor detection (stop-hook path classification)', () => {

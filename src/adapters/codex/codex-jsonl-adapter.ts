@@ -319,8 +319,7 @@ function emitFunctionCall(
   const outputRecord = outputIndex.get(callId);
   if (outputRecord) {
     const outputPayload = outputRecord.payload;
-    const rawOutput = outputPayload.output as string;
-    const { exitCode, body } = parseExecOutputHeader(rawOutput);
+    const { exitCode, body } = parseExecOutputHeader(outputPayload.output);
     const isError = exitCode !== 0;
 
     const toolResult: ToolResultBlock = {
@@ -521,7 +520,7 @@ function buildCustomToolResult(
   outputRecord: CodexJsonlEnvelope,
   base: BaseFields,
 ): TranscriptEntry {
-  const rawOutput = outputRecord.payload.output as string;
+  const rawOutput = coerceOutputText(outputRecord.payload.output);
 
   let content: string;
   let isError = false;
@@ -636,7 +635,7 @@ function emitOrphanedOutput(
   // If still in the index, it hasn't been consumed by a call — it's orphaned
   if (!outputIndex.has(callId)) return [];
 
-  const rawOutput = payload.output as string;
+  const rawOutput = coerceOutputText(payload.output);
   let content: string;
   let isError = false;
 
@@ -849,10 +848,36 @@ function mapFunctionCall(
  *
  * @returns { exitCode, body } where body is the output after the header
  */
-function parseExecOutputHeader(output: string): {
+/**
+ * Codex `function_call_output.output` is USUALLY a string, but image/tool
+ * results arrive as an array of content items (e.g.
+ * `[{ type: 'input_image', image_url: 'data:image/png;base64,...' }]`). The
+ * declared `output: string` type is a lie at runtime for those, and calling
+ * `.match()` / `JSON.parse()` on the array throws `output.match is not a
+ * function`, aborting the whole session ingest and never advancing the
+ * watermark. Coerce to a string: strings pass through, an array maps to its
+ * text parts (usually none for images → ''), anything else → ''.
+ */
+function coerceOutputText(output: unknown): string {
+  if (typeof output === 'string') return output;
+  if (Array.isArray(output)) {
+    return output
+      .map((item) =>
+        item && typeof item === 'object' && typeof (item as { text?: unknown }).text === 'string'
+          ? (item as { text: string }).text
+          : '',
+      )
+      .filter(Boolean)
+      .join('\n');
+  }
+  return '';
+}
+
+function parseExecOutputHeader(rawOutput: unknown): {
   exitCode: number;
   body: string;
 } {
+  const output = coerceOutputText(rawOutput);
   if (!output) return { exitCode: 0, body: '' };
 
   // Current format: "Process exited with code <int>"
