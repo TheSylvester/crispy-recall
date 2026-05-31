@@ -20,6 +20,13 @@ on:
   release:
     types: [published]
 
+# The "Attach to release" step (softprops/action-gh-release) updates the release
+# via the REST API, which needs write access to repo contents. Without this the
+# default GITHUB_TOKEN is read-only and the attach fails with
+# "Resource not accessible by integration" (the build itself still succeeds).
+permissions:
+  contents: write
+
 env:
   # MUST equal LLAMA_RELEASE_TAG in src/recall/embedder.ts. If you bump the CPU
   # binary's llama.cpp tag, bump this in the same commit or the ABI won't match.
