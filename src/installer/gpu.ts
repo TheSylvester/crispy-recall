@@ -11,7 +11,7 @@
  * Platform policy (Day 5):
  *   - Windows x64 + NVIDIA → prebuilt CUDA artifact (already fetched adjacent to
  *     the binary by embedder.ensureBinary when a GPU is present); live-test.
- *   - Linux x64 + NVIDIA → reuse an existing ~/.recall/bin-cuda/ build if present
+ *   - Linux x64 + NVIDIA → reuse an existing ~/.recall/bin/libggml-cuda.so if present
  *     (live-test); otherwise CPU. NEVER build from source, NEVER claim a
  *     nonexistent llama.cpp Linux CUDA prebuilt. (§8 prebuilt fetch is deferred.)
  *   - macOS arm64 → Metal is in the standard build; adopt GPU, no extra libs,
@@ -31,7 +31,7 @@ import { platform as osPlatform, arch as osArch, tmpdir } from 'node:os';
 import { get as httpsGet } from 'node:https';
 import extract from 'extract-zip';
 import { hasNvidiaGpu, getBinaryPath, getModelPath } from '../recall/embedder.js';
-import { binDir, recallRoot } from '../paths.js';
+import { binDir } from '../paths.js';
 import { writeEmbedderConfig, readConfig } from './config.js';
 import { log } from '../log.js';
 
@@ -141,9 +141,17 @@ export interface GpuPhaseResult {
   reason?: string;
 }
 
-/** Directory where a pre-built Linux CUDA stack may already live for reuse. */
-export function binCudaDir(): string {
-  return join(recallRoot(), 'bin-cuda');
+/**
+ * Path to the staged CUDA backend lib. It MUST sit next to the executable and
+ * the other libggml-*.so files (i.e. in bin/), because llama.cpp's
+ * GGML_BACKEND_DL loader discovers backends by scanning the binary's own
+ * directory — it does NOT consult LD_LIBRARY_PATH for backend discovery.
+ * Staging it in a separate dir leaves the CUDA backend unloaded and silently
+ * falls back to CPU (while still printing "offloaded N/N layers to GPU").
+ * This matches the Windows path, which already co-locates its CUDA libs in bin/.
+ */
+export function cudaBackendLib(): string {
+  return join(binDir(), 'libggml-cuda.so');
 }
 
 /** Best-effort VRAM read via nvidia-smi. Returns undefined on any failure. */
@@ -190,8 +198,8 @@ export async function detectGpu(opts: GpuPhaseOptions = {}): Promise<GpuInfo> {
     // it (cuda candidate first) when a GPU is present, staging the libs adjacent.
     return { ...base, cudaAvailable: 'prebuilt', plannedMode: 'gpu' };
   }
-  if (p === 'linux' && a === 'x64' && existsSync(binCudaDir())) {
-    // Reuse a previously built/staged CUDA stack — the higher-priority shortcut.
+  if (p === 'linux' && a === 'x64' && existsSync(cudaBackendLib())) {
+    // Reuse a previously staged CUDA backend lib — the higher-priority shortcut.
     return { ...base, cudaAvailable: 'reuse-existing', plannedMode: 'gpu' };
   }
   if (p === 'linux' && a === 'x64') {
@@ -206,20 +214,23 @@ export async function detectGpu(opts: GpuPhaseOptions = {}): Promise<GpuInfo> {
 }
 
 /**
- * Decide whether a probe's stderr proves the CUDA backend actually offloaded.
- * llama.cpp signals this two different ways depending on the build:
- *   - static / older builds print "ggml_cuda_init: found N CUDA devices"
- *   - GGML_BACKEND_DL builds (our Linux prebuilt asset from build-cuda-linux.yml)
- *     load CUDA as a dynamic backend and print ONLY "offloaded N/M layers to GPU"
- *     — no ggml_cuda_init line. Checking only for ggml_cuda_init makes the
- *     installer fall back to CPU on a host whose GPU works perfectly.
- * Accept either signal, but require ≥1 layer actually offloaded (a literal
- * "offloaded 0/N layers to GPU" means everything stayed on the CPU).
+ * Decide whether a probe's stderr proves the CUDA backend actually loaded and
+ * ran on the GPU. The ONLY reliable signals are ones the CUDA backend itself
+ * emits when it initializes a device and allocates device buffers:
+ *   - "ggml_cuda_init: found N CUDA devices"
+ *   - "load_backend: loaded CUDA backend from .../libggml-cuda.so"
+ *   - "using device CUDA0 (...)"
+ *   - "CUDA0 {model,compute,KV} buffer size = ..."
+ *
+ * The "offloaded N/N layers to GPU" line is NOT reliable: llama.cpp prints it
+ * from the requested -ngl even when the CUDA backend failed to load and every
+ * tensor silently stayed on the CPU (the buffers then show as "CPU_Mapped" /
+ * "CPU compute buffer"). Keying on it caused the installer to adopt GPU and
+ * persist mode=gpu while embedding actually ran on the CPU — slow enough to look
+ * like a stalled backfill. Require a real device/backend marker instead.
  */
 export function stderrIndicatesOffload(stderr: string): boolean {
-  if (/ggml_cuda_init/.test(stderr)) return true;
-  const m = /offloaded\s+(\d+)\s*\/\s*\d+\s+layers?\s+to\s+GPU/i.exec(stderr);
-  return m ? Number(m[1]) > 0 : false;
+  return /ggml_cuda_init|found\s+\d+\s+CUDA\s+devices|loaded CUDA backend|using device CUDA|CUDA0[^\n]*buffer/i.test(stderr);
 }
 
 /** Real LIVE offload probe: run llama-embedding once with -ngl, capture stderr. */
@@ -301,7 +312,7 @@ export async function runGpuPhase(opts: GpuPhaseOptions = {}): Promise<GpuPhaseR
   // No usable GPU path: short-circuit to CPU, never stage, never probe.
   if (info.plannedMode === 'cpu') {
     const reason = info.detected && info.vendor === 'nvidia'
-      ? 'NVIDIA GPU detected but no usable CUDA libs (no prebuilt for this platform; no ~/.recall/bin-cuda/ build present)'
+      ? 'NVIDIA GPU detected but no usable CUDA libs (no prebuilt for this platform; no ~/.recall/bin/libggml-cuda.so present)'
       : undefined;
     return persist('cpu', null, reason);
   }
@@ -314,7 +325,7 @@ export async function runGpuPhase(opts: GpuPhaseOptions = {}): Promise<GpuPhaseR
   // Resolve the staged lib dir for the live test.
   let libDir: string | null;
   if (info.cudaAvailable === 'reuse-existing') {
-    libDir = binCudaDir();
+    libDir = binDir();
   } else if (info.cudaAvailable === 'prebuilt' && p === 'win32') {
     // Windows: the prebuilt CUDA libs are staged adjacent to the binary by
     // embedder.ensureBinary (cuda candidate first when a GPU is present).
@@ -361,16 +372,18 @@ export async function runGpuPhase(opts: GpuPhaseOptions = {}): Promise<GpuPhaseR
 
 /**
  * Default Linux 'prebuilt' staging: ensure `libggml-cuda.so` is present in
- * ~/.recall/bin-cuda/. Staging there means a future install's 'reuse-existing'
- * shortcut picks it up. Returns the dir, or null on any failure / offline-absent.
+ * ~/.recall/bin/ — next to the executable + other libggml-*.so, where the
+ * backend loader can find it (see cudaBackendLib). Staging there means a future
+ * install's 'reuse-existing' shortcut picks it up. Returns the bin dir, or null
+ * on any failure / offline-absent.
  *
  * cudart/cublas are NOT fetched here — they are validated by the subsequent LIVE
  * offload probe (a CUDA host normally has them system-wide). A host missing the
  * CUDA runtime simply fails the probe and falls back to CPU, which is correct.
  */
 async function defaultStage(args: StageArgs): Promise<string | null> {
-  const target = binCudaDir();
-  const libPath = join(target, 'libggml-cuda.so');
+  const target = binDir();
+  const libPath = cudaBackendLib();
   if (existsSync(libPath)) return target; // already staged (prior install or offline pre-stage)
   if (args.offline) return null;          // offline + absent: no network, fall back to CPU
 

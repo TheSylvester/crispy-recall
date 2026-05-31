@@ -5,12 +5,20 @@
  * the phase is deterministic and never touches a real GPU or binary.
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, mkdirSync, rmSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync } from 'node:fs';
+import { dirname } from 'node:path';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { _setTestRoot } from '../../src/paths.js';
-import { runGpuPhase, binCudaDir, stderrIndicatesOffload } from '../../src/installer/gpu.js';
+import { runGpuPhase, cudaBackendLib, stderrIndicatesOffload } from '../../src/installer/gpu.js';
 import { readConfig } from '../../src/installer/config.js';
+
+/** Create a fake staged CUDA backend lib at bin/libggml-cuda.so. */
+function stageFakeCudaLib(): void {
+  const lib = cudaBackendLib();
+  mkdirSync(dirname(lib), { recursive: true });
+  writeFileSync(lib, 'fake');
+}
 
 let root: string;
 let restore: () => void;
@@ -40,37 +48,40 @@ describe('gpu-phase', () => {
     expect(readConfig()?.embedder.mode).toBe('cpu');
   });
 
-  it('GPU present + offload succeeds → GPU, reuses existing ~/.recall/bin-cuda/', async () => {
-    mkdirSync(binCudaDir(), { recursive: true }); // pre-built CUDA stack present
+  it('GPU present + offload succeeds → GPU, reuses existing bin/libggml-cuda.so', async () => {
+    stageFakeCudaLib(); // pre-staged CUDA backend lib present
     const res = await runGpuPhase({ platform: 'linux', arch: 'x64', detect: async () => true, probe: okProbe });
     expect(res.mode).toBe('gpu');
     expect(res.cudaAvailable).toBe('reuse-existing');
-    expect(res.libDir).toContain('bin-cuda');
+    // libDir is bin/ — the backend lib must sit beside the executable, not in a
+    // separate dir the GGML_BACKEND_DL loader never scans.
+    expect(res.libDir?.endsWith('bin')).toBe(true);
     const cfg = readConfig()!;
     expect(cfg.embedder.mode).toBe('gpu');
-    expect(cfg.embedder.libDir).toContain('bin-cuda');
+    expect(cfg.embedder.libDir?.endsWith('bin')).toBe(true);
   });
 
   it('GPU present + offload fails → silently falls back to CPU (no throw)', async () => {
-    mkdirSync(binCudaDir(), { recursive: true });
+    stageFakeCudaLib();
     const res = await runGpuPhase({ platform: 'linux', arch: 'x64', detect: async () => true, probe: failProbe });
     expect(res.mode).toBe('cpu');
     expect(res.reason).toBeTruthy();
     expect(readConfig()?.embedder.mode).toBe('cpu');
   });
 
-  it("Linux + GPU, no bin-cuda → 'prebuilt': stages our lib, then adopts on a good probe", async () => {
-    // Part B: a fresh CUDA box (no ~/.recall/bin-cuda/) now fetches the version-
-    // matched prebuilt instead of silently staying CPU. Stub the stager.
+  it("Linux + GPU, no staged lib → 'prebuilt': stages our lib into bin/, then adopts on a good probe", async () => {
+    // A fresh CUDA box (no bin/libggml-cuda.so) fetches the version-matched
+    // prebuilt instead of silently staying CPU. Stub the stager to drop the lib
+    // beside the executable, as defaultStage now does.
     const res = await runGpuPhase({
       platform: 'linux', arch: 'x64',
       detect: async () => true,
-      stage: async () => { const d = binCudaDir(); mkdirSync(d, { recursive: true }); return d; },
+      stage: async () => { stageFakeCudaLib(); return dirname(cudaBackendLib()); },
       probe: okProbe,
     });
     expect(res.cudaAvailable).toBe('prebuilt');
     expect(res.mode).toBe('gpu');
-    expect(res.libDir).toContain('bin-cuda');
+    expect(res.libDir?.endsWith('bin')).toBe(true);
     expect(readConfig()?.embedder.mode).toBe('gpu');
   });
 
@@ -93,20 +104,21 @@ describe('gpu-phase', () => {
     expect(readConfig()?.embedder.mode).toBe('cpu');
   });
 
-  // Regression: the live probe must recognise GPU offload for BOTH llama.cpp
-  // build flavors. The prebuilt Linux asset (GGML_BACKEND_DL) prints only
-  // "offloaded N/N layers to GPU" with no ggml_cuda_init line — checking only
-  // for ggml_cuda_init made every Linux/WSL auto-fetch install fall back to CPU
-  // despite a working GPU (verified against the real published v0.1.0 asset).
+  // Regression: only a REAL CUDA device/backend marker counts. The bare
+  // "offloaded N/N layers to GPU" line prints from the requested -ngl even when
+  // the CUDA backend never loaded (lib not beside the executable → CPU
+  // fallback), so it must NOT be accepted. A prior fix keyed on it and adopted
+  // GPU while embedding silently ran on CPU.
   describe('stderrIndicatesOffload', () => {
-    it('detects the GGML_BACKEND_DL form (offloaded N/N layers to GPU, no ggml_cuda_init)', () => {
+    it('accepts a real CUDA backend load (GGML_BACKEND_DL, lib found in bin/)', () => {
       const stderr = [
-        'load_tensors: offloading 12 repeating layers to GPU',
-        'load_tensors: offloading output layer to GPU',
+        'ggml_cuda_init: found 1 CUDA devices:',
+        'load_backend: loaded CUDA backend from /home/u/.recall/bin/libggml-cuda.so',
+        'llama_model_load_from_file_impl: using device CUDA0 (NVIDIA GeForce RTX 2060) - 5105 MiB free',
         'load_tensors: offloaded 13/13 layers to GPU',
-        'load_tensors:   CPU_Mapped model buffer size =   138.65 MiB',
+        'load_tensors:        CUDA0 model buffer size =   114.91 MiB',
+        'llama_context:      CUDA0 compute buffer size =  3776.00 MiB',
       ].join('\n');
-      expect(/ggml_cuda_init/.test(stderr)).toBe(false); // the string the old check required is absent
       expect(stderrIndicatesOffload(stderr)).toBe(true);
     });
 
@@ -114,12 +126,22 @@ describe('gpu-phase', () => {
       expect(stderrIndicatesOffload('ggml_cuda_init: found 1 CUDA devices')).toBe(true);
     });
 
-    it('rejects a CPU-only run (no offload lines)', () => {
-      expect(stderrIndicatesOffload('load_tensors: CPU_Mapped model buffer size = 138.65 MiB')).toBe(false);
+    it('REJECTS the CPU-fallback that still prints "offloaded N/N layers to GPU"', () => {
+      // This is exactly what a CPU run looks like when the CUDA backend lib was
+      // not discoverable: the offload line is present, but the buffers are CPU
+      // and there is no ggml_cuda_init / CUDA0 marker. Must be treated as CPU.
+      const stderr = [
+        'load_tensors: offloading 12 repeating layers to GPU',
+        'load_tensors: offloaded 13/13 layers to GPU',
+        'load_tensors:   CPU_Mapped model buffer size =   138.65 MiB',
+        'llama_context:        CPU compute buffer size =  3752.06 MiB',
+      ].join('\n');
+      expect(/ggml_cuda_init/.test(stderr)).toBe(false);
+      expect(stderrIndicatesOffload(stderr)).toBe(false);
     });
 
-    it('rejects "offloaded 0/N layers to GPU" (nothing actually offloaded)', () => {
-      expect(stderrIndicatesOffload('load_tensors: offloaded 0/13 layers to GPU')).toBe(false);
+    it('rejects a CPU-only run (no offload lines)', () => {
+      expect(stderrIndicatesOffload('load_tensors: CPU_Mapped model buffer size = 138.65 MiB')).toBe(false);
     });
   });
 
