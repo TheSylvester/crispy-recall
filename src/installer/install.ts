@@ -18,6 +18,7 @@ import {
 } from '@clack/prompts';
 import {
   existsSync, readFileSync, writeFileSync, copyFileSync, mkdirSync, openSync,
+  realpathSync,
 } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { dirname, join } from 'node:path';
@@ -67,10 +68,21 @@ export interface InstallResult {
 // Path / template resolution
 // ---------------------------------------------------------------------------
 
-function defaultDistDir(): string {
+export function defaultDistDir(): string {
   // When run as `node dist/recall.js install`, argv[1] is the bundle path.
+  // Under a global npm install `recall` is a symlink (bin/recall →
+  // ../lib/node_modules/crispy-recall/dist/recall.js), so argv[1] is the
+  // symlink in bin/, not the dist dir. Resolve it to realpath before taking
+  // the dirname, or staging the bundles into ~/.recall/bin/ silently no-ops
+  // and the wired Stop hook points at a missing stop-hook.js.
   const argv1 = process.argv[1];
-  if (argv1) return dirname(argv1);
+  if (argv1) {
+    try {
+      return dirname(realpathSync(argv1));
+    } catch {
+      return dirname(argv1);
+    }
+  }
   return __dirname;
 }
 
