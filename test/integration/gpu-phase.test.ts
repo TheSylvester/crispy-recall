@@ -9,7 +9,7 @@ import { mkdtempSync, mkdirSync, rmSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { _setTestRoot } from '../../src/paths.js';
-import { runGpuPhase, binCudaDir } from '../../src/installer/gpu.js';
+import { runGpuPhase, binCudaDir, stderrIndicatesOffload } from '../../src/installer/gpu.js';
 import { readConfig } from '../../src/installer/config.js';
 
 let root: string;
@@ -91,6 +91,36 @@ describe('gpu-phase', () => {
     expect(res.reason).toMatch(/libcudart|libcublas|CUDA runtime/i);
     expect(probed).toBe(false); // never probes when staging failed
     expect(readConfig()?.embedder.mode).toBe('cpu');
+  });
+
+  // Regression: the live probe must recognise GPU offload for BOTH llama.cpp
+  // build flavors. The prebuilt Linux asset (GGML_BACKEND_DL) prints only
+  // "offloaded N/N layers to GPU" with no ggml_cuda_init line — checking only
+  // for ggml_cuda_init made every Linux/WSL auto-fetch install fall back to CPU
+  // despite a working GPU (verified against the real published v0.1.0 asset).
+  describe('stderrIndicatesOffload', () => {
+    it('detects the GGML_BACKEND_DL form (offloaded N/N layers to GPU, no ggml_cuda_init)', () => {
+      const stderr = [
+        'load_tensors: offloading 12 repeating layers to GPU',
+        'load_tensors: offloading output layer to GPU',
+        'load_tensors: offloaded 13/13 layers to GPU',
+        'load_tensors:   CPU_Mapped model buffer size =   138.65 MiB',
+      ].join('\n');
+      expect(/ggml_cuda_init/.test(stderr)).toBe(false); // the string the old check required is absent
+      expect(stderrIndicatesOffload(stderr)).toBe(true);
+    });
+
+    it('detects the static-build form (ggml_cuda_init: found N CUDA devices)', () => {
+      expect(stderrIndicatesOffload('ggml_cuda_init: found 1 CUDA devices')).toBe(true);
+    });
+
+    it('rejects a CPU-only run (no offload lines)', () => {
+      expect(stderrIndicatesOffload('load_tensors: CPU_Mapped model buffer size = 138.65 MiB')).toBe(false);
+    });
+
+    it('rejects "offloaded 0/N layers to GPU" (nothing actually offloaded)', () => {
+      expect(stderrIndicatesOffload('load_tensors: offloaded 0/13 layers to GPU')).toBe(false);
+    });
   });
 
   it("offline + GPU + no pre-staged lib → CPU via defaultStage (no network, no probe)", async () => {

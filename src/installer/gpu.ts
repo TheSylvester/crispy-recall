@@ -98,7 +98,7 @@ export interface GpuInfo {
 
 /** Result of a single LIVE offload probe (one llama-embedding run with -ngl). */
 export interface OffloadProbeResult {
-  cudaInit: boolean; // stderr contained ggml_cuda_init (CUDA backend really offloaded)
+  cudaInit: boolean; // stderr proved the CUDA backend really offloaded (see stderrIndicatesOffload)
   vectorOk: boolean; // a non-empty vector of EXPECTED_DIMS came back
   stderr: string;
 }
@@ -205,6 +205,23 @@ export async function detectGpu(opts: GpuPhaseOptions = {}): Promise<GpuInfo> {
   return { ...base, cudaAvailable: 'none', plannedMode: 'cpu' };
 }
 
+/**
+ * Decide whether a probe's stderr proves the CUDA backend actually offloaded.
+ * llama.cpp signals this two different ways depending on the build:
+ *   - static / older builds print "ggml_cuda_init: found N CUDA devices"
+ *   - GGML_BACKEND_DL builds (our Linux prebuilt asset from build-cuda-linux.yml)
+ *     load CUDA as a dynamic backend and print ONLY "offloaded N/M layers to GPU"
+ *     — no ggml_cuda_init line. Checking only for ggml_cuda_init makes the
+ *     installer fall back to CPU on a host whose GPU works perfectly.
+ * Accept either signal, but require ≥1 layer actually offloaded (a literal
+ * "offloaded 0/N layers to GPU" means everything stayed on the CPU).
+ */
+export function stderrIndicatesOffload(stderr: string): boolean {
+  if (/ggml_cuda_init/.test(stderr)) return true;
+  const m = /offloaded\s+(\d+)\s*\/\s*\d+\s+layers?\s+to\s+GPU/i.exec(stderr);
+  return m ? Number(m[1]) > 0 : false;
+}
+
 /** Real LIVE offload probe: run llama-embedding once with -ngl, capture stderr. */
 async function defaultProbe(args: GpuProbeArgs): Promise<OffloadProbeResult> {
   const { binaryPath, modelPath, libDir, ngl, platform } = args;
@@ -246,7 +263,7 @@ async function defaultProbe(args: GpuProbeArgs): Promise<OffloadProbeResult> {
     stderr = e.stderr ?? e.message ?? '';
   }
 
-  const cudaInit = /ggml_cuda_init/.test(stderr);
+  const cudaInit = stderrIndicatesOffload(stderr);
   let vectorOk = false;
   try {
     const parsed = JSON.parse(stdout.trim());
