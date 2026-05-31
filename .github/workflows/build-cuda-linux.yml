@@ -75,12 +75,14 @@ jobs:
             -DGGML_NATIVE=OFF \
             -DBUILD_SHARED_LIBS=ON \
             -DLLAMA_CURL=OFF \
-            -DCMAKE_CUDA_ARCHITECTURES="75;80;86;89"
+            -DCMAKE_CUDA_ARCHITECTURES="75;86;89"
 
-      # Trimmed to Turing→Ada (sm_75/80/86/89: RTX 20/30/40, A100) and capped at
-      # -j2: compiling ggml-cuda for many arches with -j$(nproc) OOM-kills nvcc on
-      # the 7 GB GitHub runner ("nvcc: Terminated"). Pascal/Volta dropped — those
-      # users fall back to CPU; revisit on a larger runner if there's demand.
+      # Consumer arches only — sm_75/86/89 = RTX 20xx/GTX16, RTX 30xx, RTX 40xx.
+      # Each Ampere+ arch adds ~150 MB of flash-attention MMA kernels, so we drop
+      # sm_80 (A100/datacenter, rare for a personal tool) to keep the asset ~130 MB
+      # instead of ~200 MB. Capped at -j2: compiling for many arches with
+      # -j$(nproc) OOM-kills nvcc on the 7 GB runner ("nvcc: Terminated").
+      # Pascal/Volta/A100 users fall back to CPU; revisit per-arch assets later.
       - name: Build ggml-cuda
         run: cmake --build llama.cpp/build --config Release --target ggml-cuda -j2
 
