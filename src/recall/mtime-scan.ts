@@ -24,7 +24,7 @@ import { statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { getDb } from '../db.js';
-import { dbPath } from '../paths.js';
+import { dbPath, transcriptGlob } from '../paths.js';
 import { log } from '../log.js';
 import { ingestSessionMessages } from './message-ingest.js';
 
@@ -48,8 +48,8 @@ export async function mtimeScan(opts?: { vendors?: ('claude' | 'codex')[] }): Pr
   const codexRoot = process.env['CODEX_HOME'] ?? join(homedir(), '.codex');
 
   const patterns: Array<[string, 'claude' | 'codex']> = [];
-  if (vendors.includes('claude')) patterns.push([join(claudeRoot, 'projects', '**', '*.jsonl'), 'claude']);
-  if (vendors.includes('codex')) patterns.push([join(codexRoot, 'sessions', '**', '*.jsonl'), 'codex']);
+  if (vendors.includes('claude')) patterns.push([transcriptGlob(claudeRoot, 'projects', '**', '*.jsonl'), 'claude']);
+  if (vendors.includes('codex')) patterns.push([transcriptGlob(codexRoot, 'sessions', '**', '*.jsonl'), 'codex']);
 
   const db = getDb(dbPath());
   const watermarks = new Map<string, WatermarkRow>();

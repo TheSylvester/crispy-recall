@@ -68,3 +68,17 @@ export function logsDir(): string {
 export function ensureDir(): void {
   mkdirSync(recallRoot(), { recursive: true });
 }
+
+/**
+ * Build a glob pattern from path segments using forward slashes.
+ *
+ * `path.join` emits `\` on Windows, and the `glob` library treats `\` as an
+ * escape character — so a joined pattern like `C:\Users\me\.claude\projects\**\*.jsonl`
+ * silently matches NOTHING on Windows-native. glob accepts forward-slash
+ * patterns (including drive letters like `C:/Users/...`) on every platform,
+ * so we join with `/` and normalize any backslashes the root already carries.
+ * Same normalization the Stop hook applies to `transcript_path`.
+ */
+export function transcriptGlob(...segments: string[]): string {
+  return segments.join('/').replace(/\\/g, '/');
+}

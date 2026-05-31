@@ -17,6 +17,7 @@
 import { globSync } from 'glob';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { transcriptGlob } from './paths.js';
 import type { TranscriptEntry } from './transcript.js';
 
 /** Subset of the session descriptor that the lifted recall code reads. */
@@ -63,7 +64,7 @@ export function listAllSessions(opts?: { vendors?: ('claude' | 'codex')[] }): Sh
   const out: ShimSessionInfo[] = [];
 
   if (vendors.includes('claude')) {
-    const files = globSync(join(claudeRoot, 'projects', '**', '*.jsonl'), { nodir: true });
+    const files = globSync(transcriptGlob(claudeRoot, 'projects', '**', '*.jsonl'), { nodir: true });
     for (const file of files) {
       out.push({
         sessionId: sessionIdFromPath(file, 'claude'),
@@ -74,7 +75,7 @@ export function listAllSessions(opts?: { vendors?: ('claude' | 'codex')[] }): Sh
     }
   }
   if (vendors.includes('codex')) {
-    const files = globSync(join(codexRoot, 'sessions', '**', '*.jsonl'), { nodir: true });
+    const files = globSync(transcriptGlob(codexRoot, 'sessions', '**', '*.jsonl'), { nodir: true });
     for (const file of files) {
       out.push({
         sessionId: sessionIdFromPath(file, 'codex'),
