@@ -251,6 +251,12 @@ async function defaultProbe(args: GpuProbeArgs): Promise<OffloadProbeResult> {
     '-m', modelPath,
     '--embd-output-format', 'array',
     '-c', '8192',
+    // Probe with the SAME flags the real embed server uses (esp. -fa). Without
+    // Flash Attention the probe allocates the ~3.7 GB O(n²) attention buffer and
+    // OOMs on a 4 GB card — failing the probe and falling back to CPU even
+    // though the actual -fa server (~2.9 GB) would have fit. Probe must mirror
+    // runtime to gate GPU adoption correctly.
+    '-fa',
     '--rope-scaling', 'yarn',
     '--rope-freq-scale', '0.75',
     '-ngl', String(ngl),

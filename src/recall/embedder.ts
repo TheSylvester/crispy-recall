@@ -741,6 +741,11 @@ async function startServer(): Promise<string> {
     '-c', '8192',
     '-b', '8192',        // physical batch size — must match -c or large inputs get HTTP 500
     '-ub', '8192',       // micro-batch (ubatch) — also defaults to 512, must be raised
+    // Flash Attention: the attention compute buffer is otherwise O(n²) in the
+    // 8192-token batch (~3.7 GB on GPU), which OOMs cards <6 GB and forces CPU.
+    // -fa makes it O(n) (~0.8 GB → ~2.9 GB total), so 4 GB cards run on GPU,
+    // with numerically identical embeddings (verified cosine 1.0 vs non-FA).
+    '-fa',
     // nomic-embed-text-v1.5 is trained at 2048 ctx and uses Dynamic NTK-aware
     // RoPE scaling to extend to 8192. Without these flags, newer llama.cpp
     // (b9253+) refuses inputs >2048 tokens, and older versions silently
@@ -999,6 +1004,9 @@ async function embedViaProcess(texts: string[], modelPath: string): Promise<Floa
       '-m', modelPath,
       '--embd-output-format', 'array',
       '-c', '8192',
+      // Flash Attention — see startServer: O(n) attention buffer instead of
+      // O(n²), so the one-shot path also fits cards <6 GB. Identical embeddings.
+      '-fa',
       // Match the YaRN flags on the llama-server batch path — nomic-embed-text-v1.5
       // is trained at 2048 ctx and extends to 8192 via Dynamic NTK-aware RoPE.
       // Without these, newer llama.cpp (b9253+) refuses inputs >2048 tokens here
