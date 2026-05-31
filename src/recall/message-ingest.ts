@@ -33,6 +33,7 @@ import type { MessageRecord, MessageVectorRecord } from './message-store.js';
 import { getDb } from '../db.js';
 import { dbPath } from '../paths.js';
 import { normalizePath } from '../url-path-resolver.js';
+import { log } from '../log.js';
 import { parseJsonlFile } from '../adapters/claude/jsonl-reader.js';
 import { adaptClaudeEntries } from '../adapters/claude/claude-entry-adapter.js';
 import { parseCodexJsonlFile } from '../adapters/codex/codex-jsonl-reader.js';
@@ -209,6 +210,60 @@ export const MAX_EMBED_CHARS = 14_000;
  *  total throughput — just per-call work. */
 const MAX_EMBED_BATCH = 10;
 
+/** Hard char cap for the per-item fallback. Each wordpiece token is ≥1 char, so
+ *  chars ≤ tokens; 6,000 < the 8,192-token physical batch, so a slice this size
+ *  ALWAYS fits and embeds. Used only when a normal MAX_EMBED_CHARS slice still
+ *  exceeds the token budget (pathologically dense content — base64/minified
+ *  JSON/hex) and 500s, so one poison message can't wedge the whole backfill. */
+const SAFE_EMBED_CHARS = 6_000;
+
+/**
+ * Embed pre-truncated rows into vector records, resilient to a single oversized
+ * message. Fast path embeds the whole batch in one call. If that throws — e.g.
+ * one input exceeds the embed server's physical batch and the request 500s,
+ * which would otherwise fail (and stall) every message behind it — fall back to
+ * embedding each row alone, hard-truncating to SAFE_EMBED_CHARS any row that
+ * still fails so it always yields a vector instead of blocking forever. Rows
+ * that fail even then (transient: server down) are skipped and retried by the
+ * next sweep.
+ */
+async function embedRowsResilient(
+  rows: Array<{ messageId: string; text: string }>,
+): Promise<MessageVectorRecord[]> {
+  const { embedBatch } = await import('./embedder.js');
+  const { quantizeToQ8, computeNorm } = await import('./quantize.js');
+
+  const toRecord = (messageId: string, f32: Float32Array): MessageVectorRecord => {
+    const { q8, scale } = quantizeToQ8(f32);
+    return { messageId, embeddingQ8: q8, norm: computeNorm(f32), quantScale: scale };
+  };
+
+  try {
+    const vectors = await embedBatch(rows.map(r => r.text));
+    return rows.map((r, j) => toRecord(r.messageId, vectors[j]!));
+  } catch {
+    const records: MessageVectorRecord[] = [];
+    for (const r of rows) {
+      try {
+        const [v] = await embedBatch([r.text]);
+        records.push(toRecord(r.messageId, v!));
+      } catch {
+        try {
+          const [v] = await embedBatch([r.text.slice(0, SAFE_EMBED_CHARS)]);
+          records.push(toRecord(r.messageId, v!));
+        } catch (err) {
+          log({
+            source: 'recall:embed',
+            level: 'warn',
+            summary: `skipped message ${r.messageId} (embed failed even at ${SAFE_EMBED_CHARS} chars): ${(err as Error).message}`,
+          });
+        }
+      }
+    }
+    return records;
+  }
+}
+
 /**
  * Embed a session's indexed messages into q8 vectors for semantic search.
  *
@@ -257,27 +312,8 @@ export async function embedSessionMessages(
     validRows.length = MAX_EMBED_BATCH;
   }
 
-  // Lazy-load embedding modules
-  const { embedBatch } = await import('./embedder.js');
-  const { quantizeToQ8, computeNorm } = await import('./quantize.js');
-
-  // Embed
-  const texts = validRows.map(r => r.text);
-  const vectors = await embedBatch(texts);
-
-  // Quantize and build records
-  const records: MessageVectorRecord[] = [];
-  for (let j = 0; j < validRows.length; j++) {
-    const f32 = vectors[j]!;
-    const { q8, scale } = quantizeToQ8(f32);
-    const norm = computeNorm(f32);
-    records.push({
-      messageId: validRows[j]!.messageId,
-      embeddingQ8: q8,
-      norm,
-      quantScale: scale,
-    });
-  }
+  // Embed (resilient: one oversized message can't fail the whole batch)
+  const records = await embedRowsResilient(validRows);
 
   // Insert
   insertMessageVectors(records);
@@ -310,24 +346,9 @@ export async function embedMessageBatch(
   }
   if (truncated.length === 0) return 0;
 
-  const { embedBatch } = await import('./embedder.js');
-  const { quantizeToQ8, computeNorm } = await import('./quantize.js');
-
-  const texts = truncated.map(r => r.text);
-  const vectors = await embedBatch(texts);
-
-  const records: MessageVectorRecord[] = [];
-  for (let j = 0; j < truncated.length; j++) {
-    const f32 = vectors[j]!;
-    const { q8, scale } = quantizeToQ8(f32);
-    const norm = computeNorm(f32);
-    records.push({
-      messageId: truncated[j]!.messageId,
-      embeddingQ8: q8,
-      norm,
-      quantScale: scale,
-    });
-  }
+  // Resilient embed: a single message that still exceeds the token budget after
+  // truncation no longer 500s the whole batch (and stalls the backfill).
+  const records = await embedRowsResilient(truncated);
 
   insertMessageVectors(records);
   return records.length;
