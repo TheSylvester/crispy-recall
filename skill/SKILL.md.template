@@ -71,6 +71,12 @@ DATE HANDLING: Any date the user mentions MUST become a flag — never search te
   --recent             Boost recent sessions (use when user says 'recently', 'latest')
   Example: \"what happened April 10\" → $RECALL_BIN --list --since 2026-04-10 --until 2026-04-10
 
+PROJECT SCOPING: search and list default to the CURRENT directory's project.
+  --all                Search across ALL projects (use when the answer may live
+                       in another repo, or when a scoped search returns little)
+  --project PATH       Scope to a specific project path instead of the CWD
+  If results look thin or empty, retry with --all before concluding nothing exists.
+
 CRITICAL READING RULE: After searching, ALWAYS read the matched message:
   $RECALL_BIN <session-id> <message-id>
 This auto-centers on the match and shows surrounding turns. The output
@@ -192,6 +198,33 @@ $RECALL_BIN "old bug" --until 2026-03-15
 `$RECALL_BIN --list --since 2026-04-10 --until 2026-04-10` to find all sessions,
 then search with topic keywords + date flags if needed.
 
+## Project scope
+
+**Search and list default to the current working directory's project.** Recall
+filters results to the project whose path is your CWD — so from inside one repo
+you only see that repo's sessions. This keeps everyday recall focused, but it
+silently hides history when the answer lives elsewhere.
+
+```bash
+# Default — scoped to the CWD's project
+$RECALL_BIN "auth refactor"
+
+# Search every project (cross-repo questions, or when a scoped search is thin)
+$RECALL_BIN "auth refactor" --all
+
+# Scope to a specific project regardless of CWD
+$RECALL_BIN "auth refactor" --project /home/me/dev/other-repo
+```
+
+- `--all` — disable scoping; search across all indexed projects
+- `--project PATH` — scope to an explicit project path instead of the CWD
+- Both work in search and list modes
+
+**When to reach for `--all`:** the user asks about work that may span repos, the
+question isn't tied to the current repo, or a default (scoped) search returns
+few/zero results. A thin scoped result is often just the scope — retry with
+`--all` before concluding the history doesn't exist.
+
 ## Recency boost
 
 When the user says "recently", "latest", "last few days", or otherwise indicates
@@ -209,4 +242,5 @@ pushing recent sessions to the top of results. Combine with `--since` for best r
 - **Search is cheap, reading is expensive.** Run 3-5 varied queries before committing to reading sessions.
 - **Message IDs are stable.** You can reference them across searches.
 - **Use `--since` / `--until` to scope.** Both search and list modes accept date flags.
+- **Search is scoped to the CWD's project by default.** Add `--all` for cross-repo questions or when a scoped search comes back thin.
 - **Raw JSON output** (`--raw`) is available for programmatic processing.
