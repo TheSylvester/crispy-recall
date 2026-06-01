@@ -83,12 +83,26 @@ export function extractEntryText(entry: TranscriptEntry): string {
 }
 
 /**
+ * Find the working directory recorded on a session's transcript entries.
+ *
+ * Claude and Codex both stamp `cwd` on their entries; it's constant for a
+ * session. Returns the first non-empty value, or undefined if none carry one
+ * (e.g. transcripts of internal/operation entries only).
+ */
+function entriesCwd(entries: TranscriptEntry[]): string | undefined {
+  for (const e of entries) {
+    if (e.cwd) return e.cwd;
+  }
+  return undefined;
+}
+
+/**
  * Ingest a session's messages into the message-level recall index.
  *
  * Flow:
  *   1. Check if already processed (skip unless force)
- *   2. Resolve project_id from options
- *   3. Load entries through the vendor reader on the given transcript path
+ *   2. Load entries through the vendor reader on the given transcript path
+ *   3. Resolve project_id (caller-provided cwd, else the transcript's own cwd)
  *   4. Strip tool content, filter sub-agent entries
  *   5. Extract text per entry, build MessageRecords
  *   6. Batch insert into SQLite (FTS5 triggers fire automatically)
@@ -108,11 +122,7 @@ export async function ingestSessionMessages(
   // 1. Check if already processed (batch/backfill only — real-time always appends)
   //    When force is not set, we still proceed to INSERT OR IGNORE new messages.
 
-  // 2. Resolve project_id from caller-provided options (Stop hook passes cwd)
-  const rawProjectId = options?.projectId ?? null;
-  const projectId = rawProjectId ? normalizePath(rawProjectId) : null;
-
-  // 3. Load entries via vendor-dispatched reader on the given transcript path
+  // 2. Load entries via vendor-dispatched reader on the given transcript path
   let rawEntries: TranscriptEntry[];
   try {
     if (vendor === 'claude') {
@@ -134,6 +144,14 @@ export async function ingestSessionMessages(
   if (rawEntries.length === 0) {
     return { sessionId, chunksCreated: 0, skipped: true };
   }
+
+  // 3. Resolve project_id. The Stop hook passes the session cwd explicitly;
+  //    backfill passes nothing, so fall back to the cwd recorded on the
+  //    transcript's own entries (both Claude and Codex adapters carry it).
+  //    Without this fallback every backfilled session lands with a NULL
+  //    project_id and is invisible to project-scoped (default) recall search.
+  const rawProjectId = options?.projectId ?? entriesCwd(rawEntries);
+  const projectId = rawProjectId ? normalizePath(rawProjectId) : null;
 
   // 4. Strip tool content, filter sub-agent entries
   const filtered = stripToolContent(rawEntries);
