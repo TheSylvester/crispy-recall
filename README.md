@@ -19,7 +19,7 @@ recall install
 llama embedding binary, the model, and the SQLite DB), wires a Stop hook into
 Claude Code so your transcripts are indexed automatically as sessions end, and
 installs the `recall` skill. If Codex is detected it also gets the `recall`
-skill (so the agent can search), but not an automatic per-turn hook in v0.1.0 —
+skill (so the agent can search), but not an automatic per-turn hook (yet) —
 index Codex history with `recall backfill --vendor codex`. After that, recall
 runs passively — you only invoke `recall` directly for `status`, `doctor`,
 `repair`, or `uninstall`.
@@ -37,8 +37,8 @@ Windows-native are separate installs.** If you use both, run the install in each
 Prerequisites: Node ≥ 20 and Claude Code installed. If Codex is detected
 (`~/.codex/` exists), recall installs the `recall` skill into Codex (so the
 agent can search) and you can index your Codex history with
-`recall backfill --vendor codex`. Real-time per-turn Codex indexing is **not**
-in v0.1.0.
+`recall backfill --vendor codex`. Real-time per-turn Codex indexing is **not
+yet** supported.
 
 ## What it does
 
@@ -52,29 +52,49 @@ in v0.1.0.
 Two steps. First, search for the relevant session:
 
 ```bash
-$RECALL_BIN "the thing you're trying to remember"
+recall "the thing you're trying to remember"
 ```
 
 That returns a table of matching sessions. Then read one, centered on the match:
 
 ```bash
-$RECALL_BIN <session-id> <message-id>
+recall <session-id> <message-id>
+```
+
+Search and list default to the **current directory's project** — from inside one
+repo you only see that repo's sessions. Add `--all` to search across every
+indexed project (use it for cross-repo questions, or when a scoped search comes
+back thin), or `--project <path>` to target a specific repo regardless of where
+you are:
+
+```bash
+recall --all "the thing you're trying to remember"
 ```
 
 The skill's frontmatter teaches Claude *when* to reach for this (before
 non-trivial tasks, architectural decisions, or work with obvious prior
-history), so in practice the agent calls it for you.
+history), so in practice the agent calls it for you. (Inside the installed skill
+the command is written out as `node ~/.recall/bin/recall.js` so it works even
+when `recall` isn't on the agent's `PATH` — `$RECALL_BIN` in the skill source is
+a placeholder the installer substitutes, not an environment variable you set.)
 
 ## Commands
 
 | Command | What it does |
 |---|---|
+| `recall "<query>" [--all] [--project <path>]` | Search past sessions (FTS5 + semantic). Defaults to the current project; `--all` searches every indexed project, `--project` targets one. |
+| `recall <session-id> [<message-id>]` | Read a session, optionally centered on a matched message. |
 | `recall install` | One-time setup: scaffold `~/.recall/`, wire the Stop hook, install the skill. |
 | `recall uninstall` | Reverse the install (skill, hook, CLAUDE.md block). `--purge` also removes `~/.recall/`. |
 | `recall status` | DB size, message count, last ingest, embedding gap, active backfill PID, GPU/CPU backend. |
 | `recall doctor` | Read-only health check (the install pre-flight suite). `--integrity` runs DB + FTS5 checks. |
 | `recall repair --fts \| --vectors \| --full` | Rebuild the FTS index, re-embed vectors, or full reingest from JSONL. |
 | `recall backfill [--auto-embed] [--vendor <v>] [--detach]` | Index historical transcripts. |
+
+Add `--json` to `install`/`uninstall`/`status`/`doctor` for machine-readable
+output. `recall install` also takes `--offline` (use a pre-staged binary +
+model instead of downloading) and `--no-backfill` / `--auto-backfill` to control
+the initial history index. Run `recall --help` for the full flag set.
 
 ## Where things live
 
@@ -86,9 +106,11 @@ history), so in practice the agent calls it for you.
 
 ## Privacy
 
-Everything is local. No telemetry, no network calls except the one-time
-binary + model download at install. The DB is plain SQLite — open it with any
-SQLite browser if you want to poke around.
+Everything is local. No telemetry. The only data transfer is the one-time
+binary + model download at install (from llama.cpp's GitHub releases and
+HuggingFace); `recall install` and `recall doctor` also send lightweight
+reachability probes to those two hosts. Nothing else leaves your machine. The DB
+is plain SQLite — open it with any SQLite browser if you want to poke around.
 
 ## Troubleshooting
 
