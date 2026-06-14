@@ -39,17 +39,15 @@
     "test": "vitest run",
     "prepublishOnly": "npm run build"
   },
-  "dependencies": {
+  "devDependencies": {
     "@anthropic-ai/claude-agent-sdk": "0.2.114",
     "@clack/prompts": "^0.7.0",
+    "@types/node": "^20.0.0",
+    "esbuild": "^0.20.0",
     "extract-zip": "^2.0.1",
     "glob": "^10.4.5",
     "node-sqlite3-wasm": "^0.8.53",
-    "picocolors": "^1.0.0"
-  },
-  "devDependencies": {
-    "@types/node": "^20.0.0",
-    "esbuild": "^0.20.0",
+    "picocolors": "^1.0.0",
     "typescript": "^5.0.0",
     "vitest": "^4.0.18"
   }
