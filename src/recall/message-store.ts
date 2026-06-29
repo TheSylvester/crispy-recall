@@ -164,9 +164,10 @@ export function searchMessagesFts(
   projectId?: string,
   sessionId?: string,
   excludeSessionId?: string,
+  skipIdf?: boolean,
 ): MessageSearchResult[] {
   try {
-    const sanitized = sanitizeFts5Query(query);
+    const sanitized = sanitizeFts5Query(query, { skipIdf });
     if (!sanitized) return [];
 
     const params: (string | number)[] = [sanitized];

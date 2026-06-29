@@ -39,6 +39,10 @@ export interface DualPathSearchOptions {
   /** Recency decay rate. Higher = stronger preference for recent results.
    *  0 = no decay. Default 0.02 (~50% penalty at 50 days). */
   recencyDecay?: number;
+  /** Bypass the IDF (high-frequency term) sanitizer on the FTS5 path. When set,
+   *  common-but-meaningful terms ("when"/"before"/"after") survive instead of
+   *  being dropped. Escaping is unchanged. Used by the `--no-idf` config. */
+  skipIdf?: boolean;
 }
 
 export interface ScoredResult {
@@ -114,7 +118,7 @@ export async function dualPathSearch(
   }
 
   // Run both paths (both are synchronous SQLite operations)
-  const ftsResults = searchMessagesFts(query, fetchLimit, opts?.projectId, opts?.sessionId, opts?.excludeSessionId);
+  const ftsResults = searchMessagesFts(query, fetchLimit, opts?.projectId, opts?.sessionId, opts?.excludeSessionId, opts?.skipIdf);
 
   const semanticResults = queryQ8 && queryNorm > 0
     ? searchMessagesSemantic(queryQ8, queryNorm, queryScale, {
