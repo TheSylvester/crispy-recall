@@ -33,21 +33,19 @@ let originalEnvClaudeConfigDir: string | undefined;
 let originalEnvCodexHome: string | undefined;
 
 function writeFixtureSession(filePath: string, sessionId: string): void {
-  const lines: string[] = [];
-  for (let i = 0; i < 4; i++) {
-    const role = i % 2 === 0 ? 'user' : 'assistant';
-    const uuid = `${sessionId}-msg-${i}-${randomUUID().slice(0, 6)}`;
-    lines.push(JSON.stringify({
-      type: role,
-      uuid,
-      parentUuid: i === 0 ? null : `${sessionId}-msg-${i - 1}`,
-      sessionId,
-      timestamp: new Date(Date.UTC(2026, 0, 1, 0, 0, i)).toISOString(),
-      // Tiny body so length < MIN_EMBED_CHARS — gap stays 0.
-      message: { role, content: `hi ${i}` },
-    }));
-  }
-  writeFileSync(filePath, lines.join('\n') + '\n');
+  // A single tiny FIRST-turn message: short (< MIN_EMBED_CHARS) AND with no
+  // preceding turn, so it is not enrichable → stays out of the embedding pipeline
+  // → gap stays 0 and the embed phase is skipped (keeps this test hermetic/fast).
+  const uuid = `${sessionId}-msg-0-${randomUUID().slice(0, 6)}`;
+  const line = JSON.stringify({
+    type: 'user',
+    uuid,
+    parentUuid: null,
+    sessionId,
+    timestamp: new Date(Date.UTC(2026, 0, 1, 0, 0, 0)).toISOString(),
+    message: { role: 'user', content: 'hi there' },
+  });
+  writeFileSync(filePath, line + '\n');
 }
 
 interface RowCounts {

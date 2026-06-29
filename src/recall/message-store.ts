@@ -21,7 +21,7 @@ import { getDb } from '../db.js';
 import { dbPath, ensureDir as ensureRecallDir } from '../paths.js';
 import { sanitizeFts5Query } from './query-sanitizer.js';
 import { dotProductQ8 } from './quantize.js';
-import { EMBED_VERSION } from './embed-config.js';
+import { EMBED_VERSION, buildEmbedText } from './embed-config.js';
 
 // ============================================================================
 // Types
@@ -695,8 +695,13 @@ export function getIndexedSessionIds(): Set<string> {
   }
 }
 
-/** Messages shorter than this are skipped for embedding — trivial messages
- *  like "yes", "ok", "do it" add noise to semantic search. FTS5 still indexes them. */
+/** Floor for embedding a message by its OWN length. A short message below this is
+ *  embedded ONLY if it is ENRICHABLE — i.e. it has a preceding turn whose context
+ *  buildEmbedText prepends to give it semantic surface. A context-starved isolated
+ *  fragment (short AND no preceding turn) is still skipped, so we never embed
+ *  context-less trivia. The eligibility predicate
+ *    (LENGTH(message_text) >= MIN_EMBED_CHARS OR <has a preceding turn in session>)
+ *  is shared verbatim by the three selectors below and mirrored by the LoCoMo harness. */
 const MIN_EMBED_CHARS = 50;
 
 /**
@@ -710,7 +715,9 @@ export function getEmbeddingGapStats(): { totalMessages: number; gapCount: numbe
       `SELECT
         COUNT(*) as total,
         SUM(CASE WHEN NOT EXISTS (SELECT 1 FROM message_vectors mv WHERE mv.message_id = m.message_id AND mv.embed_version = ?)
-                       AND LENGTH(m.message_text) >= ${MIN_EMBED_CHARS} THEN 1 ELSE 0 END) as gap
+                       AND (LENGTH(m.message_text) >= ${MIN_EMBED_CHARS}
+                            OR EXISTS (SELECT 1 FROM messages p WHERE p.session_id = m.session_id AND p.message_seq < m.message_seq))
+                       THEN 1 ELSE 0 END) as gap
        FROM messages m WHERE m.message_text != ''`,
       [EMBED_VERSION],
     ) as Record<string, unknown> | undefined;
@@ -732,7 +739,8 @@ export function getSessionsWithEmbeddingGap(): string[] {
     const rows = db().all(
       `SELECT DISTINCT m.session_id FROM messages m
        WHERE m.message_text != ''
-         AND LENGTH(m.message_text) >= ${MIN_EMBED_CHARS}
+         AND (LENGTH(m.message_text) >= ${MIN_EMBED_CHARS}
+              OR EXISTS (SELECT 1 FROM messages p WHERE p.session_id = m.session_id AND p.message_seq < m.message_seq))
          AND NOT EXISTS (SELECT 1 FROM message_vectors mv WHERE mv.message_id = m.message_id AND mv.embed_version = ?)
        ORDER BY m.created_at DESC`,
       [EMBED_VERSION],
@@ -747,28 +755,46 @@ export interface UnembeddedMessage {
   message_id: string;
   session_id: string;
   message_text: string;
+  /** The embed INPUT: short messages get adjacency context prepended (see
+   *  buildEmbedText); long messages equal message_text. Stored/FTS text unchanged. */
+  embed_text: string;
 }
 
 /**
  * Fetch unembedded messages across all sessions, most recent first.
- * Skips trivial messages (< MIN_EMBED_CHARS) so they never enter the pipeline.
+ * Skips only context-less trivia: a message short (< MIN_EMBED_CHARS) AND with no
+ * preceding turn to enrich from. Enrichable short turns ARE returned.
+ *
+ * A correlated subquery fetches the immediately-preceding turn's text per row so
+ * buildEmbedText can prepend bounded context to short messages — the single
+ * source of truth shared with the LoCoMo harness via this `embed_text` field.
  */
 export function getUnembeddedMessages(limit: number): UnembeddedMessage[] {
   try {
     const rows = db().all(
-      `SELECT m.message_id, m.session_id, m.message_text FROM messages m
+      `SELECT m.message_id, m.session_id, m.message_text,
+         (SELECT p.message_text FROM messages p
+           WHERE p.session_id = m.session_id AND p.message_seq < m.message_seq
+           ORDER BY p.message_seq DESC LIMIT 1) AS prev_text
+       FROM messages m
        WHERE m.message_text != ''
-         AND LENGTH(m.message_text) >= ${MIN_EMBED_CHARS}
+         AND (LENGTH(m.message_text) >= ${MIN_EMBED_CHARS}
+              OR EXISTS (SELECT 1 FROM messages p2 WHERE p2.session_id = m.session_id AND p2.message_seq < m.message_seq))
          AND NOT EXISTS (SELECT 1 FROM message_vectors mv WHERE mv.message_id = m.message_id AND mv.embed_version = ?)
        ORDER BY m.created_at DESC
        LIMIT ?`,
       [EMBED_VERSION, limit],
     ) as Array<Record<string, unknown>>;
-    return rows.map(r => ({
-      message_id: r.message_id as string,
-      session_id: r.session_id as string,
-      message_text: r.message_text as string,
-    }));
+    return rows.map(r => {
+      const message_text = r.message_text as string;
+      const prev_text = (r.prev_text as string) ?? null;
+      return {
+        message_id: r.message_id as string,
+        session_id: r.session_id as string,
+        message_text,
+        embed_text: buildEmbedText(message_text, prev_text),
+      };
+    });
   } catch {
     return [];
   }
