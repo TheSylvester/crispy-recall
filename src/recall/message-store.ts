@@ -21,6 +21,7 @@ import { getDb } from '../db.js';
 import { dbPath, ensureDir as ensureRecallDir } from '../paths.js';
 import { sanitizeFts5Query } from './query-sanitizer.js';
 import { dotProductQ8 } from './quantize.js';
+import { EMBED_VERSION } from './embed-config.js';
 
 // ============================================================================
 // Types
@@ -532,8 +533,8 @@ export function insertMessageVectors(records: MessageVectorRecord[]): void {
   try {
     const stmt = d.prepare(
       `INSERT OR REPLACE INTO message_vectors
-       (message_id, embedding_q8, norm, quant_scale)
-       VALUES (?, ?, ?, ?)`,
+       (message_id, embedding_q8, norm, quant_scale, embed_version)
+       VALUES (?, ?, ?, ?, ?)`,
     );
     try {
       for (const r of records) {
@@ -542,6 +543,7 @@ export function insertMessageVectors(records: MessageVectorRecord[]): void {
           Buffer.from(r.embeddingQ8.buffer, r.embeddingQ8.byteOffset, r.embeddingQ8.byteLength),
           r.norm,
           r.quantScale,
+          EMBED_VERSION,
         ]);
       }
     } finally {
@@ -608,13 +610,18 @@ export function searchMessagesSemantic(
       params.push(opts.excludeSessionId);
     }
 
+    // Only score current-version vectors. The query is QUERY_PREFIX-prefixed, so
+    // only DOC_PREFIX-prefixed (current-version) doc vectors are comparable;
+    // legacy bare vectors are excluded (still reachable via FTS, fused by RRF).
+    params.push(EMBED_VERSION);
+
     const rows = db().all(
       `SELECT mv.message_id, mv.embedding_q8, mv.norm, mv.quant_scale,
               m.session_id, m.message_seq, m.project_id, m.created_at, m.message_role,
               SUBSTR(m.message_text, 1, 401) as message_preview_raw
        FROM message_vectors mv
        JOIN messages m ON m.message_id = mv.message_id
-       WHERE 1=1${filterClauses}`,
+       WHERE 1=1${filterClauses} AND mv.embed_version = ?`,
       params,
     );
 
@@ -702,9 +709,10 @@ export function getEmbeddingGapStats(): { totalMessages: number; gapCount: numbe
     const row = db().get(
       `SELECT
         COUNT(*) as total,
-        SUM(CASE WHEN NOT EXISTS (SELECT 1 FROM message_vectors mv WHERE mv.message_id = m.message_id)
+        SUM(CASE WHEN NOT EXISTS (SELECT 1 FROM message_vectors mv WHERE mv.message_id = m.message_id AND mv.embed_version = ?)
                        AND LENGTH(m.message_text) >= ${MIN_EMBED_CHARS} THEN 1 ELSE 0 END) as gap
        FROM messages m WHERE m.message_text != ''`,
+      [EMBED_VERSION],
     ) as Record<string, unknown> | undefined;
     return {
       totalMessages: row ? (row.total as number) : 0,
@@ -725,8 +733,9 @@ export function getSessionsWithEmbeddingGap(): string[] {
       `SELECT DISTINCT m.session_id FROM messages m
        WHERE m.message_text != ''
          AND LENGTH(m.message_text) >= ${MIN_EMBED_CHARS}
-         AND NOT EXISTS (SELECT 1 FROM message_vectors mv WHERE mv.message_id = m.message_id)
+         AND NOT EXISTS (SELECT 1 FROM message_vectors mv WHERE mv.message_id = m.message_id AND mv.embed_version = ?)
        ORDER BY m.created_at DESC`,
+      [EMBED_VERSION],
     ) as Array<Record<string, unknown>>;
     return rows.map(r => r.session_id as string);
   } catch {
@@ -750,10 +759,10 @@ export function getUnembeddedMessages(limit: number): UnembeddedMessage[] {
       `SELECT m.message_id, m.session_id, m.message_text FROM messages m
        WHERE m.message_text != ''
          AND LENGTH(m.message_text) >= ${MIN_EMBED_CHARS}
-         AND NOT EXISTS (SELECT 1 FROM message_vectors mv WHERE mv.message_id = m.message_id)
+         AND NOT EXISTS (SELECT 1 FROM message_vectors mv WHERE mv.message_id = m.message_id AND mv.embed_version = ?)
        ORDER BY m.created_at DESC
        LIMIT ?`,
-      [limit],
+      [EMBED_VERSION, limit],
     ) as Array<Record<string, unknown>>;
     return rows.map(r => ({
       message_id: r.message_id as string,

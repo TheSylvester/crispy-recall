@@ -293,9 +293,30 @@ function ensureSchema(db: Database): void {
       message_id    TEXT PRIMARY KEY REFERENCES messages(message_id) ON DELETE CASCADE,
       embedding_q8  BLOB NOT NULL,
       norm          REAL NOT NULL,
-      quant_scale   REAL NOT NULL
+      quant_scale   REAL NOT NULL,
+      embed_version INTEGER NOT NULL DEFAULT 1
     );
   `);
+
+  // Idempotent, race-safe migration for existing DBs: add embed_version if
+  // absent. ensureSchema runs inside getDb(), which several processes (parallel
+  // Stop hooks, embed-pending, CLI, backfill) hit at once, so the ALTER can lose
+  // a race two ways — another process already added the column ("duplicate
+  // column name"), or the writer lock is contended (SQLITE_BUSY/"database is
+  // locked"). On ANY failure, re-check table_info: treat it as success if the
+  // column now exists; only throw if it genuinely still isn't there.
+  const hasEmbedVersion = () =>
+    (db.all(`PRAGMA table_info(message_vectors)`) as Array<{ name: string }>)
+      .some((c) => c.name === 'embed_version');
+  if (!hasEmbedVersion()) {
+    try {
+      db.exec(`ALTER TABLE message_vectors ADD COLUMN embed_version INTEGER NOT NULL DEFAULT 1`);
+    } catch (e) {
+      // A racing process may have added it, or the lock was contended. Re-check;
+      // only surface the error if the column genuinely isn't there.
+      if (!hasEmbedVersion()) throw e;
+    }
+  }
 
   // ====================================================================
   // ingest_watermark — steady-state catch-up tracking (plan §5.4 / §5.14

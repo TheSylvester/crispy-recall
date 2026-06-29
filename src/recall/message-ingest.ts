@@ -30,6 +30,7 @@ import {
   insertMessageVectors,
 } from './message-store.js';
 import type { MessageRecord, MessageVectorRecord } from './message-store.js';
+import { DOC_PREFIX, EMBED_VERSION } from './embed-config.js';
 import { getDb } from '../db.js';
 import { dbPath } from '../paths.js';
 import { normalizePath } from '../url-path-resolver.js';
@@ -251,6 +252,12 @@ async function embedRowsResilient(
   const { embedBatch } = await import('./embedder.js');
   const { quantizeToQ8, computeNorm } = await import('./quantize.js');
 
+  // Prefix every document with DOC_PREFIX (nomic task instruction). Applied once
+  // here so it survives both the whole-batch path and the SAFE_EMBED_CHARS
+  // fallback slice (which slices from index 0, keeping the prefix at the front).
+  // Only the embed *input* is prefixed; the stored message_text is untouched.
+  rows = rows.map((r) => ({ messageId: r.messageId, text: DOC_PREFIX + r.text }));
+
   const toRecord = (messageId: string, f32: Float32Array): MessageVectorRecord => {
     const { q8, scale } = quantizeToQ8(f32);
     return { messageId, embeddingQ8: q8, norm: computeNorm(f32), quantScale: scale };
@@ -309,9 +316,9 @@ export async function embedSessionMessages(
       ? `SELECT message_id, message_text FROM messages WHERE session_id = ? ORDER BY message_seq ASC`
       : `SELECT m.message_id, m.message_text FROM messages m
          WHERE m.session_id = ?
-           AND NOT EXISTS (SELECT 1 FROM message_vectors mv WHERE mv.message_id = m.message_id)
+           AND NOT EXISTS (SELECT 1 FROM message_vectors mv WHERE mv.message_id = m.message_id AND mv.embed_version = ?)
          ORDER BY m.message_seq ASC`,
-    [sessionId],
+    force ? [sessionId] : [sessionId, EMBED_VERSION],
   ) as Array<Record<string, unknown>>;
 
   const validRows: Array<{ messageId: string; text: string }> = [];

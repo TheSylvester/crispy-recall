@@ -24,6 +24,7 @@ import { embed } from './embedder.js';
 import { quantizeToQ8, computeNorm } from './quantize.js';
 import { searchMessagesFts, searchMessagesSemantic } from './message-store.js';
 import type { MessageSearchResult } from './message-store.js';
+import { QUERY_PREFIX } from './embed-config.js';
 import { log } from '../log.js';
 
 // ---------------------------------------------------------------------------
@@ -103,7 +104,7 @@ export async function dualPathSearch(
   let semanticAvailable = true;
 
   try {
-    const queryF32 = await embed(query);
+    const queryF32 = await embed(QUERY_PREFIX + query);
     queryNorm = computeNorm(queryF32);
     const quantized = quantizeToQ8(queryF32);
     queryQ8 = quantized.q8;
