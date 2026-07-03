@@ -3,16 +3,16 @@
  *
  * Runs FTS5 BM25 keyword search and q8 semantic brute-force scan as
  * CO-EQUAL retrieval paths on every query. Results are merged via
- * Reciprocal Rank Fusion (RRF) with time-decayed recency weighting —
- * scale-invariant, boosts results found by both paths, and gently
- * favors recent messages.
+ * Reciprocal Rank Fusion (RRF) — scale-invariant, boosts results found by
+ * both paths. Recency weighting is off by default; `--recent` opts into
+ * absolute age decay.
  *
  * Query pipeline:
  *   1. Embed query with Nomic (~50ms)
  *   2. Quantize query vector to q8
  *   3. Path A — BM25: FTS5 MATCH on messages_fts
  *   4. Path B — Semantic: full table scan of message_vectors, q8 dot product
- *   5. RRF merge with recency decay — fuse ranked lists, deduplicate, take top-K
+ *   5. RRF merge — fuse ranked lists, deduplicate, take top-K
  *
  * Owns: search orchestration, result merging.
  * Does not: persist data, manage models.
@@ -37,8 +37,9 @@ export interface DualPathSearchOptions {
   sessionId?: string;
   /** Session ID to exclude from results (caller's own session). */
   excludeSessionId?: string;
-  /** Recency decay rate. Higher = stronger preference for recent results.
-   *  0 = no decay. Default 0.02 (~50% penalty at 50 days). */
+  /** Recency decay rate on the RRF score. `undefined`/`0` → off (recency 1 —
+   *  the default; retrieval relevance is not re-weighted by age). `> 0` →
+   *  absolute now-anchored `1/(1+ageDays·decay)`; `--recent` passes 0.10. */
   recencyDecay?: number;
   /** Bypass the IDF (high-frequency term) sanitizer on the FTS5 path. When set,
    *  common-but-meaningful terms ("when"/"before"/"after") survive instead of
@@ -73,8 +74,21 @@ export interface DualPathSearchResult {
 const DEFAULT_LIMIT = 200; // generous ceiling — score gap cuts naturally within this
 const FETCH_MULTIPLIER = 3; // fetch more from each path to improve union quality
 const RRF_K = 60; // Reciprocal Rank Fusion constant — dampens top-rank dominance
-const DEFAULT_RECENCY_DECAY = 0.02; // ~50% penalty at 50 days old
 const SEMANTIC_DISCOVERY_BOOST = 1.05; // gentle lift for sessions found only by semantic path
+
+// ---------------------------------------------------------------------------
+// Recency weighting
+// ---------------------------------------------------------------------------
+
+/**
+ * Per-candidate recency multiplier on the RRF score. `decay` falsy/≤0 → 1 (off,
+ * the default). `> 0` → absolute now-anchored `1/(1+ageDays·decay)`; `--recent` = 0.10.
+ */
+export function recencyMultiplier(decay: number | undefined, ageMs: number): number {
+  if (!(decay && decay > 0)) return 1;
+  const ageDays = Math.max(0, ageMs) / 86_400_000; // future-dated (clock skew) → age 0, no penalty
+  return 1 / (1 + ageDays * decay);
+}
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -138,15 +152,14 @@ export async function dualPathSearch(
     summary: `FTS5: ${ftsResults.length} results, Semantic: ${semanticResults.length} results${!semanticAvailable ? ' (UNAVAILABLE — embed failed)' : ''}`,
   });
 
-  // RRF merge with recency decay — scale-invariant fusion of ranked lists
-  const decay = opts?.recencyDecay ?? DEFAULT_RECENCY_DECAY;
+  // RRF merge with recency weighting — scale-invariant fusion of ranked lists
+  const decay = opts?.recencyDecay;
   const now = Date.now();
   const rrfScores = new Map<string, ScoredResult>();
 
   for (let i = 0; i < ftsResults.length; i++) {
     const r = ftsResults[i]!;
-    const ageDays = (now - r.created_at) / 86_400_000;
-    const recency = 1 / (1 + ageDays * decay);
+    const recency = recencyMultiplier(decay, now - r.created_at);
     rrfScores.set(r.message_id, { result: r, score: (1 / (RRF_K + i)) * recency, paths: ['fts5'] });
   }
 
@@ -154,8 +167,7 @@ export async function dualPathSearch(
 
   for (let i = 0; i < semanticResults.length; i++) {
     const r = semanticResults[i]!;
-    const ageDays = (now - r.created_at) / 86_400_000;
-    const recency = 1 / (1 + ageDays * decay);
+    const recency = recencyMultiplier(decay, now - r.created_at);
     const rrfScore = (1 / (RRF_K + i)) * recency;
     const existing = rrfScores.get(r.message_id);
     if (existing) {

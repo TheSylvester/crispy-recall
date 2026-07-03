@@ -486,7 +486,7 @@ async function runSearch(query: string) {
     limit: ceiling,
     projectId: effectiveProject,
     ...(noIdf ? { skipIdf: true } : {}),
-    ...(recent ? { recencyDecay: 0.10 } : {}),
+    ...(recent ? { recencyDecay: 0.10 } : {}), // default is off; --recent opts into absolute age decay
   });
   let { scored } = r;
 
