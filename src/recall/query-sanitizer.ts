@@ -127,8 +127,15 @@ function normalizeTokenSeparators(input: string): string {
  *
  * Returns the sanitized query string, or `null` if the input is
  * empty/whitespace-only (callers should skip the MATCH entirely).
+ *
+ * When `opts.skipIdf` is set, the high-frequency (low-IDF) term filter for
+ * 3+ word queries is bypassed: every word is kept (escaped, deduplicated,
+ * OR-joined) so common-but-meaningful terms like "when"/"before"/"after"
+ * survive. FTS5 operator/punctuation escaping is unchanged — "skip IDF" is
+ * NOT "zero sanitization" (raw MATCH input would be a syntax error). Used by
+ * the `--no-idf` retrieval config.
  */
-export function sanitizeFts5Query(raw: string): string | null {
+export function sanitizeFts5Query(raw: string, opts?: { skipIdf?: boolean }): string | null {
   const trimmed = raw.trim();
   if (!trimmed) return null;
 
@@ -174,29 +181,33 @@ export function sanitizeFts5Query(raw: string): string | null {
   // 3+ words — filter by IDF before building OR query.
   // Drop terms appearing in >15% of indexed messages (high-frequency noise).
   // Uses FTS5-native stemmer to guarantee stems match the index.
+  // When skipIdf is set, this filter is bypassed entirely (every word kept).
   const originalCount = words.length;
-  const dropped: string[] = [];
-  words = words.filter(w => {
-    const df = getTermDocFrequency(w);
-    if (df >= IDF_PERCENTILE_THRESHOLD) {
-      dropped.push(`${w}(${(df * 100).toFixed(0)}%)`);
-      return false;
-    }
-    return true;
-  });
-
-  if (dropped.length > 0) {
-    log({
-      source: 'query-sanitizer',
-      level: 'debug',
-      summary: `IDF filter: ${originalCount} → ${words.length} terms, dropped: ${dropped.join(', ')}`,
+  if (!opts?.skipIdf) {
+    const dropped: string[] = [];
+    words = words.filter(w => {
+      const df = getTermDocFrequency(w);
+      if (df >= IDF_PERCENTILE_THRESHOLD) {
+        dropped.push(`${w}(${(df * 100).toFixed(0)}%)`);
+        return false;
+      }
+      return true;
     });
+
+    if (dropped.length > 0) {
+      log({
+        source: 'query-sanitizer',
+        level: 'debug',
+        summary: `IDF filter: ${originalCount} → ${words.length} terms, dropped: ${dropped.join(', ')}`,
+      });
+    }
   }
 
   // Deduplicate (e.g., "recall" appeared multiple times in the raw query)
   words = [...new Set(words.map(w => w.toLowerCase()))];
 
-  // After filtering, may have 0-2 words left
+  // After filtering, may have 0-2 words left (skipIdf never drops, so this
+  // fallback only triggers when the IDF filter removed everything).
   if (words.length === 0) {
     // All words were high-frequency — fall back to rarest 5 from original
     const originalWords = [...new Set(

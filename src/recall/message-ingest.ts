@@ -30,6 +30,7 @@ import {
   insertMessageVectors,
 } from './message-store.js';
 import type { MessageRecord, MessageVectorRecord } from './message-store.js';
+import { DOC_PREFIX, EMBED_VERSION, buildEmbedText } from './embed-config.js';
 import { getDb } from '../db.js';
 import { dbPath } from '../paths.js';
 import { normalizePath } from '../url-path-resolver.js';
@@ -251,6 +252,12 @@ async function embedRowsResilient(
   const { embedBatch } = await import('./embedder.js');
   const { quantizeToQ8, computeNorm } = await import('./quantize.js');
 
+  // Prefix every document with DOC_PREFIX (nomic task instruction). Applied once
+  // here so it survives both the whole-batch path and the SAFE_EMBED_CHARS
+  // fallback slice (which slices from index 0, keeping the prefix at the front).
+  // Only the embed *input* is prefixed; the stored message_text is untouched.
+  rows = rows.map((r) => ({ messageId: r.messageId, text: DOC_PREFIX + r.text }));
+
   const toRecord = (messageId: string, f32: Float32Array): MessageVectorRecord => {
     const { q8, scale } = quantizeToQ8(f32);
     return { messageId, embeddingQ8: q8, norm: computeNorm(f32), quantScale: scale };
@@ -303,24 +310,36 @@ export async function embedSessionMessages(
 ): Promise<number> {
   const d = getDb(dbPath());
 
-  // Only fetch messages that don't have vectors yet (unless force)
+  // Only fetch messages that don't have vectors yet (unless force). The
+  // correlated prev_text subquery fetches the immediately-preceding turn so
+  // buildEmbedText can context-enrich short messages (embed input only).
   const rows = d.all(
     force
-      ? `SELECT message_id, message_text FROM messages WHERE session_id = ? ORDER BY message_seq ASC`
-      : `SELECT m.message_id, m.message_text FROM messages m
+      ? `SELECT m.message_id, m.message_text,
+           (SELECT p.message_text FROM messages p
+             WHERE p.session_id = m.session_id AND p.message_seq < m.message_seq
+             ORDER BY p.message_seq DESC LIMIT 1) AS prev_text
+         FROM messages m WHERE m.session_id = ? ORDER BY m.message_seq ASC`
+      : `SELECT m.message_id, m.message_text,
+           (SELECT p.message_text FROM messages p
+             WHERE p.session_id = m.session_id AND p.message_seq < m.message_seq
+             ORDER BY p.message_seq DESC LIMIT 1) AS prev_text
+         FROM messages m
          WHERE m.session_id = ?
-           AND NOT EXISTS (SELECT 1 FROM message_vectors mv WHERE mv.message_id = m.message_id)
+           AND NOT EXISTS (SELECT 1 FROM message_vectors mv WHERE mv.message_id = m.message_id AND mv.embed_version = ?)
          ORDER BY m.message_seq ASC`,
-    [sessionId],
+    force ? [sessionId] : [sessionId, EMBED_VERSION],
   ) as Array<Record<string, unknown>>;
 
   const validRows: Array<{ messageId: string; text: string }> = [];
   for (const r of rows) {
-    const text = (r.message_text as string).trim();
-    if (!text) continue;
+    const messageText = (r.message_text as string).trim();
+    if (!messageText) continue;
+    const prevText = (r.prev_text as string) ?? null;
+    const embedText = buildEmbedText(messageText, prevText);
     validRows.push({
       messageId: r.message_id as string,
-      text: text.length > MAX_EMBED_CHARS ? text.slice(0, MAX_EMBED_CHARS) : text,
+      text: embedText.length > MAX_EMBED_CHARS ? embedText.slice(0, MAX_EMBED_CHARS) : embedText,
     });
   }
   if (validRows.length === 0) return 0;
@@ -349,13 +368,15 @@ export async function embedSessionMessages(
  * @returns         Number of messages successfully embedded.
  */
 export async function embedMessageBatch(
-  messages: Array<{ message_id: string; message_text: string }>,
+  messages: Array<{ message_id: string; message_text: string; embed_text?: string }>,
 ): Promise<number> {
   if (messages.length === 0) return 0;
 
   const truncated: Array<{ messageId: string; text: string }> = [];
   for (const m of messages) {
-    const text = m.message_text.trim();
+    // Embed the context-enriched input when present (from getUnembeddedMessages
+    // via buildEmbedText); fall back to raw message_text otherwise.
+    const text = (m.embed_text ?? m.message_text).trim();
     if (!text) continue;
     truncated.push({
       messageId: m.message_id,

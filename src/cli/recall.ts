@@ -68,6 +68,12 @@ function flagInt(name: string, fallback: number): number {
 }
 
 const raw = hasFlag('--raw');
+// --raw-messages: emit the FULL pre-shaping per-message ranked list (bypasses
+// score-gap cutoff + session-dedup + pagination) as a JSON object. For per-turn
+// retrieval scoring (e.g. recall@k harnesses) that need individual turns, not
+// session rows. --no-idf bypasses the FTS5 IDF high-frequency-term filter.
+const rawMessages = hasFlag('--raw-messages');
+const noIdf = hasFlag('--no-idf');
 const showHelp = hasFlag('--help') || hasFlag('-h');
 const showVersion = hasFlag('--version') || hasFlag('-v');
 const listMode = hasFlag('--list');
@@ -105,7 +111,8 @@ const effectiveProject = allProjects ? undefined : normalizePath(projectFlag ?? 
 // Collect positional args (skip flags and their values)
 const FLAG_WITH_VALUE = new Set(['--limit', '--offset', '--since', '--until', '--project', '--vendor']);
 const FLAG_BOOLEAN = new Set([
-  '--raw', '--help', '-h', '--version', '-v', '--list', '--all', '--reverse', '--recent',
+  '--raw', '--raw-messages', '--no-idf',
+  '--help', '-h', '--version', '-v', '--list', '--all', '--reverse', '--recent',
   '--no-catchup', '--auto-embed', '--detach',
   // installer subcommand flags
   '--yes', '--offline', '--json', '--purge', '--integrity',
@@ -162,6 +169,11 @@ FLAGS
   --recent         Strongly boost recent sessions in search ranking
   --reverse        Read session messages newest-first (default: oldest-first)
   --raw            Output raw JSON instead of formatted tables
+  --raw-messages   Output the FULL pre-shaping per-message ranked list as JSON
+                   (bypasses score-gap cutoff, session-dedup, and pagination);
+                   for per-turn retrieval scoring. Honors --limit as the top-k.
+  --no-idf         Bypass the FTS5 IDF high-frequency-term filter (keeps
+                   common-but-meaningful terms like when/before/after)
   --list           List sessions mode
   --no-catchup     Skip the per-invocation mtime catch-up scan (T1)
   --help, -h       Show this help
@@ -473,7 +485,8 @@ async function runSearch(query: string) {
   const r = await dualPathSearch(query, {
     limit: ceiling,
     projectId: effectiveProject,
-    ...(recent ? { recencyDecay: 0.10 } : {}),
+    ...(noIdf ? { skipIdf: true } : {}),
+    ...(recent ? { recencyDecay: 0.10 } : {}), // default is off; --recent opts into absolute age decay
   });
   let { scored } = r;
 
@@ -502,6 +515,36 @@ async function runSearch(query: string) {
       console.error(`Invalid --until date: "${until}" (expected ISO-8601)`);
       exit(1);
     }
+  }
+
+  // --- Raw per-message output (bypass all shaping) ---
+  // Emit the full RRF-merged per-message ranked list (top `ceiling`), skipping
+  // the score-gap cutoff, session-dedup, and pagination below. This is the
+  // UNSHAPED list of individual turns that per-turn retrieval scorers consume.
+  if (rawMessages) {
+    const top = scored.slice(0, ceiling);
+    console.log(JSON.stringify({
+      query,
+      no_idf: noIdf,
+      semantic_available: r.semanticAvailable,
+      semantic_count: r.semanticCount,
+      fts_count: r.ftsCount,
+      total: top.length,
+      messages: top.map((x, i) => ({
+        rank: i + 1,
+        session_id: x.result.session_id,
+        message_id: x.result.message_id,
+        message_seq: x.result.message_seq,
+        score: x.score,
+        snippet: (x.result.match_snippet || x.result.message_preview || '')
+          .slice(0, 200)
+          .replace(/\n/g, ' '),
+        tag: x.paths.includes('fts5') && x.paths.includes('semantic')
+          ? 'FTS5+SEMANTIC'
+          : x.paths.includes('semantic') ? 'SEMANTIC-ONLY' : 'FTS5-ONLY',
+      })),
+    }, null, 2));
+    return;
   }
 
   // --- Score-gap cutoff ---

@@ -20,7 +20,7 @@ vi.mock('../../src/recall/quantize.js', async () => {
 
 import { searchMessagesFts, searchMessagesSemantic } from '../../src/recall/message-store.js';
 import { embed } from '../../src/recall/embedder.js';
-import { dualPathSearch } from '../../src/recall/vector-search.js';
+import { dualPathSearch, recencyMultiplier } from '../../src/recall/vector-search.js';
 
 const mockSearchFts = vi.mocked(searchMessagesFts);
 const mockSearchSemantic = vi.mocked(searchMessagesSemantic);
@@ -163,6 +163,7 @@ describe('dualPathSearch', () => {
       'proj1',
       'sess1',
       undefined,
+      undefined,
     );
     expect(mockSearchSemantic).toHaveBeenCalledWith(
       expect.any(Int8Array),
@@ -170,5 +171,59 @@ describe('dualPathSearch', () => {
       expect.any(Number),
       expect.objectContaining({ projectId: 'proj1', sessionId: 'sess1' }),
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// recencyMultiplier — default off, --recent absolute
+// ---------------------------------------------------------------------------
+
+const DAY = 86_400_000;
+
+describe('recencyMultiplier', () => {
+  it('default (undefined) → 1 (off) regardless of age', () => {
+    expect(recencyMultiplier(undefined, 0)).toBe(1);
+    expect(recencyMultiplier(undefined, 500 * DAY)).toBe(1);
+  });
+
+  it('0 and negative decay → 1 (off)', () => {
+    expect(recencyMultiplier(0, 500 * DAY)).toBe(1);
+    expect(recencyMultiplier(-0.1, 500 * DAY)).toBe(1);
+  });
+
+  it('> 0 → absolute 1/(1+ageDays·decay)', () => {
+    expect(recencyMultiplier(0.10, 30 * DAY)).toBeCloseTo(1 / (1 + 30 * 0.10), 10); // --recent at 30d
+    expect(recencyMultiplier(0.02, 50 * DAY)).toBeCloseTo(0.5, 10);                 // legacy 0.02 = 0.5 at 50d
+    expect(recencyMultiplier(0.10, 0)).toBe(1);                                     // age 0 → no penalty
+  });
+
+  it('future-dated (negative age) → 1, never Infinity or negative', () => {
+    expect(recencyMultiplier(0.10, -10 * DAY)).toBe(1);   // 10d future under --recent
+    expect(recencyMultiplier(0.10, -999 * DAY)).toBe(1);  // far future → still clamped, no sign flip
+    expect(Number.isFinite(recencyMultiplier(0.10, -10 * DAY))).toBe(true);
+  });
+
+  it('monotonic non-increasing in age for a positive decay', () => {
+    const d = 0.05;
+    let prev = Infinity;
+    for (const days of [0, 1, 10, 100, 1000]) {
+      const r = recencyMultiplier(d, days * DAY);
+      expect(r).toBeLessThanOrEqual(prev);
+      prev = r;
+    }
+  });
+});
+
+describe('CLI recency flag (mirrors recall.ts runSearch spread)', () => {
+  // Default search passes no recencyDecay → off; --recent opts into absolute 0.10.
+  function resolve(o: { recent?: boolean }): number | undefined {
+    const opts: { recencyDecay?: number } = { ...(o.recent ? { recencyDecay: 0.10 } : {}) };
+    return opts.recencyDecay;
+  }
+  it('no flag → undefined (off)', () => {
+    expect(resolve({})).toBeUndefined();
+  });
+  it('--recent → 0.10', () => {
+    expect(resolve({ recent: true })).toBe(0.10);
   });
 });
