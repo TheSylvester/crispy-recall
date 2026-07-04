@@ -10,11 +10,11 @@
  *      backstop that re-reads transcripts from disk.
  *
  * Why (3) goes through catch-up: the Stop hook is best-effort by design. It
- * runs with a 500 ms busy_timeout (stop-hook.ts) and `node-sqlite3-wasm`'s
- * cross-process lock is a coarse directory mutex, so under a burst of truly
- * simultaneous writers an individual hook write can be deferred. That is not
- * data loss — the transcript JSONL on disk is the source of truth and the DB
- * is a rebuildable index. `runFts5Catchup` (the same pass `recall backfill`
+ * runs with a 5000 ms busy_timeout (stop-hook.ts) and, even under real WAL
+ * (better-sqlite3), a burst of truly simultaneous writers can still briefly
+ * contend, so an individual hook write can be deferred. That is not data
+ * loss — the transcript JSONL on disk is the source of truth and the DB is a
+ * rebuildable index. `runFts5Catchup` (the same pass `recall backfill`
  * and the installer run) re-ingests anything the fast-path dropped, single-
  * process and contention-free. Asserting immediate per-hook landing would
  * over-specify beyond what the architecture guarantees and flake under load;

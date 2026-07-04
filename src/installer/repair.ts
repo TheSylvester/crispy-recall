@@ -80,7 +80,10 @@ export async function repairFull(opts: RepairFullOptions = {}): Promise<void> {
   }
 
   const d = db();
-  d.exec('BEGIN');
+  // BEGIN IMMEDIATE: acquire the write lock up front so a concurrent writer
+  // (a Stop hook mid-repair) waits on busy_timeout instead of hitting a
+  // deferred-transaction SQLITE_BUSY_SNAPSHOT under WAL.
+  d.exec('BEGIN IMMEDIATE');
   try {
     // DELETE FROM messages cascades to message_vectors (FK) + messages_fts (trigger).
     d.exec('DELETE FROM messages;');

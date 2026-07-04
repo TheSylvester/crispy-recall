@@ -8,14 +8,34 @@
  * @module installer/doctor
  */
 
+import { existsSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import Database from 'better-sqlite3';
 import { runPreflight, type PreflightReport } from './preflight.js';
 import { readConfig } from './config.js';
 import { integrityCheck } from './repair.js';
+import { isBindingLoadError } from '../db.js';
+import { binDir, dbPath } from '../paths.js';
 
 export interface DoctorOptions {
   json?: boolean;
   integrity?: boolean;
   offline?: boolean;
+}
+
+/**
+ * Native-binding + WAL drift health. Read-only: it opens the DB `readonly` and
+ * only READS `journal_mode` — it never runs `journal_mode = WAL`, so it can
+ * never implicitly convert the live DB (that is an attended, separate event).
+ */
+export interface BindingHealth {
+  installed: boolean;        // recall bundles staged at all?
+  markerPresent: boolean;    // .binding-info.json (absent = pre-migration wasm-era install)
+  abiOk: boolean | null;     // staged ABI matches current Node (null if no marker)
+  pinnedNodeOk: boolean | null; // pinned node path still exists (null if no marker)
+  bindingLoads: boolean;     // better_sqlite3.node loads under this Node
+  journalMode: string | null;   // current mode on the live DB (null if DB absent/unreadable)
+  problems: string[];
 }
 
 /** Returns a process exit code (0 = healthy, 1 = problems found). */
@@ -24,13 +44,123 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<number> {
 
   const report = await runPreflight({ ...(opts.offline ? { offline: true } : {}) });
   const embedder = readConfig()?.embedder ?? null;
+  const binding = checkBindingHealth();
 
   if (opts.json) {
-    console.log(JSON.stringify({ ...report, embedder }, null, 2));
+    console.log(JSON.stringify({ ...report, embedder, binding }, null, 2));
   } else {
     printTable(report, embedder?.mode ?? 'cpu', embedder?.fallbackReason);
+    printBinding(binding);
   }
-  return report.failures.length > 0 ? 1 : 0;
+  const bindingFailed = binding.installed && binding.problems.length > 0;
+  return report.failures.length > 0 || bindingFailed ? 1 : 0;
+}
+
+/** Path to the staged addon (beside the bundles). */
+function stagedBindingPath(): string {
+  return join(binDir(), 'better_sqlite3.node');
+}
+
+function checkBindingHealth(): BindingHealth {
+  const problems: string[] = [];
+  const installed = existsSync(join(binDir(), 'recall.js'));
+  if (!installed) {
+    return {
+      installed: false, markerPresent: false, abiOk: null, pinnedNodeOk: null,
+      bindingLoads: false, journalMode: null, problems: ['recall is not installed — run `recall install`'],
+    };
+  }
+
+  // --- ABI marker ---
+  const markerPath = join(binDir(), '.binding-info.json');
+  const markerPresent = existsSync(markerPath);
+  let abiOk: boolean | null = null;
+  let pinnedNodeOk: boolean | null = null;
+  if (!markerPresent) {
+    problems.push('no .binding-info.json marker — pre-migration (wasm-era) install; run `recall install --restage`');
+  } else {
+    try {
+      const marker = JSON.parse(readFileSync(markerPath, 'utf-8')) as {
+        nodeModuleVersion?: string; nodePath?: string;
+      };
+      abiOk = String(marker.nodeModuleVersion) === String(process.versions.modules);
+      if (!abiOk) {
+        problems.push(
+          `binding ABI mismatch (staged for NODE_MODULE_VERSION ${marker.nodeModuleVersion}, ` +
+            `current ${process.versions.modules}) — run \`recall install --restage\``,
+        );
+      }
+      pinnedNodeOk = !!marker.nodePath && existsSync(marker.nodePath);
+      if (!pinnedNodeOk) {
+        problems.push(`pinned Node path missing (${marker.nodePath ?? 'unset'}) — run \`recall install --restage\``);
+      }
+    } catch {
+      problems.push('unreadable .binding-info.json marker — run `recall install --restage`');
+    }
+  }
+
+  // --- Binding load + WAL drift (read-only) ---
+  let bindingLoads = false;
+  let journalMode: string | null = null;
+  const localBinding = stagedBindingPath();
+  const dbFile = dbPath();
+  if (existsSync(dbFile)) {
+    try {
+      const raw = existsSync(localBinding)
+        ? new Database(dbFile, { readonly: true, fileMustExist: true, nativeBinding: localBinding })
+        : new Database(dbFile, { readonly: true, fileMustExist: true });
+      bindingLoads = true;
+      journalMode = String(raw.pragma('journal_mode', { simple: true }));
+      raw.close();
+      if (journalMode !== 'wal') {
+        problems.push(
+          `live DB journal_mode is '${journalMode}', not 'wal' — a native build on a non-WAL DB is drift ` +
+            `(the WAL conversion is a separate attended step; do not restage over a delete-mode DB blindly)`,
+        );
+      }
+    } catch (e) {
+      if (isBindingLoadError(e)) {
+        problems.push('better_sqlite3.node failed to load (ABI/dlopen) — run `recall install --restage`');
+      } else {
+        problems.push(`could not read live DB journal_mode: ${(e as Error).message}`);
+      }
+    }
+  } else {
+    // No DB yet — prove the binding at least loads against an in-memory DB.
+    try {
+      const raw = existsSync(localBinding)
+        ? new Database(':memory:', { nativeBinding: localBinding })
+        : new Database(':memory:');
+      bindingLoads = true;
+      raw.close();
+    } catch (e) {
+      problems.push(
+        isBindingLoadError(e)
+          ? 'better_sqlite3.node failed to load (ABI/dlopen) — run `recall install --restage`'
+          : `binding self-test failed: ${(e as Error).message}`,
+      );
+    }
+  }
+
+  return { installed, markerPresent, abiOk, pinnedNodeOk, bindingLoads, journalMode, problems };
+}
+
+function printBinding(b: BindingHealth): void {
+  const ok = (v: boolean) => (v ? 'OK' : 'FAIL');
+  console.log('\nSQLite binding (better-sqlite3, native WAL)');
+  console.log('------------------------------------------');
+  if (!b.installed) {
+    console.log('  not installed — run `recall install`');
+    return;
+  }
+  console.log(`Binding loads:  ${ok(b.bindingLoads)}`);
+  console.log(`ABI marker:     ${b.markerPresent ? (b.abiOk ? 'OK' : 'MISMATCH') : 'absent (wasm-era)'}`);
+  console.log(`Pinned Node:    ${b.pinnedNodeOk === null ? 'n/a' : ok(b.pinnedNodeOk)}`);
+  console.log(`journal_mode:   ${b.journalMode ?? 'no DB yet'}${b.journalMode && b.journalMode !== 'wal' ? '  [DRIFT]' : ''}`);
+  if (b.problems.length) {
+    console.log('  Issues:');
+    for (const p of b.problems) console.log(`   ✖ ${p}`);
+  }
 }
 
 function printIntegrity(json: boolean): number {

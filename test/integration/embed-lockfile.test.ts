@@ -20,7 +20,7 @@ import {
 import { join } from 'node:path';
 import { tmpdir, homedir } from 'node:os';
 import { randomUUID } from 'node:crypto';
-import { Database as DatabaseConstructor } from 'node-sqlite3-wasm';
+import { getDb, _resetDb } from '../../src/db.js';
 
 const ROOT = join(__dirname, '..', '..');
 const EMBED_BUNDLE = join(ROOT, 'dist', 'embed-pending.js');
@@ -32,38 +32,16 @@ const binariesReady =
   existsSync(EMBED_BUNDLE) && existsSync(LLAMA_EMBED_BIN) && existsSync(NOMIC_MODEL);
 
 function seedMessages(dbFile: string, sessions: string[], perSession: number): string[] {
-  const db = new DatabaseConstructor(dbFile);
-  db.exec('PRAGMA busy_timeout = 5000');
-  db.exec('PRAGMA journal_mode = WAL');
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS messages (
-      message_id    TEXT PRIMARY KEY,
-      session_id    TEXT NOT NULL,
-      message_seq   INTEGER NOT NULL,
-      message_text  TEXT NOT NULL,
-      project_id    TEXT,
-      created_at    INTEGER NOT NULL,
-      message_role  TEXT,
-      UNIQUE(session_id, message_id)
-    );
-    CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
-      message_text, content=messages, content_rowid=rowid, tokenize='porter unicode61'
-    );
-    CREATE TRIGGER IF NOT EXISTS messages_fts_ai AFTER INSERT ON messages BEGIN
-      INSERT INTO messages_fts(rowid, message_text) VALUES (new.rowid, new.message_text);
-    END;
-    CREATE TABLE IF NOT EXISTS message_vectors (
-      message_id   TEXT PRIMARY KEY REFERENCES messages(message_id) ON DELETE CASCADE,
-      embedding_q8 BLOB NOT NULL,
-      norm         REAL NOT NULL,
-      quant_scale  REAL NOT NULL
-    );
-  `);
+  // Seed through the real getDb/ensureSchema (better-sqlite3, WAL) so the fixture
+  // schema never drifts from production — the hand-rolled subset used to omit
+  // embed_version. Close (via _resetDb) before the child processes run.
+  const db = getDb(dbFile);
   const ids: string[] = [];
   const insert = db.prepare(
     `INSERT INTO messages (message_id, session_id, message_seq, message_text, project_id, created_at, message_role)
      VALUES (?, ?, ?, ?, ?, ?, ?)`,
   );
+  db.exec('BEGIN IMMEDIATE');
   try {
     for (const sid of sessions) {
       for (let i = 0; i < perSession; i++) {
@@ -75,10 +53,12 @@ function seedMessages(dbFile: string, sessions: string[], perSession: number): s
         ids.push(id);
       }
     }
-  } finally {
-    insert.finalize();
-    db.close();
+    db.exec('COMMIT');
+  } catch (e) {
+    db.exec('ROLLBACK');
+    throw e;
   }
+  _resetDb();
   return ids;
 }
 
@@ -164,8 +144,8 @@ describe.skipIf(!binariesReady)('embed-pending lockfile concurrency', () => {
     expect(serverStarts).toBeLessThanOrEqual(1);
 
     // Every seeded message is vectorized exactly once.
-    const db = new DatabaseConstructor(dbFile);
     try {
+      const db = getDb(dbFile);
       const rows = db.all(
         `SELECT message_id, COUNT(*) AS n FROM message_vectors GROUP BY message_id`,
       ) as Array<{ message_id: string; n: number }>;
@@ -177,7 +157,7 @@ describe.skipIf(!binariesReady)('embed-pending lockfile concurrency', () => {
         expect(r.n).toBe(1);
       }
     } finally {
-      db.close();
+      _resetDb();
     }
 
     // Lockfile cleaned up after the active child exited.
@@ -209,15 +189,15 @@ describe.skipIf(!binariesReady)('embed-pending lockfile concurrency', () => {
     expect(result.exitCode).toBe(0);
 
     // It should have taken the lock and actually embedded.
-    const db = new DatabaseConstructor(dbFile);
     try {
+      const db = getDb(dbFile);
       const rows = db.all(
         `SELECT message_id FROM message_vectors WHERE message_id IN (${seeded.map(() => '?').join(',')})`,
         seeded,
       ) as Array<{ message_id: string }>;
       expect(rows.length).toBe(seeded.length);
     } finally {
-      db.close();
+      _resetDb();
     }
 
     // Lockfile released after exit.

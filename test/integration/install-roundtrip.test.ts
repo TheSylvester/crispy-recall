@@ -91,7 +91,8 @@ describe('install-roundtrip', () => {
     const skillPath = join(claudeDir, 'skills', 'recall', 'SKILL.md');
     expect(existsSync(skillPath)).toBe(true);
     const skill = readFileSync(skillPath, 'utf-8');
-    const runnable = `node ${join(binDir(), 'recall.js')}`;
+    // Runnable is the pinned-node form: `"<execPath>" "<binDir>/recall.js"`.
+    const runnable = `"${process.execPath}" "${join(binDir(), 'recall.js')}"`;
     expect(skill).toContain(runnable);
     expect(skill).not.toContain('$RECALL_BIN'); // fully substituted
 

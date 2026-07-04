@@ -31,7 +31,7 @@
     "THIRD-PARTY-LICENSES"
   ],
   "engines": {
-    "node": ">=20"
+    "node": ">=22.16"
   },
   "scripts": {
     "build": "node scripts/build.mjs",
@@ -39,9 +39,13 @@
     "test": "vitest run",
     "prepublishOnly": "npm run build"
   },
+  "dependencies": {
+    "better-sqlite3": "^12.11.1"
+  },
   "devDependencies": {
     "@anthropic-ai/claude-agent-sdk": "0.2.114",
     "@clack/prompts": "^0.7.0",
+    "@types/better-sqlite3": "^7.6.11",
     "@types/node": "^20.0.0",
     "esbuild": "^0.20.0",
     "extract-zip": "^2.0.1",

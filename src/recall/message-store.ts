@@ -77,7 +77,12 @@ export function insertMessages(
   ensureDir();
   const d = db();
 
-  d.exec('BEGIN');
+  // BEGIN IMMEDIATE (not deferred): take the write lock up front so a
+  // contended writer WAITS on busy_timeout and serializes. A deferred BEGIN
+  // opens a read snapshot first, and the later read→write upgrade throws
+  // SQLITE_BUSY_SNAPSHOT the busy handler can't wait on — the exact "database
+  // is locked" the WAL migration must eliminate for concurrent Stop hooks.
+  d.exec('BEGIN IMMEDIATE');
   try {
     if (opts?.replaceSessionId) {
       // Delete vectors explicitly (belt-and-suspenders with the CASCADE), then
@@ -94,20 +99,16 @@ export function insertMessages(
        (message_id, session_id, message_seq, message_text, project_id, created_at, message_role)
        VALUES (?, ?, ?, ?, ?, ?, ?)`,
     );
-    try {
-      for (const m of messages) {
-        stmt.run([
-          m.message_id,
-          m.session_id,
-          m.message_seq,
-          m.message_text,
-          m.project_id,
-          m.created_at,
-          m.message_role,
-        ]);
-      }
-    } finally {
-      stmt.finalize();
+    for (const m of messages) {
+      stmt.run([
+        m.message_id,
+        m.session_id,
+        m.message_seq,
+        m.message_text,
+        m.project_id,
+        m.created_at,
+        m.message_role,
+      ]);
     }
     d.exec('COMMIT');
   } catch (e) {
@@ -529,25 +530,26 @@ export function insertMessageVectors(records: MessageVectorRecord[]): void {
   ensureDir();
   const d = db();
 
-  d.exec('BEGIN');
+  // BEGIN IMMEDIATE (not deferred): take the write lock up front so a
+  // contended writer WAITS on busy_timeout and serializes. A deferred BEGIN
+  // opens a read snapshot first, and the later read→write upgrade throws
+  // SQLITE_BUSY_SNAPSHOT the busy handler can't wait on — the exact "database
+  // is locked" the WAL migration must eliminate for concurrent Stop hooks.
+  d.exec('BEGIN IMMEDIATE');
   try {
     const stmt = d.prepare(
       `INSERT OR REPLACE INTO message_vectors
        (message_id, embedding_q8, norm, quant_scale, embed_version)
        VALUES (?, ?, ?, ?, ?)`,
     );
-    try {
-      for (const r of records) {
-        stmt.run([
-          r.messageId,
-          Buffer.from(r.embeddingQ8.buffer, r.embeddingQ8.byteOffset, r.embeddingQ8.byteLength),
-          r.norm,
-          r.quantScale,
-          EMBED_VERSION,
-        ]);
-      }
-    } finally {
-      stmt.finalize();
+    for (const r of records) {
+      stmt.run([
+        r.messageId,
+        Buffer.from(r.embeddingQ8.buffer, r.embeddingQ8.byteOffset, r.embeddingQ8.byteLength),
+        r.norm,
+        r.quantScale,
+        EMBED_VERSION,
+      ]);
     }
     d.exec('COMMIT');
   } catch (e) {

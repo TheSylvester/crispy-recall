@@ -48,12 +48,13 @@ async function runStopHook(): Promise<void> {
   if (payload.stop_hook_active) process.exit(0); // recursion guard
 
   try {
-    // 500 ms busy_timeout for hook DB writes — multi-process contention defers
-    // to T1 mtime-scan rather than blocking Claude Code on the writer lock.
-    // (Other recall connections keep the 5000 ms default set in db.ts.) Inside
-    // the try so a DB open/init failure is logged and swallowed — the hook must
+    // 5000 ms busy_timeout for hook DB writes. The wasm-era 500 ms was a
+    // contention dodge (its coarse mkdir lock blocked even readers); under real
+    // WAL a writer never blocks a reader and short writes settle well inside
+    // 5 s, so match db.ts's default. Inside the try so a DB open/init failure —
+    // including a BindingLoadError — is logged and swallowed: the hook must
     // always exit 0 and never block the user's turn.
-    getDb(dbPath()).exec("PRAGMA busy_timeout = 500;");
+    getDb(dbPath()).exec("PRAGMA busy_timeout = 5000;");
 
     const vendor = vendorForTranscript(payload.transcript_path);
 

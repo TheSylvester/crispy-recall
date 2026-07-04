@@ -11,7 +11,9 @@ import { tmpdir } from 'node:os';
 import { mergeStopHook, removeStopHook } from '../../src/installer/settings-merge.js';
 
 const HOOK = '/home/u/.recall/bin/stop-hook.js';
-const CMD = `node ${HOOK}`;
+// The hook command pins the installing Node's execPath (ABI-lock survival) and
+// quotes both paths — see settings-merge.ts mergeStopHook.
+const CMD = `"${process.execPath}" "${HOOK}"`;
 
 let dir: string;
 function setup(content: string, name = 'settings.json'): string {

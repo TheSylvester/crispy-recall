@@ -126,7 +126,15 @@ function makeEntry(command: string): HookEntry {
  * absent. `hookScriptPath` is the absolute path to the staged stop-hook.js.
  */
 export function mergeStopHook(filePath: string, hookScriptPath: string): MergeResult {
-  const desiredCommand = `node ${hookScriptPath}`;
+  // Pin the installing Node's absolute path (not a bare `node`). The
+  // better-sqlite3 addon is ABI-locked to the Node it was built for, so the
+  // hook must run under that exact interpreter — a PATH `node` that later
+  // points at a different major would fail to load the binding. Quote BOTH
+  // paths: ~/.recall or a user home can contain spaces. `isRecallCommand` is
+  // path-based (matches stop-hook.js + a recall marker), so it still recognizes
+  // this pinned form and heals a stale command in place (idempotent when the
+  // pinned node is unchanged; rewrites on an ABI/node-path change).
+  const desiredCommand = `"${process.execPath}" "${hookScriptPath}"`;
   const exists = existsSync(filePath);
   const raw = exists ? readFileSync(filePath, 'utf-8') : null;
   const obj: SettingsShape = raw && raw.trim().length > 0 ? parseTolerant(raw) : {};

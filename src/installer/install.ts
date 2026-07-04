@@ -18,9 +18,10 @@ import {
 } from '@clack/prompts';
 import {
   existsSync, readFileSync, writeFileSync, copyFileSync, mkdirSync, openSync,
-  realpathSync,
+  realpathSync, readdirSync, statSync, unlinkSync,
 } from 'node:fs';
 import { spawn } from 'node:child_process';
+import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
 import { binDir, modelsDir, runDir, logsDir, recallRoot, dbPath } from '../paths.js';
 import { getDb } from '../db.js';
@@ -99,9 +100,13 @@ function resolveTemplatePath(explicit?: string): string {
   return candidates[candidates.length - 1]!;
 }
 
-/** The directly-runnable command the skill body uses (NOT a bare path). */
+/** The directly-runnable command the skill body uses (NOT a bare path).
+ *  Pins the installing Node's absolute path — same ABI-lock reasoning as the
+ *  Stop hook command (settings-merge.ts): the CLI bundle loads the ABI-locked
+ *  better_sqlite3.node and must run under the Node it was built for. Both paths
+ *  are quoted (spaces in ~/.recall / user home). */
 function recallBinCommand(): string {
-  return `node ${join(binDir(), 'recall.js')}`;
+  return `"${process.execPath}" "${join(binDir(), 'recall.js')}"`;
 }
 
 // ---------------------------------------------------------------------------
@@ -133,9 +138,102 @@ function stageBundles(distDir: string, written: string[]): void {
     copyFileSync(src, dest);
     written.push(dest);
   }
-  // Stage the sqlite wasm runtime next to the bundles if present.
-  const wasm = join(distDir, 'node-sqlite3-wasm.wasm');
-  if (existsSync(wasm)) copyFileSync(wasm, join(binDir(), 'node-sqlite3-wasm.wasm'));
+  stageNativeBinding(written);
+}
+
+/**
+ * Stage the ABI-matching `better_sqlite3.node` beside the bundles, plus a
+ * `.binding-info.json` marker, and remove any leftover wasm sidecar.
+ *
+ * The addon is resolved from THIS installer's own node_modules (Node's real
+ * resolution), NOT from distDir: `dist/better_sqlite3.node` is the *builder's*
+ * platform addon (correct for local build/test only), whereas each machine must
+ * stage the prebuild matching its own installing Node. The installed bundles
+ * compute `nativeBinding` as `join(__dirname, 'better_sqlite3.node')`, so it
+ * must sit directly beside them in binDir().
+ */
+function stageNativeBinding(written: string[]): void {
+  // Restage hygiene: drop a pre-migration wasm sidecar — the bundles now load
+  // better_sqlite3.node and would ignore it, but leaving it is misleading.
+  const staleWasm = join(binDir(), 'node-sqlite3-wasm.wasm');
+  if (existsSync(staleWasm)) {
+    try { unlinkSync(staleWasm); } catch { /* best-effort */ }
+  }
+
+  const binding = resolveInstalledBinding();
+  if (!binding) {
+    log({
+      source: 'installer/install',
+      level: 'warn',
+      summary: 'better_sqlite3.node not found in node_modules — the CLI/hooks will fail to load SQLite until reinstalled',
+    });
+    return;
+  }
+
+  const dest = join(binDir(), 'better_sqlite3.node');
+  copyFileSync(binding, dest);
+  written.push(dest);
+
+  // ABI marker: `recall doctor` uses it to detect a Node-major drift (module
+  // version mismatch) or a stale wasm-era install (marker absent) and advise
+  // `recall install --restage`.
+  const markerPath = join(binDir(), '.binding-info.json');
+  writeFileSync(
+    markerPath,
+    JSON.stringify(
+      {
+        platform: process.platform,
+        arch: process.arch,
+        nodeModuleVersion: process.versions.modules,
+        nodePath: process.execPath,
+      },
+      null,
+      2,
+    ),
+  );
+  written.push(markerPath);
+}
+
+/** Resolve the installed better-sqlite3 addon via Node's real module
+ *  resolution (respects hoisting), then locate its compiled `.node`. */
+function resolveInstalledBinding(): string | null {
+  try {
+    const pkgJson = createRequire(__filename).resolve('better-sqlite3/package.json');
+    return findDotNode(dirname(pkgJson));
+  } catch {
+    return null;
+  }
+}
+
+/** Find better_sqlite3.node under a package dir: canonical gyp output first,
+ *  then a bounded recursive scan (covers prebuild-install `prebuilds/…`). */
+function findDotNode(baseDir: string): string | null {
+  for (const c of [
+    join(baseDir, 'build', 'Release', 'better_sqlite3.node'),
+    join(baseDir, 'build', 'Debug', 'better_sqlite3.node'),
+  ]) {
+    try {
+      if (statSync(c).isFile()) return c;
+    } catch {
+      // keep looking
+    }
+  }
+  const stack = [baseDir];
+  while (stack.length) {
+    const dir = stack.pop()!;
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const e of entries) {
+      const p = join(dir, e.name);
+      if (e.isDirectory()) stack.push(p);
+      else if (e.name.endsWith('.node')) return p;
+    }
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
