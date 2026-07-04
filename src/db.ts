@@ -256,6 +256,12 @@ function ensureSchema(db: RecallDb): void {
 
     CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_at);
     CREATE INDEX IF NOT EXISTS idx_messages_project ON messages(project_id);
+    -- getUnembeddedMessages() orders the whole table by created_at DESC (LIMIT N).
+    -- Without a standalone created_at index SQLite full-scans messages and builds
+    -- a TEMP B-TREE to sort on every call — a ~4s/batch cost that dominates the
+    -- embed drain and every Stop-hook catch-up. This index serves the ORDER BY so
+    -- the planner walks it and early-terminates at LIMIT instead.
+    CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at);
   `);
 
   // ====================================================================
