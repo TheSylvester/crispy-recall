@@ -34,6 +34,12 @@ import {
   clearCancelFlag,
 } from '../recall/catchup.js';
 import { logsDir, runDir } from '../paths.js';
+import {
+  findSessionsForCommit,
+  findSessionsForBlame,
+  parseBlameSpec,
+  type SessionMatch,
+} from '../git-attribution.js';
 import { mkdirSync, openSync, writeFileSync, readFileSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { join } from 'node:path';
@@ -86,6 +92,8 @@ const projectFlag = flagValue('--project');
 const allProjects = hasFlag('--all');
 const reverse = hasFlag('--reverse');
 const recent = hasFlag('--recent');
+const commitFlag = flagValue('--commit');
+const blameMode = hasFlag('--blame');
 
 /**
  * Clean termination WITHOUT exit(). On Windows, exit() aborts
@@ -109,10 +117,11 @@ function exit(code: number): never {
 const effectiveProject = allProjects ? undefined : normalizePath(projectFlag ?? process.cwd());
 
 // Collect positional args (skip flags and their values)
-const FLAG_WITH_VALUE = new Set(['--limit', '--offset', '--since', '--until', '--project', '--vendor']);
+// --commit / --blame consume positionals separately below.
+const FLAG_WITH_VALUE = new Set(['--limit', '--offset', '--since', '--until', '--project', '--vendor', '--commit']);
 const FLAG_BOOLEAN = new Set([
   '--raw', '--raw-messages', '--no-idf',
-  '--help', '-h', '--version', '-v', '--list', '--all', '--reverse', '--recent',
+  '--help', '-h', '--version', '-v', '--list', '--all', '--reverse', '--recent', '--blame',
   '--no-catchup', '--auto-embed', '--detach',
   // installer subcommand flags
   '--yes', '--offline', '--json', '--purge', '--integrity',
@@ -152,6 +161,9 @@ USAGE
   recall <session-id>                Read messages from a session
   recall <session-id> <message-id>   Read centered on matched message
   recall --list                      List recent sessions
+  recall --commit <hash>             Sessions that produced a commit
+  recall --blame <path>[:<line>[-<line>]]...  Sessions responsible for a file
+                                     or a specific line/range (via git blame)
   recall backfill [flags]            Catch up FTS5 + embeddings against transcript files
 
 ARGUMENTS
@@ -175,6 +187,9 @@ FLAGS
   --no-idf         Bypass the FTS5 IDF high-frequency-term filter (keeps
                    common-but-meaningful terms like when/before/after)
   --list           List sessions mode
+  --commit HASH    Sessions that produced the given commit (git attribution)
+  --blame SPEC...  Sessions responsible for a file or line range at HEAD; takes
+                   one or more <path>[:<line>[-<line>]] specs (via git blame)
   --no-catchup     Skip the per-invocation mtime catch-up scan (T1)
   --help, -h       Show this help
   --version, -v    Print the recall version
@@ -199,6 +214,18 @@ EXAMPLES
   recall a1b2c3d4 e5f6a7b8
   recall a1b2c3d4 --reverse
   recall --list --since 2026-04-10 --until 2026-04-10
+  recall --commit 25dd0f8
+  recall --blame src/paths.ts:82-84
+  recall --blame src/foo.ts:42 src/bar.ts:10-20 --limit 20
+
+COMMIT ATTRIBUTION (--commit / --blame)
+  Returns the session(s) whose Edit/Write/MultiEdit tool calls structurally
+  match each commit's diff. Sessions are listed chronologically (oldest first).
+  The most recent is usually the load-bearing edit for current code; earlier
+  sessions show evolution and may reveal originating intent or rejected
+  approaches. --blame runs git blame to find the commits responsible for the
+  current file (or line range) at HEAD, then attributes each. --limit (with
+  --blame) caps the number of returned matches.
 `.trim());
 }
 
@@ -710,6 +737,138 @@ async function runSearch(query: string) {
 }
 
 // ---------------------------------------------------------------------------
+// Mode: Commit attribution (--commit / --blame)
+// ---------------------------------------------------------------------------
+
+/** Collect all positionals trailing `--blame`, stopping at the next flag. */
+function blamePositionals(): string[] {
+  const idx = argv.indexOf('--blame');
+  if (idx < 0) return [];
+  const out: string[] = [];
+  for (let i = idx + 1; i < argv.length; i++) {
+    const a = argv[i]!;
+    if (a.startsWith('--')) break;
+    out.push(a);
+  }
+  return out;
+}
+
+function printCommitAttribution(query: string, matches: SessionMatch[]) {
+  const note = 'Sessions are listed chronologically (oldest first). The most recent is usually the load-bearing one for current code; earlier sessions show evolution and may reveal originating intent or rejected approaches.';
+
+  if (raw) {
+    console.log(JSON.stringify({
+      query,
+      note,
+      count: matches.length,
+      matches,
+    }, null, 2));
+    return;
+  }
+
+  console.log(`Query: ${query}`);
+  console.log(`Matches: ${matches.length}`);
+  console.log(`Note: ${note}`);
+  console.log('---');
+
+  if (matches.length === 0) {
+    console.log('No sessions matched.');
+    return;
+  }
+
+  // Session ids are shown in full — a UUID is 36 chars and 'agent-<hash>'
+  // varies — with the column sized to the widest label so the id never
+  // truncates or merges into the Commit column. A fixed GAP separates every
+  // column. Subagent leaves get a trailing ' ↳' marker.
+  const sessLabels = matches.map((m) =>
+    m.parent_session_id ? `${m.session} ↳` : m.session,
+  );
+  const sessW = Math.max('Session'.length, ...sessLabels.map((s) => s.length));
+  const commitW = 12;
+  const hitsW = 6;
+  const survW = 5;
+  const ratioW = 6;
+  const dateW = 19;   // 'YYYY-MM-DD HH:MM:SS'
+  const GAP = '  ';
+
+  const header =
+    'Session'.padEnd(sessW) + GAP +
+    'Commit'.padEnd(commitW) + GAP +
+    'Hits'.padStart(hitsW) + GAP +
+    'Surv?'.padEnd(survW) + GAP +
+    'Ratio'.padStart(ratioW) + GAP +
+    'Last edit'.padEnd(dateW) + GAP +
+    'Files';
+  console.log(header);
+  console.log('-'.repeat(header.length));
+
+  matches.forEach((m, i) => {
+    const date = m.last_edit_at.slice(0, 19).replace('T', ' ');
+    console.log(
+      sessLabels[i]!.padEnd(sessW) + GAP +
+      m.commit.slice(0, 10).padEnd(commitW) + GAP +
+      String(m.content_hits).padStart(hitsW) + GAP +
+      (m.surviving_in_commit ? 'yes' : 'no').padEnd(survW) + GAP +
+      String(m.surviving_ratio).padStart(ratioW) + GAP +
+      date.padEnd(dateW) + GAP +
+      m.matched_files.join(', '),
+    );
+    if (m.parent_session_id) {
+      console.log(
+        ' '.repeat(2) +
+        `(subagent of ${m.parent_session_id.slice(0, 8)}${m.agent_type ? `, type=${m.agent_type}` : ''})`,
+      );
+    }
+  });
+}
+
+async function runCommitAttribution() {
+  // Raw path on purpose: the Claude project slug is derived from the exact
+  // cwd string Claude ran with — normalizePath() would corrupt it (e.g.
+  // lowercased Windows drive letters).
+  const repoRoot = projectFlag ?? process.cwd();
+
+  if (hasFlag('--commit')) {
+    if (commitFlag === undefined || commitFlag.startsWith('--')) {
+      console.error('--commit requires a commit hash. Use --help for usage.');
+      exit(1);
+    }
+    let matches: SessionMatch[];
+    try {
+      matches = await findSessionsForCommit(commitFlag, { repoRoot });
+    } catch (err) {
+      console.error(`recall --commit: git failed for "${commitFlag}" in ${repoRoot}: ${gitErrLine(err)}`);
+      exit(1);
+    }
+    printCommitAttribution(`--commit ${commitFlag}`, matches);
+    return;
+  }
+
+  const rawSpecs = blamePositionals();
+  if (rawSpecs.length === 0) {
+    console.error('--blame requires at least one path or path:line[-line] spec. Use --help for usage.');
+    exit(1);
+  }
+  const specs = rawSpecs.map(parseBlameSpec);
+  const matchLimit = limit > 0 ? limit : undefined;
+  let matches: SessionMatch[];
+  try {
+    matches = await findSessionsForBlame(specs, { repoRoot, ...(matchLimit !== undefined ? { limit: matchLimit } : {}) });
+  } catch (err) {
+    console.error(`recall --blame: ${gitErrLine(err)}`);
+    exit(1);
+  }
+  printCommitAttribution(`--blame ${rawSpecs.join(' ')}`, matches);
+}
+
+/** First useful line of a git/attribution failure: prefer captured stderr. */
+function gitErrLine(err: unknown): string {
+  const stderr = (err as { stderr?: string }).stderr;
+  if (typeof stderr === 'string' && stderr.trim()) return stderr.trim().split('\n')[0]!;
+  return err instanceof Error ? err.message.split('\n')[0]! : String(err);
+}
+
+// ---------------------------------------------------------------------------
 // Dispatch
 // ---------------------------------------------------------------------------
 
@@ -859,6 +1018,15 @@ async function main() {
 
   if (showHelp) {
     printHelp();
+    exit(0);
+  }
+
+  // Commit attribution — dispatched before the positional subcommands so a
+  // blame spec that happens to be named like one (`--blame install`) is never
+  // hijacked, and before maybeRunT1() because this mode never touches the DB
+  // (it reads git + raw transcript JSONL directly).
+  if (hasFlag('--commit') || blameMode) {
+    await runCommitAttribution();
     exit(0);
   }
 

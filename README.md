@@ -96,6 +96,22 @@ output. `recall install` also takes `--offline` (use a pre-staged binary +
 model instead of downloading) and `--no-backfill` / `--auto-backfill` to control
 the initial history index. Run `recall --help` for the full flag set.
 
+### Commit attribution (`--commit` / `--blame`)
+
+Find the session(s) that produced a commit, or the session(s) responsible for
+the current state of a file or line. Matching is structural — session
+Edit/Write/MultiEdit tool calls are compared against the commit's diff via
+tri-gram intersection, not clock proximity. `--blame` is HEAD-relative: it runs
+`git blame` to find the commits behind the current file (or line range) and
+attributes each; sessions overwritten by a later commit won't appear. Results
+list top-level sessions and subagent leaves chronologically (oldest first).
+
+```bash
+recall --commit 25dd0f8                          # sessions that produced a commit
+recall --blame src/paths.ts:82-84                # sessions behind a line range
+recall --blame src/foo.ts:42 src/bar.ts:10-20 --limit 20   # union of specs
+```
+
 ## Where things live
 
 - `~/.recall/` — the DB, model, binary, logs, and `config.json` (the resolved GPU/CPU embedder mode).
