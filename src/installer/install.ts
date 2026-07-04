@@ -24,16 +24,21 @@ import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
 import { binDir, modelsDir, runDir, logsDir, recallRoot, dbPath } from '../paths.js';
-import { getDb } from '../db.js';
+import { getDb, isBindingLoadError } from '../db.js';
+import { getEmbedVersionStats, getEmbeddingGapStats } from '../recall/message-store.js';
 import {
   runPreflight, preflightPassed, acquireInstallLock, releaseInstallLock,
   claudeRecallSkillPath, claudeSettingsPath, claudeMdPath,
-  codexAgentsPath, codexRecallSkillPath,
+  codexAgentsPath, codexHooksPath, codexRecallSkillPath,
   type PreflightReport,
 } from './preflight.js';
 import { buildManifest, renderManifest } from './manifest.js';
 import { runGpuPhase, type GpuPhaseResult, type GpuProbeArgs, type OffloadProbeResult } from './gpu.js';
-import { mergeStopHook, backupFile } from './settings-merge.js';
+import { mergeStopHook, removeStopHook, backupFile } from './settings-merge.js';
+import {
+  classifyUpgrade, snapshotDb, handleIntegrity, backfillAlreadyRunning, migrationReportLine,
+  type UpgradeState, type IntegrityStatus,
+} from './upgrade-migrate.js';
 import { applyNudge } from './claudemd-nudge.js';
 import { ensureBinary, ensureModel, getBinaryPath, getModelPath } from '../recall/embedder.js';
 import { log } from '../log.js';
@@ -56,13 +61,29 @@ export interface InstallOptions {
   gpuProbe?: (args: GpuProbeArgs) => Promise<OffloadProbeResult>;
 }
 
+/** In-place upgrade migration outcome, surfaced for the report + tests. */
+export interface MigrationInfo {
+  state: UpgradeState;
+  /** Fraction of vectors at EMBED_VERSION at report time (`< 1` → re-embed in flight). */
+  coverage: number;
+  /** Whether a background re-embed/backfill was launched this run. */
+  drainLaunched: boolean;
+  /** Pre-flip rollback snapshot (upgrade only). */
+  snapshotPath?: string;
+  /** Post-flip integrity result (upgrade only). */
+  integrity?: IntegrityStatus;
+}
+
 export interface InstallResult {
   aborted?: boolean;
+  /** Human-readable reason when `aborted` — remediation for a busy/corrupt DB. */
+  abortReason?: string;
   report: PreflightReport;
   selected: string[];
   gpu: GpuPhaseResult;
   filesWritten: string[];
   backfillPid?: number;
+  migration?: MigrationInfo;
 }
 
 // ---------------------------------------------------------------------------
@@ -290,11 +311,33 @@ export async function runInstall(opts: InstallOptions = {}): Promise<InstallResu
     return { aborted: true, report, selected: [...selected], gpu: { mode: 'cpu', libDir: null, ngl: 0, cudaAvailable: 'none' }, filesWritten: [] };
   }
 
+  // Classify the existing DB BEFORE staging rewrites the ABI marker, so the
+  // marker read reflects the PRIOR install (wasm-era = absent). Drives the
+  // quiesce/snapshot/integrity/drain-gating an in-place upgrade needs.
+  const migration = classifyUpgrade();
+
   const filesWritten: string[] = [];
   let gpu: GpuPhaseResult = { mode: 'cpu', libDir: null, ngl: 0, cudaAvailable: 'none' };
   let backfillPid: number | undefined;
+  let snapshotPath: string | undefined;
+  let integrity: IntegrityStatus | undefined;
+  let drainLaunched = false;
 
   try {
+    // ---- Upgrade quiesce (needs-migration only) ----
+    // Remove the stale (wasm-era) Stop hook BEFORE staging the native bundles or
+    // opening the DB, so no old writer fires during the exclusive WAL flip. The
+    // "hooks wired LAST" invariant guards *adding* hooks at not-yet-staged
+    // scripts; *removing* the stale hook early is strictly safer. Phase 7 re-adds
+    // the recall hook pointing at the freshly staged stop-hook.js.
+    if (migration.state === 'needs-migration') {
+      for (const p of [claudeSettingsPath(), codexHooksPath()]) {
+        const r = removeStopHook(p);
+        if (r.changed) filesWritten.push(p);
+      }
+      say('upgrade: quiesced stale Stop hook before migration');
+    }
+
     // ---- 2/3. Resolve paths + scaffold ~/.recall/ ----
     for (const d of [binDir(), modelsDir(), runDir(), logsDir()]) mkdirSync(d, { recursive: true });
     stageBundles(opts.distDir ?? defaultDistDir(), filesWritten);
@@ -305,9 +348,15 @@ export async function runInstall(opts: InstallOptions = {}): Promise<InstallResu
       const haveBin = existsSync(getBinaryPath());
       const haveModel = existsSync(getModelPath());
       if (!haveBin || !haveModel) {
-        const msg = `--offline but runtime not pre-staged (binary=${haveBin}, model=${haveModel}).`;
+        const msg =
+          `--offline but runtime not pre-staged (binary=${haveBin}, model=${haveModel}). ` +
+          'Pre-stage ~/.recall/bin + model (or drop --offline), then re-run `recall install`' +
+          (migration.state === 'needs-migration' ? ' (which restores the recall Stop hook).' : '.');
         log({ source: 'installer/install', level: 'error', summary: msg });
-        return { aborted: true, report, selected: [...selected], gpu, filesWritten };
+        return {
+          aborted: true, abortReason: msg, report, selected: [...selected], gpu, filesWritten,
+          migration: { state: migration.state, coverage: migration.coverage, drainLaunched: false },
+        };
       }
       say('offline: CPU runtime already staged');
     } else {
@@ -327,9 +376,72 @@ export async function runInstall(opts: InstallOptions = {}): Promise<InstallResu
     });
     say(gpu.mode === 'gpu' ? `GPU acceleration enabled (${gpu.cudaAvailable})` : `using CPU embeddings${gpu.reason ? ` (${gpu.reason})` : ''}`);
 
-    // ---- 6. Init DB ----
-    getDb(dbPath());
+    // ---- 5.5 Pre-flip snapshot (upgrade only) — rollback artifact before the
+    // native binding flips the delete-mode DB to WAL. ----
+    if (migration.state === 'needs-migration') {
+      snapshotPath = snapshotDb() ?? undefined;
+      say(snapshotPath ? `pre-upgrade snapshot: ${snapshotPath}` : 'pre-upgrade snapshot skipped (no DB / copy failed)');
+    }
+
+    // ---- 6. Init DB (implicit WAL flip on an upgrade) ----
+    // configurePragmas asserts journal_mode='wal'; under contention (a live
+    // session still holding the delete-mode DB) the exclusive flip fails and
+    // getDb throws. Catch it → clean aborted result with remediation, never a
+    // half-migrated brick or a stack trace. The snapshot is preserved.
+    try {
+      getDb(dbPath());
+    } catch (e) {
+      // Every branch is self-healing: re-running `recall install` re-quiesces,
+      // retries the flip, and re-wires the recall Stop hook removed above.
+      const emsg = (e as Error).message;
+      const rerun = migration.state === 'needs-migration'
+        ? ' Then re-run `recall install` to finish migrating and restore the recall Stop hook.'
+        : ' Then re-run `recall install`.';
+      let remediation: string;
+      if (isBindingLoadError(e)) {
+        remediation = `The native SQLite binding failed to load (${emsg}). Run \`recall install --restage\` (or \`recall doctor\`).`;
+      } else if (/database is locked|SQLITE_BUSY|busy_timeout/i.test(emsg)) {
+        remediation = `A live session is holding the database. Exit all Claude/Codex sessions.${rerun}`;
+      } else if (/expected WAL journal_mode/i.test(emsg)) {
+        remediation =
+          'recall could not enable WAL on this filesystem (e.g. a network / virtual mount). ' +
+          `Put ~/.recall on a local disk (or set RECALL_HOME to one).${rerun}`;
+      } else {
+        remediation = `Could not open the database (${emsg}). Run \`recall doctor --integrity\`; if unrecoverable, rebuild from JSONL with \`recall repair --full\`.${rerun}`;
+      }
+      if (interactive) note(remediation, 'Migration aborted');
+      else log({ source: 'installer/install', level: 'error', summary: `migration aborted: ${remediation}` });
+      return {
+        aborted: true, abortReason: remediation, report, selected: [...selected], gpu, filesWritten,
+        migration: {
+          state: migration.state, coverage: migration.coverage, drainLaunched: false,
+          ...(snapshotPath ? { snapshotPath } : {}),
+        },
+      };
+    }
     say('database initialized');
+
+    // ---- 6.5 Post-flip integrity (upgrade only) ----
+    if (migration.state === 'needs-migration') {
+      const res = handleIntegrity();
+      integrity = res.status;
+      if (res.status === 'unrecoverable') {
+        const remediation =
+          `Database integrity check failed (${res.detail ?? 'unknown'}) and could not be auto-repaired. ` +
+          `Your pre-upgrade snapshot is preserved at ${snapshotPath ?? '(snapshot unavailable)'}. ` +
+          'Rebuild the index from JSONL with `recall repair --full`, then re-run `recall install` to restore the recall Stop hook.';
+        if (interactive) note(remediation, 'Migration aborted');
+        else log({ source: 'installer/install', level: 'error', summary: `migration aborted: ${remediation}` });
+        return {
+          aborted: true, abortReason: remediation, report, selected: [...selected], gpu, filesWritten,
+          migration: {
+            state: migration.state, coverage: migration.coverage, drainLaunched: false, integrity,
+            ...(snapshotPath ? { snapshotPath } : {}),
+          },
+        };
+      }
+      say(res.status === 'repaired-stem' ? 'upgrade: repaired corrupt _stem index' : 'upgrade: integrity check passed');
+    }
 
     // ---- 7. Claude / Codex filesystem edits (LAST) ----
     const runnable = recallBinCommand();
@@ -354,9 +466,20 @@ export async function runInstall(opts: InstallOptions = {}): Promise<InstallResu
       const r = applyNudge(codexAgentsPath());
       if (r.changed) filesWritten.push(codexAgentsPath());
     }
+    // An upgrade touches settings.json twice (quiesce-remove + phase-7 re-add) —
+    // collapse to one entry so the count/report reflects distinct files.
+    if (filesWritten.length !== new Set(filesWritten).size) {
+      filesWritten.splice(0, filesWritten.length, ...new Set(filesWritten));
+    }
     say(`wrote ${filesWritten.length} files`);
 
-    // ---- 8. Backfill (MANDATORY, default = background) ----
+    // ---- 8. Backfill / re-embed drain (MANDATORY, default = background) ----
+    // The detached backfill re-embeds v1 rows → v3 via the version-aware gap
+    // selectors, so it IS the migration drain. Gate it: skip only a genuinely
+    // redundant drain — already-migrated, all vectors current, AND no embedding
+    // gap (coverage counts only vectors that exist, so guard the gap too) — and
+    // never spawn a duplicate over a live drain.
+    const coverage = getEmbedVersionStats().coverage;
     if (opts.noBackfill) {
       say('backfill skipped (--no-backfill)');
     } else if (opts.autoBackfill) {
@@ -367,8 +490,14 @@ export async function runInstall(opts: InstallOptions = {}): Promise<InstallResu
       await startRecallCatchup({ autoEmbed: true });
       await mtimeScan();
       sp?.stop('Backfill complete');
+      drainLaunched = true;
+    } else if (backfillAlreadyRunning()) {
+      say('backfill already running in background — not relaunching');
+    } else if (migration.state === 'already-migrated' && coverage >= 1 && getEmbeddingGapStats().gapCount === 0) {
+      say('already migrated (all vectors current) — no background re-embed needed');
     } else {
       backfillPid = spawnDetachedBackfill();
+      drainLaunched = backfillPid !== undefined;
       say(backfillPid ? `backfill running in background (PID ${backfillPid})` : 'backfill could not be launched');
     }
   } finally {
@@ -376,18 +505,34 @@ export async function runInstall(opts: InstallOptions = {}): Promise<InstallResu
   }
 
   // ---- 9. Final report ----
+  const finalCoverage = getEmbedVersionStats().coverage;
+  const migrationInfo: MigrationInfo = {
+    state: migration.state,
+    coverage: finalCoverage,
+    drainLaunched,
+    ...(snapshotPath ? { snapshotPath } : {}),
+    ...(integrity ? { integrity } : {}),
+  };
+  const migLine = migrationReportLine(finalCoverage);
+
   if (interactive) {
     const lines = [
       gpu.mode === 'gpu' ? 'GPU acceleration: enabled' : `Embeddings: CPU${gpu.reason ? ` (${gpu.reason})` : ''}`,
       `Files written/edited: ${filesWritten.length}`,
       backfillPid ? `Backfill running in background (PID ${backfillPid}) — check with \`recall status\`.` : 'Backfill: see above',
+      ...(migLine ? [migLine] : []),
       'Try it — ask Claude: "what did I work on yesterday?"',
       'Commands: recall doctor · recall status · recall uninstall',
     ];
     outro(lines.join('\n'));
+  } else if (migLine) {
+    log({ source: 'installer/install', level: 'info', summary: migLine });
   }
 
-  return { report, selected: [...selected], gpu, filesWritten, ...(backfillPid ? { backfillPid } : {}) };
+  return {
+    report, selected: [...selected], gpu, filesWritten, migration: migrationInfo,
+    ...(backfillPid ? { backfillPid } : {}),
+  };
 }
 
 /** Spawn `recall backfill --auto-embed` detached; record run/backfill.pid. */

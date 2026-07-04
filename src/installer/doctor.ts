@@ -16,6 +16,7 @@ import { readConfig } from './config.js';
 import { integrityCheck } from './repair.js';
 import { isBindingLoadError } from '../db.js';
 import { binDir, dbPath } from '../paths.js';
+import { EMBED_VERSION } from '../recall/embed-config.js';
 
 export interface DoctorOptions {
   json?: boolean;
@@ -35,6 +36,10 @@ export interface BindingHealth {
   pinnedNodeOk: boolean | null; // pinned node path still exists (null if no marker)
   bindingLoads: boolean;     // better_sqlite3.node loads under this Node
   journalMode: string | null;   // current mode on the live DB (null if DB absent/unreadable)
+  /** Fraction of vectors at EMBED_VERSION (null if DB absent / no vectors table).
+   *  `< 1` surfaces an in-progress embed_version re-embed — read on the SAME
+   *  readonly connection as journalMode, so doctor never flips the live DB. */
+  embedCoverage: number | null;
   problems: string[];
 }
 
@@ -67,7 +72,8 @@ function checkBindingHealth(): BindingHealth {
   if (!installed) {
     return {
       installed: false, markerPresent: false, abiOk: null, pinnedNodeOk: null,
-      bindingLoads: false, journalMode: null, problems: ['recall is not installed — run `recall install`'],
+      bindingLoads: false, journalMode: null, embedCoverage: null,
+      problems: ['recall is not installed — run `recall install`'],
     };
   }
 
@@ -102,6 +108,7 @@ function checkBindingHealth(): BindingHealth {
   // --- Binding load + WAL drift (read-only) ---
   let bindingLoads = false;
   let journalMode: string | null = null;
+  let embedCoverage: number | null = null;
   const localBinding = stagedBindingPath();
   const dbFile = dbPath();
   if (existsSync(dbFile)) {
@@ -111,6 +118,21 @@ function checkBindingHealth(): BindingHealth {
         : new Database(dbFile, { readonly: true, fileMustExist: true });
       bindingLoads = true;
       journalMode = String(raw.pragma('journal_mode', { simple: true }));
+      // Embed-version coverage on the SAME readonly connection (never flips WAL).
+      try {
+        const row = raw
+          .prepare(
+            `SELECT COUNT(*) AS total,
+                    COALESCE(SUM(CASE WHEN embed_version = ? THEN 1 ELSE 0 END), 0) AS current
+             FROM message_vectors`,
+          )
+          .get(EMBED_VERSION) as { total: number; current: number } | undefined;
+        const total = row ? Number(row.total) : 0;
+        const current = row ? Number(row.current ?? 0) : 0;
+        embedCoverage = total === 0 ? null : current / total;
+      } catch {
+        embedCoverage = null; // no vectors table / no embed_version column
+      }
       raw.close();
       if (journalMode !== 'wal') {
         problems.push(
@@ -142,7 +164,7 @@ function checkBindingHealth(): BindingHealth {
     }
   }
 
-  return { installed, markerPresent, abiOk, pinnedNodeOk, bindingLoads, journalMode, problems };
+  return { installed, markerPresent, abiOk, pinnedNodeOk, bindingLoads, journalMode, embedCoverage, problems };
 }
 
 function printBinding(b: BindingHealth): void {
@@ -157,6 +179,9 @@ function printBinding(b: BindingHealth): void {
   console.log(`ABI marker:     ${b.markerPresent ? (b.abiOk ? 'OK' : 'MISMATCH') : 'absent (wasm-era)'}`);
   console.log(`Pinned Node:    ${b.pinnedNodeOk === null ? 'n/a' : ok(b.pinnedNodeOk)}`);
   console.log(`journal_mode:   ${b.journalMode ?? 'no DB yet'}${b.journalMode && b.journalMode !== 'wal' ? '  [DRIFT]' : ''}`);
+  if (b.embedCoverage !== null && b.embedCoverage < 1) {
+    console.log(`Embed migration: re-embedding to v${EMBED_VERSION} (${Math.round(b.embedCoverage * 100)}%) — semantic search stays available`);
+  }
   if (b.problems.length) {
     console.log('  Issues:');
     for (const p of b.problems) console.log(`   ✖ ${p}`);

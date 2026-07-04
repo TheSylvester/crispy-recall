@@ -112,7 +112,16 @@ export function getDb(dbPath: string): RecallDb {
   cleanupWasmArtifacts(dbPath);
 
   const raw = openDatabase(dbPath);
-  configurePragmas(raw, dbPath);
+  try {
+    configurePragmas(raw, dbPath);
+  } catch (e) {
+    // configurePragmas can throw (notably the WAL-flip assert). A caller may now
+    // catch-and-continue in-process (the installer's WAL-flip remediation), so
+    // close the orphaned handle instead of leaking it: on Windows a live handle
+    // holds the DB file open and blocks the snapshot/rename during a busy abort.
+    raw.close();
+    throw e;
+  }
 
   db = createAdapter(raw);
   currentDbPath = dbPath;
