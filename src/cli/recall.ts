@@ -529,6 +529,7 @@ async function runSearch(query: string) {
       semantic_available: r.semanticAvailable,
       semantic_count: r.semanticCount,
       fts_count: r.ftsCount,
+      embed_coverage: r.embedCoverage,
       total: top.length,
       messages: top.map((x, i) => ({
         rank: i + 1,
@@ -654,6 +655,7 @@ async function runSearch(query: string) {
       fts_count: r.ftsCount,
       semantic_count: r.semanticCount,
       semantic_available: r.semanticAvailable,
+      embed_coverage: r.embedCoverage,
       unique_sessions: totalSessions,
       showing_offset: pageStart,
       showing_count: page.length,
@@ -663,7 +665,10 @@ async function runSearch(query: string) {
   } else {
     console.log(`Query: "${query}"`);
     console.log(`Results: ${trimmed.length} messages, ${totalSessions} unique sessions (showing ${pageStart + 1}-${pageEnd})`);
-    console.log(`Paths: FTS5=${r.ftsCount}  Semantic=${r.semanticCount} (${r.semanticAvailable ? 'active' : 'UNAVAILABLE'})`);
+    const migrating = r.embedCoverage < 0.95
+      ? `  (migrating: ${Math.round(r.embedCoverage * 100)}% re-embedded)`
+      : '';
+    console.log(`Paths: FTS5=${r.ftsCount}  Semantic=${r.semanticCount} (${r.semanticAvailable ? 'active' : 'UNAVAILABLE'})${migrating}`);
     if (cutoffIdx < scored.length) {
       console.log(`Cutoff: position ${cutoffIdx} of ${scored.length} (score gap detected)`);
     }

@@ -11,7 +11,9 @@ import { existsSync, statSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { getDb } from '../db.js';
 import { dbPath, runDir } from '../paths.js';
-import { getEmbeddingGapStats } from '../recall/message-store.js';
+import { getEmbeddingGapStats, getEmbedVersionStats } from '../recall/message-store.js';
+import type { EmbedVersionStats } from '../recall/message-store.js';
+import { EMBED_VERSION } from '../recall/embed-config.js';
 import { readEmbedderConfig } from './config.js';
 
 export interface StatusReport {
@@ -20,6 +22,8 @@ export interface StatusReport {
   messageCount: number;
   lastIngest: string | null;
   embeddingGap: { totalMessages: number; gapCount: number };
+  /** Per-version vector coverage — surfaces an in-progress embed_version re-embed. */
+  embedVersions: EmbedVersionStats;
   backfillPid: number | null;
   backfillRunning: boolean;
   embedder: 'gpu' | 'cpu';
@@ -32,6 +36,7 @@ export function getStatus(): StatusReport {
   const lastIngest = lastRow.m ? new Date(lastRow.m).toISOString() : null;
   const dbSizeBytes = existsSync(dbPath()) ? statSync(dbPath()).size : 0;
   const embeddingGap = getEmbeddingGapStats();
+  const embedVersions = getEmbedVersionStats();
 
   let backfillPid: number | null = null;
   let backfillRunning = false;
@@ -50,6 +55,7 @@ export function getStatus(): StatusReport {
     messageCount,
     lastIngest,
     embeddingGap,
+    embedVersions,
     backfillPid,
     backfillRunning,
     embedder: readEmbedderConfig().mode,
@@ -69,6 +75,10 @@ export function printStatus(json: boolean): void {
   console.log(`Messages:      ${s.messageCount}`);
   console.log(`Last ingest:   ${s.lastIngest ?? 'never'}`);
   console.log(`Embedding gap: ${s.embeddingGap.gapCount} of ${s.embeddingGap.totalMessages} unembedded`);
+  if (s.embedVersions.coverage < 1) {
+    const pct = Math.round(s.embedVersions.coverage * 100);
+    console.log(`Embed migration: ${s.embedVersions.current} of ${s.embedVersions.total} at v${EMBED_VERSION} (${pct}%)`);
+  }
   console.log(`Embedder:      ${s.embedder.toUpperCase()}`);
   console.log(`Backfill:      ${s.backfillPid === null ? 'none recorded' : `PID ${s.backfillPid} (${s.backfillRunning ? 'running' : 'finished'})`}`);
 }

@@ -7,6 +7,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 vi.mock('../../src/recall/message-store.js', () => ({
   searchMessagesFts: vi.fn(() => []),
   searchMessagesSemantic: vi.fn(() => []),
+  getEmbedVersionStats: vi.fn(() => ({ total: 0, current: 0, stale: 0, coverage: 1 })),
 }));
 
 vi.mock('../../src/recall/embedder.js', () => ({

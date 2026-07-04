@@ -581,17 +581,57 @@ export function hasSessionVectors(sessionId: string): boolean {
 }
 
 /**
+ * Per-version coverage of the vector table, for the embed-version migration.
+ *
+ * Counts vector ROWS by embed_version — distinct from getEmbeddingGapStats(),
+ * which counts message-level embed gaps. dualPathSearch reads this once per
+ * search to decide whether to engage tolerant transitional scoring (coverage
+ * < 0.95), and `recall status` reports it so an in-progress re-embed is visible
+ * instead of silently blacking out semantic search.
+ */
+export interface EmbedVersionStats {
+  total: number;    // rows in message_vectors
+  current: number;  // rows at EMBED_VERSION
+  stale: number;    // total - current
+  coverage: number; // current/total; 1 when total === 0
+}
+
+export function getEmbedVersionStats(): EmbedVersionStats {
+  try {
+    // SUM over zero rows returns NULL in SQLite → COALESCE (and the defensive ??)
+    // keep `current` numeric so the arithmetic below never yields NaN.
+    const row = db().get(
+      `SELECT COUNT(*) AS total,
+              COALESCE(SUM(CASE WHEN embed_version = ? THEN 1 ELSE 0 END), 0) AS current
+       FROM message_vectors`,
+      [EMBED_VERSION],
+    ) as Record<string, unknown> | undefined;
+    const total = row ? (row.total as number) : 0;
+    const current = row ? ((row.current as number) ?? 0) : 0;
+    const stale = total - current;
+    const coverage = total === 0 ? 1 : current / total;
+    return { total, current, stale, coverage };
+  } catch {
+    // Fail safe to coverage 1 → hard filter → unchanged behavior.
+    return { total: 0, current: 0, stale: 0, coverage: 1 };
+  }
+}
+
+/**
  * Semantic search over message_vectors using brute-force q8 dot product.
  *
  * Scans all vectors, computes approximate cosine similarity via q8 dot
  * product, and returns the top-N matches joined to messages for metadata.
  * Optionally scoped by project or session.
+ *
+ * `opts.tolerant` selects the version-filtering mode (default false → hard
+ * filter). dualPathSearch derives it from migration coverage; see the scan below.
  */
 export function searchMessagesSemantic(
   queryQ8: Int8Array,
   queryNorm: number,
   queryScale: number,
-  opts?: { limit?: number; projectId?: string; sessionId?: string; excludeSessionId?: string },
+  opts?: { limit?: number; projectId?: string; sessionId?: string; excludeSessionId?: string; tolerant?: boolean },
 ): MessageSearchResult[] {
   try {
     const limit = opts?.limit ?? 20;
@@ -612,10 +652,20 @@ export function searchMessagesSemantic(
       params.push(opts.excludeSessionId);
     }
 
-    // Only score current-version vectors. The query is QUERY_PREFIX-prefixed, so
-    // only DOC_PREFIX-prefixed (current-version) doc vectors are comparable;
-    // legacy bare vectors are excluded (still reachable via FTS, fused by RRF).
-    params.push(EMBED_VERSION);
+    // Version filtering has two modes, keyed by migration coverage. dualPathSearch
+    // computes coverage via getEmbedVersionStats() and passes `tolerant`:
+    //   - Default (hard filter): only score current-version vectors. The query is
+    //     QUERY_PREFIX-prefixed, so only DOC_PREFIX-prefixed (current-version) doc
+    //     vectors are strictly comparable; legacy bare vectors are excluded (still
+    //     reachable via FTS, fused by RRF).
+    //   - Tolerant (coverage < 0.95, mid-migration): also score stale-version
+    //     vectors so semantic search stays alive during a re-embed instead of going
+    //     dark. Cross-version scoring is degraded-but-present (the prefix change was
+    //     R@5-neutral on LoCoMo); the scan-loop dim guard below skips any vector
+    //     whose length differs from the query's, so a future dimension bump can
+    //     never corrupt a score.
+    const versionClause = opts?.tolerant ? '' : ' AND mv.embed_version = ?';
+    if (!opts?.tolerant) params.push(EMBED_VERSION);
 
     const rows = db().all(
       `SELECT mv.message_id, mv.embedding_q8, mv.norm, mv.quant_scale,
@@ -623,7 +673,7 @@ export function searchMessagesSemantic(
               SUBSTR(m.message_text, 1, 401) as message_preview_raw
        FROM message_vectors mv
        JOIN messages m ON m.message_id = mv.message_id
-       WHERE 1=1${filterClauses} AND mv.embed_version = ?`,
+       WHERE 1=1${filterClauses}${versionClause}`,
       params,
     );
 
@@ -640,6 +690,12 @@ export function searchMessagesSemantic(
       if (storedNorm === 0 || queryNorm === 0) continue;
 
       const storedQ8Buf = row.embedding_q8 as Buffer;
+      // Dimension guard (applied unconditionally; a no-op in hard mode since
+      // current-version vectors always match the query dimension). A stale vector
+      // from a prior model/version could differ in length: dotProductQ8 iterates
+      // queryQ8.length and reading past a shorter stored vector yields a NaN score
+      // that silently corrupts ranking (it does not throw). Skip any mismatch.
+      if (storedQ8Buf.byteLength !== queryQ8.byteLength) continue;
       const storedQ8 = new Int8Array(
         storedQ8Buf.buffer,
         storedQ8Buf.byteOffset,

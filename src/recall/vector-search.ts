@@ -22,7 +22,7 @@
 
 import { embed } from './embedder.js';
 import { quantizeToQ8, computeNorm } from './quantize.js';
-import { searchMessagesFts, searchMessagesSemantic } from './message-store.js';
+import { searchMessagesFts, searchMessagesSemantic, getEmbedVersionStats } from './message-store.js';
 import type { MessageSearchResult } from './message-store.js';
 import { QUERY_PREFIX } from './embed-config.js';
 import { log } from '../log.js';
@@ -65,6 +65,10 @@ export interface DualPathSearchResult {
   ftsCount: number;
   /** Number of results from semantic vector search (0 if unavailable). */
   semanticCount: number;
+  /** Fraction of vectors at the current EMBED_VERSION (0..1); 1 when the table is
+   *  empty. `< 0.95` means transitional (tolerant) scoring was engaged — a re-embed
+   *  is in progress and stale-version vectors were scored to avoid a semantic blackout. */
+  embedCoverage: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -109,7 +113,14 @@ export async function dualPathSearch(
   const limit = opts?.limit ?? DEFAULT_LIMIT;
   const fetchLimit = limit * FETCH_MULTIPLIER;
 
-  if (!query.trim()) return { results: [], scored: [], semanticAvailable: false, ftsCount: 0, semanticCount: 0 };
+  if (!query.trim()) return { results: [], scored: [], semanticAvailable: false, ftsCount: 0, semanticCount: 0, embedCoverage: 1 };
+
+  // Migration coverage decides transitional scoring, and is surfaced to callers so
+  // re-embed progress shows even on the FTS-only fallback (embed failed / no vectors).
+  // Below the 0.95 threshold, tolerant mode also scores stale-version vectors so
+  // semantic search stays alive during a full re-embed instead of blacking out.
+  const embedCoverage = getEmbedVersionStats().coverage;
+  const tolerant = embedCoverage < 0.95;
 
   // Embed the query and quantize
   let queryQ8: Int8Array | null = null;
@@ -141,6 +152,7 @@ export async function dualPathSearch(
         projectId: opts?.projectId,
         sessionId: opts?.sessionId,
         excludeSessionId: opts?.excludeSessionId,
+        tolerant,
       })
     : [];
 
@@ -194,5 +206,6 @@ export async function dualPathSearch(
     semanticAvailable,
     ftsCount: ftsResults.length,
     semanticCount: semanticResults.length,
+    embedCoverage,
   };
 }
