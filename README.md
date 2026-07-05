@@ -6,6 +6,43 @@ Searchable memory for your Claude Code and Codex sessions. Local, fast, no daemo
 
 A standalone spin-off of the recall feature from [Crispy](https://github.com/TheSylvester/crispy). See the parent project for the broader multi-agent orchestration GUI.
 
+## What's new in 0.2.0
+
+- **Native SQLite engine with real WAL.** The database now runs on
+  better-sqlite3 with write-ahead logging instead of the previous WebAssembly
+  binding — which never actually engaged WAL and could silently corrupt the
+  index when multiple processes wrote at once. That failure mode is eliminated
+  at the root. `recall doctor` gains a SQLite-binding health section.
+  **Node.js ≥ 22.16 is now required.**
+- **Git provenance: `--commit` and `--blame`.** `recall --commit <hash>` lists
+  the session(s) that produced a commit; `recall --blame <path>[:line[-line]]`
+  traces a file or line range back to the conversations responsible. Matching
+  is structural (your sessions' actual edits vs the commit's diff), not
+  timestamp-based. These flags were documented in the skill but missing from
+  the shipped CLI; they now work as documented.
+- **Better semantic retrieval (embedding v3).** Stored messages and queries now
+  carry the task prefixes the embedding model was trained on, and short turns
+  (one-line answers, approvals, decisions) are embedded together with their
+  preceding context so they're finally findable by meaning. Measurably improves
+  retrieval on the LoCoMo benchmark (recall@5 54.9 → 58.4).
+- **Semantic search stays available during migrations.** Upgrading re-embeds
+  your history in the background; until it finishes, search transparently
+  blends old- and new-format vectors and tags output with
+  `(migrating: N% re-embedded)` instead of going dark.
+- **Relevance-first ranking.** The hidden age penalty is off by default —
+  older sessions now rank purely by relevance (previously the right old result
+  could rank 2× worse just for being old). Pass `--recent` to prefer newer
+  sessions explicitly.
+- **Faster indexing on large databases.** A new index removes a full-table
+  scan from every embedding batch and end-of-turn catch-up (~0.3 s → ~0.05 s
+  at ~287K messages). Created automatically on first run.
+- **Safe in-place upgrade for existing installs.** `recall install` migrates
+  an existing database in place: rollback snapshot → WAL conversion →
+  integrity check with auto-repair → background re-embed. See
+  [Upgrading from 0.1.x](#upgrading-from-01x).
+- **New scripting flags.** `--raw-messages` (full ranked per-message JSON) and
+  `--no-idf` (keep common words in keyword search), both off by default.
+
 ## Install
 
 Install the command globally, then run the one-time setup:
@@ -34,11 +71,45 @@ Windows-native are separate installs.** If you use both, run the install in each
 > installed skill's command contract have nothing to call. Use the global
 > install above.
 
-Prerequisites: Node ≥ 20 and Claude Code installed. If Codex is detected
+Prerequisites: Node ≥ 22.16 and Claude Code installed. If Codex is detected
 (`~/.codex/` exists), recall installs the `recall` skill into Codex (so the
 agent can search) and you can index your Codex history with
 `recall backfill --vendor codex`. Real-time per-turn Codex indexing is **not
 yet** supported.
+
+### Upgrading from 0.1.x
+
+```bash
+npm install -g crispy-recall
+recall install   # run this FIRST, before any other recall command
+```
+
+Exit any running Claude/Codex sessions first, then make `recall install` the
+first recall command you run after the npm upgrade — it performs a one-time,
+in-place migration of your existing database (rollback snapshot → WAL
+conversion → integrity check → background re-embed). If a live session is
+still holding the database the installer aborts cleanly and asks you to
+re-run; re-running is always safe and picks up where it left off.
+
+What to expect:
+
+- **Your indexed history is preserved — even without the original
+  transcripts.** Claude Code deletes session `.jsonl` files after 30 days by
+  default; the migration never reads them. It works on the database in place,
+  and the re-embed sources text from the database itself.
+- A rollback snapshot is written to `~/.recall/recall.db.pre-upgrade-<stamp>`
+  (needs free disk roughly equal to your DB size; delete it once you're
+  satisfied).
+- A background re-embed upgrades your vectors to the new format — roughly an
+  hour per 20K messages on CPU, minutes on GPU. Search works the entire time
+  (output shows `migrating: N% re-embedded`); watch progress with
+  `recall status`. It resumes automatically after reboots.
+- The migration is one-way: **don't downgrade** to ≤ 0.1.6 afterwards — the
+  old engine fails closed on the converted database.
+- **Avoid `recall repair --full` unless you accept losing older history** — it
+  rebuilds the index from the transcripts still on disk, which for most
+  machines means only the last 30 days. Your database is the store of record;
+  the pre-upgrade snapshot is the rollback path if anything looks wrong.
 
 ## What it does
 

@@ -1,6 +1,6 @@
 {
   "name": "crispy-recall",
-  "version": "0.1.6",
+  "version": "0.2.0",
   "description": "Local session transcript memory for Claude Code and Codex — search past sessions with FTS5 + semantic vectors.",
   "license": "MIT",
   "author": "Sylvester Wong",
@@ -37,7 +37,7 @@
     "build": "node scripts/build.mjs",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build && rm -f dist/better_sqlite3.node"
   },
   "dependencies": {
     "better-sqlite3": "^12.11.1"
