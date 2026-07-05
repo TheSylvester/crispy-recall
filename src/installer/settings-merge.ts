@@ -11,6 +11,7 @@
  */
 
 import { existsSync, readFileSync, writeFileSync, copyFileSync, renameSync, unlinkSync } from 'node:fs';
+import { stableNodePath } from './stable-node.js';
 
 const HOOK_ARRAYS = ['Stop', 'SubagentStop'] as const;
 
@@ -129,12 +130,15 @@ export function mergeStopHook(filePath: string, hookScriptPath: string): MergeRe
   // Pin the installing Node's absolute path (not a bare `node`). The
   // better-sqlite3 addon is ABI-locked to the Node it was built for, so the
   // hook must run under that exact interpreter — a PATH `node` that later
-  // points at a different major would fail to load the binding. Quote BOTH
+  // points at a different major would fail to load the binding. Use the
+  // upgrade-stable public path (stableNodePath): process.execPath resolves to
+  // the versioned Homebrew Cellar, which `brew upgrade node` deletes, so pin
+  // the shim that survives upgrades instead (a no-op off Homebrew). Quote BOTH
   // paths: ~/.recall or a user home can contain spaces. `isRecallCommand` is
   // path-based (matches stop-hook.js + a recall marker), so it still recognizes
   // this pinned form and heals a stale command in place (idempotent when the
   // pinned node is unchanged; rewrites on an ABI/node-path change).
-  const desiredCommand = `"${process.execPath}" "${hookScriptPath}"`;
+  const desiredCommand = `"${stableNodePath()}" "${hookScriptPath}"`;
   const exists = existsSync(filePath);
   const raw = exists ? readFileSync(filePath, 'utf-8') : null;
   const obj: SettingsShape = raw && raw.trim().length > 0 ? parseTolerant(raw) : {};

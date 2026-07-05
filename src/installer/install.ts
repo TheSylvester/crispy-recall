@@ -35,6 +35,7 @@ import {
 import { buildManifest, renderManifest } from './manifest.js';
 import { runGpuPhase, type GpuPhaseResult, type GpuProbeArgs, type OffloadProbeResult } from './gpu.js';
 import { mergeStopHook, removeStopHook, backupFile } from './settings-merge.js';
+import { stableNodePath } from './stable-node.js';
 import {
   classifyUpgrade, snapshotDb, handleIntegrity, backfillAlreadyRunning, migrationReportLine,
   type UpgradeState, type IntegrityStatus,
@@ -122,12 +123,13 @@ function resolveTemplatePath(explicit?: string): string {
 }
 
 /** The directly-runnable command the skill body uses (NOT a bare path).
- *  Pins the installing Node's absolute path — same ABI-lock reasoning as the
+ *  Pins the installing Node via stableNodePath — same ABI-lock reasoning as the
  *  Stop hook command (settings-merge.ts): the CLI bundle loads the ABI-locked
- *  better_sqlite3.node and must run under the Node it was built for. Both paths
- *  are quoted (spaces in ~/.recall / user home). */
+ *  better_sqlite3.node and must run under the Node it was built for, but pinned
+ *  to the upgrade-stable shim (not the Cellar path brew upgrade deletes). Both
+ *  paths are quoted (spaces in ~/.recall / user home). */
 function recallBinCommand(): string {
-  return `"${process.execPath}" "${join(binDir(), 'recall.js')}"`;
+  return `"${stableNodePath()}" "${join(binDir(), 'recall.js')}"`;
 }
 
 // ---------------------------------------------------------------------------
@@ -206,7 +208,9 @@ function stageNativeBinding(written: string[]): void {
         platform: process.platform,
         arch: process.arch,
         nodeModuleVersion: process.versions.modules,
-        nodePath: process.execPath,
+        // Upgrade-stable public path, not the Cellar path brew upgrade deletes;
+        // doctor's pinnedNodeOk checks existsSync(nodePath), which this satisfies.
+        nodePath: stableNodePath(),
       },
       null,
       2,
