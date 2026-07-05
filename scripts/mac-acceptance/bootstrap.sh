@@ -35,7 +35,9 @@ CI_MODE=false
 DRY_RUN=false
 
 usage() {
-  sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'
+  # Print the header comment block (everything after the shebang up to the first
+  # non-comment line), stripping the leading "# ".
+  awk 'NR==1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
 }
 
 while [ $# -gt 0 ]; do
@@ -136,7 +138,9 @@ fi
 
 # Disk ≥ 5 GB free at $HOME.
 if is_darwin; then
-  FREE_GB="$(df -Pk "$HOME" 2>/dev/null | awk 'NR==2 {printf "%d", $4/1024/1024}')"
+  # `|| true` so a df failure yields "" (pipefail would otherwise abort here,
+  # nullifying the empty-string tolerance below).
+  FREE_GB="$(df -Pk "$HOME" 2>/dev/null | awk 'NR==2 {printf "%d", $4/1024/1024}' || true)"
   if [ -n "${FREE_GB:-}" ]; then
     if [ "$FREE_GB" -lt 5 ]; then
       warn "Only ${FREE_GB} GB free at \$HOME — recommend ≥5 GB (binary+model+DB+snapshots)."
@@ -152,6 +156,8 @@ fi
 if is_darwin; then
   if xcode-select -p >/dev/null 2>&1; then
     log "Xcode Command Line Tools present: $(xcode-select -p)"
+  elif [ "$DRY_RUN" = true ]; then
+    warn "[dry-run] Xcode Command Line Tools not found — a real run would exit 2 with: xcode-select --install"
   else
     echo "[bootstrap] ERROR: Xcode Command Line Tools not found. Install them, then re-run:" >&2
     echo "    xcode-select --install" >&2
@@ -165,22 +171,27 @@ fi
 # Step 2 — Homebrew
 # ---------------------------------------------------------------------------
 log "STEP 2: Homebrew"
-if command -v brew >/dev/null 2>&1; then
-  log "Homebrew present: $(command -v brew)"
-else
-  if [ "$DRY_RUN" = true ]; then
-    log "[dry-run] would install Homebrew (NONINTERACTIVE=1 official installer)"
-  else
-    log "Installing Homebrew (NONINTERACTIVE)…"
-    NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+# Detect an installed brew by ABSOLUTE path first. A fresh SSH shell on Apple
+# Silicon has no /opt/homebrew/bin on PATH until shellenv runs, so `command -v
+# brew` would false-miss and needlessly re-run the installer on the two-phase
+# re-run (exit-3 → login → re-run). Locate the binary directly, then shellenv it.
+find_brew() {
+  if [ -x /opt/homebrew/bin/brew ]; then echo /opt/homebrew/bin/brew
+  elif [ -x /usr/local/bin/brew ]; then echo /usr/local/bin/brew
+  elif command -v brew >/dev/null 2>&1; then command -v brew
   fi
+}
+BREW="$(find_brew)"
+if [ -n "$BREW" ]; then
+  log "Homebrew present: $BREW"
+elif [ "$DRY_RUN" = true ]; then
+  log "[dry-run] would install Homebrew (NONINTERACTIVE=1 official installer)"
+else
+  log "Installing Homebrew (NONINTERACTIVE)…"
+  NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+  BREW="$(find_brew)"
 fi
 # Load brew into THIS shell's env for the right prefix (arm64 vs Intel).
-BREW=""
-if [ -x /opt/homebrew/bin/brew ]; then BREW=/opt/homebrew/bin/brew
-elif [ -x /usr/local/bin/brew ]; then BREW=/usr/local/bin/brew
-elif command -v brew >/dev/null 2>&1; then BREW="$(command -v brew)"
-fi
 if [ -n "$BREW" ]; then
   eval "$("$BREW" shellenv)"
   log "brew shellenv loaded ($BREW)"
@@ -396,7 +407,8 @@ self_check() {
   local DOCTOR=FAIL HIT=FAIL SEM=FAIL
 
   log "Seeding a synthetic session (token: \"$TOKEN\")…"
-  SEED_TOKEN="$TOKEN" SEED_HOME="$HOME" node "$TMPDIR_BOOT/seed.cjs"
+  SEED_TOKEN="$TOKEN" SEED_HOME="$HOME" node "$TMPDIR_BOOT/seed.cjs" \
+    || die 1 "self-check seed failed — could not write the synthetic session (check ~/.claude is writable)."
 
   log "recall backfill --auto-embed (ingest + embed)…"
   recall backfill --auto-embed || warn "backfill returned non-zero (continuing to assertions)"
