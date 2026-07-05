@@ -34,18 +34,22 @@ function layout() {
   return { realNode, shim };
 }
 
+// The shim logic is gated to darwin, so exercise it with platform: 'darwin'
+// (these tests run on Linux CI/dev boxes).
+const MAC = 'darwin' as const;
+
 describe('stableNodePath', () => {
-  it('prefers a shim that resolves to the same binary as execPath', () => {
+  it('prefers a shim that resolves to the same binary as execPath (darwin)', () => {
     const { realNode, shim } = layout();
     // execPath = the resolved Cellar path (what Node reports); shim → same file.
-    expect(stableNodePath({ execPath: realNode, candidates: [shim] })).toBe(shim);
+    expect(stableNodePath({ platform: MAC, execPath: realNode, candidates: [shim] })).toBe(shim);
   });
 
   it('resolves through a symlinked execPath too (nvm-style) to the same binary', () => {
     const { realNode, shim } = layout();
     const nvmLink = join(sandbox!, 'nvm-node');
     symlinkSync(realNode, nvmLink);
-    expect(stableNodePath({ execPath: nvmLink, candidates: [shim] })).toBe(shim);
+    expect(stableNodePath({ platform: MAC, execPath: nvmLink, candidates: [shim] })).toBe(shim);
   });
 
   it('falls through to execPath when a shim points at a DIFFERENT binary', () => {
@@ -53,29 +57,37 @@ describe('stableNodePath', () => {
     const otherNode = join(sandbox!, 'other-node');
     writeFileSync(otherNode, '#!/bin/sh\n');
     // shim resolves to the Cellar node, not otherNode → no match.
-    expect(stableNodePath({ execPath: otherNode, candidates: [shim] })).toBe(otherNode);
+    expect(stableNodePath({ platform: MAC, execPath: otherNode, candidates: [shim] })).toBe(otherNode);
   });
 
   it('falls through to execPath when no candidate exists', () => {
     const { realNode } = layout();
-    expect(stableNodePath({ execPath: realNode, candidates: [join(sandbox!, 'nope')] })).toBe(realNode);
+    expect(stableNodePath({ platform: MAC, execPath: realNode, candidates: [join(sandbox!, 'nope')] })).toBe(realNode);
   });
 
   it('treats a dangling candidate symlink as a non-match', () => {
     const { realNode } = layout();
     const dangling = join(sandbox!, 'dangling');
     symlinkSync(join(sandbox!, 'missing-target'), dangling);
-    expect(stableNodePath({ execPath: realNode, candidates: [dangling] })).toBe(realNode);
+    expect(stableNodePath({ platform: MAC, execPath: realNode, candidates: [dangling] })).toBe(realNode);
   });
 
-  it('returns execPath unchanged when it cannot be resolved', () => {
+  it('returns execPath unchanged when it cannot be resolved (darwin)', () => {
     sandbox = mkdtempSync(join(tmpdir(), 'recall-stable-node-'));
     const missing = join(sandbox, 'missing-exec');
-    expect(stableNodePath({ execPath: missing, candidates: [] })).toBe(missing);
+    expect(stableNodePath({ platform: MAC, execPath: missing, candidates: [] })).toBe(missing);
   });
 
-  it('defaults to process.execPath off Homebrew (no matching shim on this host)', () => {
-    // On the dev box (nvm) none of the default Homebrew shims match → no-op.
+  it('is a STRICT no-op off darwin — ignores an otherwise-matching shim', () => {
+    const { realNode, shim } = layout();
+    // Even with a shim that resolves to the same binary, Linux/Windows must
+    // return execPath (never pin /usr/local/bin/node, which `n` floats).
+    expect(stableNodePath({ platform: 'linux', execPath: realNode, candidates: [shim] })).toBe(realNode);
+    expect(stableNodePath({ platform: 'win32', execPath: realNode, candidates: [shim] })).toBe(realNode);
+  });
+
+  it('defaults to process.execPath on this (non-darwin) host', () => {
+    // On the Linux dev box / CI the gate returns execPath directly → no-op.
     expect(stableNodePath()).toBe(process.execPath);
   });
 });

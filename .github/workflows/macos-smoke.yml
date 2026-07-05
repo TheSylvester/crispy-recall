@@ -3,9 +3,10 @@
 # WHY THIS EXISTS: recall 0.2.0 shipped native better-sqlite3 + WAL and llama.cpp
 # semantic vectors with ZERO macOS exposure — every prior test ran on Linux/WSL.
 # This workflow (a) proves a clean install works end-to-end on arm64 macOS,
-# (b) encodes regression legs for four audited macOS defects so a later fix phase
-# can flip the PRE-FIX baselines green, and (c) uploads a packed tarball for the
-# rented-Mac acceptance phase.
+# (b) carries regression/drift guards for four audited macOS defects — now FIXED,
+# so the legs assert the post-fix behavior (regression-abi-mismatch,
+# minos-floor-static, prebuild-coverage-static), and (c) uploads a packed tarball
+# for the rented-Mac acceptance phase.
 #
 # RUNNERS: this repo is PUBLIC → GitHub-hosted macOS minutes are free/unlimited.
 # We pin `macos-26` (arm64, 3-vCPU M1, 7 GB RAM, 14 GB SSD): `macos-latest` is
