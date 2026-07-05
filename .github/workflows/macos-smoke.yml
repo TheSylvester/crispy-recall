@@ -108,7 +108,11 @@ jobs:
           # (defect 3's Node-23 hole is tested separately). Record, don't fail:
           # a compile that succeeds still yields a working install, and the real
           # user-facing gate is `doctor` two steps down.
-          if grep -qiE 'node-gyp (rebuild|configure|build)|gyp info spawn' npm-install.log; then
+          # Match ACTUAL node-gyp compile output (gyp/compiler lines) — NOT the
+          # `prebuild-install || node-gyp rebuild --release` script banner that
+          # --foreground-scripts always echoes, which would false-positive on a
+          # perfectly prebuilt install.
+          if grep -qE 'gyp info spawn args|CXX\(target\)|SOLINK_MODULE' npm-install.log; then
             echo "::warning::better-sqlite3 COMPILED via node-gyp under Node ${{ matrix.node }} — expected a prebuilt darwin binary"
             echo "- ⚠️ Node ${{ matrix.node }}: better-sqlite3 compiled via node-gyp (expected prebuilt)" >> "$GITHUB_STEP_SUMMARY"
           else
@@ -314,7 +318,13 @@ jobs:
           set -uo pipefail
           node -e 'console.log("recall runtime Node ABI:", process.versions.modules)'  # 137
           echo "=== recall install --yes under mismatched Node 24 (expected to ABORT) ==="
-          OUT=$("$RECALL_BIN" install --yes --no-backfill --json 2>&1); CODE=$?
+          # GitHub runs steps under `bash -e {0}`; `set -uo pipefail` does NOT clear
+          # errexit, so a bare `OUT=$(failing-cmd)` aborts the step before any
+          # assertion runs (masking WHY install failed). Capture via `if` — errexit
+          # is suppressed only for the tested command — so the documented assertions
+          # below (exit-code guard, BindingLoadError grep, doctor bindingLoads=false)
+          # actually execute and the real error text lands in the log.
+          if OUT=$("$RECALL_BIN" install --yes --no-backfill --json 2>&1); then CODE=0; else CODE=$?; fi
           echo "$OUT"
           echo "install exit=$CODE"
           if [ "$CODE" -eq 0 ]; then
