@@ -13,7 +13,8 @@ A standalone spin-off of the recall feature from [Crispy](https://github.com/The
   binding — which never actually engaged WAL and could silently corrupt the
   index when multiple processes wrote at once. That failure mode is eliminated
   at the root. `recall doctor` gains a SQLite-binding health section.
-  **Node.js ≥ 22.16 is now required.**
+  **Node.js 22 LTS (≥ 22.16) or 24+ is now required** (Node 23 has no prebuilt
+  SQLite binding).
 - **Git provenance: `--commit` and `--blame`.** `recall --commit <hash>` lists
   the session(s) that produced a commit; `recall --blame <path>[:line[-line]]`
   traces a file or line range back to the conversations responsible. Matching
@@ -65,13 +66,19 @@ Run it in the environment where you actually use Claude Code: **WSL and
 Windows-native are separate installs.** If you use both, run the install in each
 — the installer only configures the environment it is invoked in.
 
+> **macOS: use Node 22 LTS or 24+.** Node 23 has no prebuilt SQLite binding, so
+> `npm install -g` would fall back to compiling it and fail without Xcode
+> Command Line Tools. macOS 14+ (Apple Silicon) / 13.7+ (Intel) is required for
+> the bundled semantic-embedding binaries.
+
 > **Don't install via `npx`.** recall must stay resident. `npx` runs from an
 > ephemeral cache and leaves no `recall` command on your PATH, so follow-up
 > commands (`recall status` / `doctor` / `repair` / `uninstall`) and the
 > installed skill's command contract have nothing to call. Use the global
 > install above.
 
-Prerequisites: Node ≥ 22.16 and Claude Code installed. If Codex is detected
+Prerequisites: Node 22 LTS (≥ 22.16) or 24+ — Node 23 is unsupported (no
+prebuilt SQLite binding) — and Claude Code installed. If Codex is detected
 (`~/.codex/` exists), recall installs the `recall` skill into Codex (so the
 agent can search) and you can index your Codex history with
 `recall backfill --vendor codex`. Real-time per-turn Codex indexing is **not

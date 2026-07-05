@@ -62,8 +62,15 @@ export class BindingLoadError extends Error {
   constructor(public readonly dbPath: string, public readonly cause: Error) {
     super(
       `recall: failed to load the better-sqlite3 native binding while opening ${dbPath}: ` +
-        `${cause.message}\nThe binding is ABI-locked to the Node it was built for — ` +
-        `run \`recall doctor\` (usually fixed by re-running \`recall install\`).`,
+        `${cause.message}\n` +
+        'The native SQLite binding is ABI-locked to the Node it was built for. This is usually one of:\n' +
+        '  • recall is running under a different Node than the one npm installed it with ' +
+        '(e.g. Homebrew node vs nvm) — reinstall with `npm install -g crispy-recall` using the node on ' +
+        'your PATH, then `recall install`.\n' +
+        '  • no prebuilt binary matched your Node version and it could not compile — use Node 22 LTS or ' +
+        '24+ (Node 23 has no prebuilt SQLite binding), and on macOS make sure Xcode Command Line Tools ' +
+        'are installed (`xcode-select --install`).\n' +
+        'Run `recall doctor` for details.',
     );
     this.name = 'BindingLoadError';
   }

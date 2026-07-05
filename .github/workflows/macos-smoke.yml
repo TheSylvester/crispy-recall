@@ -420,12 +420,12 @@ jobs:
           [ "$X64" = "$EXP_X64" ] || { echo "::error::x64 asset minos=$X64 != embedder.ts MACOS_MIN_VERSION.x64=$EXP_X64 — floor drifted from the shipped binary"; exit 1; }
 
   # ===========================================================================
-  # PRE-FIX BASELINE — defect 3 (Node-23 prebuild hole). Static, on ubuntu (cheap).
-  # engines.node `>=22.16` permits Node 23 (ABI 131), but better-sqlite3 ships NO
-  # darwin prebuild for 131 → node-gyp fallback bricks `npm install -g` on Macs
-  # without Xcode CLT. This leg asserts the gap == {23} (and that smoke-local's
-  # Node 22/24 ARE covered). Green today; phase 2 narrows engines / adds coverage
-  # and flips the baseline in scripts/ci/prebuild-coverage.mjs.
+  # REGRESSION GUARD — defect 3 (Node-23 prebuild hole). Static, on ubuntu (cheap).
+  # better-sqlite3 ships NO darwin prebuild for ABI 131 (Node 23), so the defect-3
+  # fix narrows engines.node to `>=22.16.0 <23 || >=24.0.0`. This leg evaluates the
+  # engines range and asserts EVERY allowed major has a darwin prebuild (and that
+  # smoke-local's Node 22/24 are allowed + covered). It goes RED if engines ever
+  # re-admits a prebuild-less major (Node 23 creeping back in).
   # ===========================================================================
   prebuild-coverage-static:
     name: prebuild-coverage-static (better-sqlite3 darwin ABIs)
