@@ -12,9 +12,11 @@
 # We pin `macos-26` (arm64, 3-vCPU M1, 7 GB RAM, 14 GB SSD): `macos-latest` is
 # mid-migration 15→26 and `macos-14` deprecates 2026-07-06. The macOS concurrency
 # cap is 5, so the PUSH path keeps macOS jobs at EXACTLY 5 (smoke-local×2 +
-# smoke-registry + regression-abi-mismatch + minos-floor-static). vitest-macos is
-# workflow_dispatch-only so it never pushes the count to 6; prebuild-coverage runs
-# on ubuntu.
+# regression-abi-mismatch + minos-floor-static + bootstrap-rehearsal). Adding
+# bootstrap-rehearsal (Phase 3) would have pushed the count to 6, so smoke-registry
+# moved to workflow_dispatch-only (its published-0.2.0 result is informational, not
+# a per-push gate). vitest-macos is likewise workflow_dispatch-only; prebuild-coverage
+# runs on ubuntu.
 #
 # METAL: llama.cpp's macOS build uses the Apple Paravirtual Metal device on these
 # runners (llama.cpp CI runs -ngl tests here). It can flake — a flake is SIGNAL:
@@ -225,6 +227,10 @@ jobs:
     name: smoke-registry (crispy-recall@0.2.0)
     runs-on: macos-26
     timeout-minutes: 40
+    # workflow_dispatch-only: keeps the PUSH macOS set at the concurrency cap of 5
+    # once bootstrap-rehearsal joins. Informational either way (records PASS/FAIL to
+    # the summary, never blocks), so demoting it off the push path costs no signal.
+    if: ${{ github.event_name == 'workflow_dispatch' }}
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4  # for scripts/ci/* assertion helpers
@@ -265,6 +271,74 @@ jobs:
             echo "## smoke-registry (crispy-recall@0.2.0, Node 24): ❌ FAIL at stage \`$FAIL\`" >> "$GITHUB_STEP_SUMMARY"
           fi
           exit 0
+
+  # ===========================================================================
+  # PHASE 3 REHEARSAL — dry-run the rented-Mac acceptance kit so the operator's
+  # first rented hour is testing, not debugging the script. Runs the SAME
+  # scripts/mac-acceptance/bootstrap.sh the operator will run, in --ci mode
+  # (headless, deterministic), against THIS run's own freshly-packed tarball —
+  # not the uploaded artifact (that's for the operator's `gh run download`). The
+  # `rm -f dist/better_sqlite3.node` before pack is LOAD-BEARING: it mirrors the
+  # published stripped tarball so the rehearsal exercises the npm-global binding
+  # resolution real users hit (see smoke-local's pack step for the full rationale).
+  #
+  # SCOPE: the rehearsal covers the script through its embedded self-check
+  # (preflight → brew/node no-ops → recall install → seed → backfill → doctor →
+  # search). It CANNOT cover the login-dependent path (step 4's `claude` auth) or
+  # the runbook's live items (C live Stop-hook, E `brew upgrade node` lifecycle) —
+  # those are exactly what the physical rented Mac is for. Node comes from
+  # setup-node (the script's "Node already suitable" branch); the `brew install
+  # node` branch is validated live on the rented Mac.
+  #
+  # Triggers on push + workflow_dispatch. It is the 5th (cap) PUSH macOS job;
+  # smoke-registry was demoted to workflow_dispatch-only to make room.
+  # ===========================================================================
+  bootstrap-rehearsal:
+    name: bootstrap-rehearsal (mac-acceptance kit, --ci)
+    runs-on: macos-26
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Cache embedding model
+        uses: actions/cache@v4
+        with:
+          path: ~/.recall/models
+          key: recall-model-${{ env.RECALL_MODEL }}
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Build → strip sibling .node → pack (mirror the published tarball)
+        run: |
+          set -euo pipefail
+          npm run build
+          # LOAD-BEARING (see smoke-local): the published tarball is stripped of
+          # dist/better_sqlite3.node by prepublishOnly; `npm pack` does not run it,
+          # so strip manually to exercise candidate #2 of resolveNativeBinding.
+          rm -f dist/better_sqlite3.node
+          npm pack
+          ls -1 crispy-recall-*.tgz
+
+      - name: Rehearse bootstrap.sh --ci against this run's tarball
+        run: |
+          set -euo pipefail
+          TGZ="$(ls crispy-recall-*.tgz | head -1)"
+          echo "rehearsing scripts/mac-acceptance/bootstrap.sh --ci --tarball $PWD/$TGZ"
+          # pipefail (GitHub's default bash flags) already fails the step if the
+          # script exits non-zero. tee keeps the log for the sentinel greps below.
+          bash scripts/mac-acceptance/bootstrap.sh --ci --tarball "$PWD/$TGZ" 2>&1 | tee bootstrap.log
+          # Assert the self-check actually PASSED and ran to the end — not a silent
+          # skip. Both sentinels are printed only on the green terminal path.
+          grep -q '\[bootstrap\] SELF-CHECK: PASS' bootstrap.log \
+            || { echo "::error::bootstrap self-check PASS sentinel not found — script did not reach a green self-check"; exit 1; }
+          grep -q 'ACCEPTANCE-READY' bootstrap.log \
+            || { echo "::error::acceptance-ready banner not found — script exited before the final banner"; exit 1; }
+          echo "## bootstrap-rehearsal: ✅ mac-acceptance kit self-check PASS on macos-26 (this run's tarball)" >> "$GITHUB_STEP_SUMMARY"
 
   # ===========================================================================
   # REGRESSION GUARD — defect 4 (ABI-mismatch marker). npm runs under Node 22
