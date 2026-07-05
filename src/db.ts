@@ -19,9 +19,11 @@
  * @module db
  */
 
-import { rmSync, existsSync, unlinkSync, mkdirSync } from 'node:fs';
+import { rmSync, existsSync, unlinkSync, mkdirSync, statSync, readdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { createRequire } from 'node:module';
 import { log } from './log.js';
+import { binDir } from './paths.js';
 import Database from 'better-sqlite3';
 
 type RawDatabase = Database.Database;
@@ -61,7 +63,7 @@ export class BindingLoadError extends Error {
     super(
       `recall: failed to load the better-sqlite3 native binding while opening ${dbPath}: ` +
         `${cause.message}\nThe binding is ABI-locked to the Node it was built for — ` +
-        `run \`recall doctor\` (usually fixed by \`recall install --restage\`).`,
+        `run \`recall doctor\` (usually fixed by re-running \`recall install\`).`,
     );
     this.name = 'BindingLoadError';
   }
@@ -155,22 +157,107 @@ export function _resetDb(): void {
 // ============================================================================
 
 function openDatabase(dbPath: string): RawDatabase {
-  // In the esbuild bundle __dirname is dist/ (or ~/.recall/bin after staging),
-  // where build.mjs / the installer place `better_sqlite3.node` beside the
-  // bundle. Passing an explicit nativeBinding path is a *runtime* variable, so
-  // esbuild never sees a static `.node` import and needs no `.node` loader. In
-  // the un-bundled dev/test path (vitest runs src/ directly) no `.node` sits
-  // beside this file, so we fall through to better-sqlite3's normal resolution
-  // from node_modules.
-  const localBinding = join(__dirname, 'better_sqlite3.node');
+  // Resolve the better-sqlite3 native addon EXPLICITLY and pass it as
+  // `nativeBinding`. This is load-bearing: build.mjs bundles better-sqlite3 AND
+  // its `bindings` helper into the CLI (`external: []`), and that bundled
+  // `bindings` resolver only searches paths rooted at the crispy-recall package
+  // dir — it never consults `node_modules/better-sqlite3`. So relying on
+  // better-sqlite3's default resolution bricks `recall` on every platform the
+  // moment the builder's sibling `.node` is stripped from the published tarball
+  // (which is exactly what `prepublishOnly` does). An explicit nativeBinding is
+  // also a *runtime* path, so esbuild never sees a static `.node` import and
+  // needs no `.node` loader.
+  //
+  // `resolveNativeBinding()` returns non-null for every real layout: the
+  // installed/bundled ones via candidates 1–3, and even the un-bundled dev/test
+  // path via candidate 2 (createRequire resolves the repo's node_modules). The
+  // bare `new Database` below is a defensive last resort — in the published
+  // bundle a candidate always resolves, and where the bare path *does* run
+  // (un-bundled) `require` is Node's real resolver, never the bricking bundled
+  // one. If nothing resolves at all, better-sqlite3 raises → BindingLoadError.
+  const nativeBinding = resolveNativeBinding();
   try {
-    return existsSync(localBinding)
-      ? new Database(dbPath, { nativeBinding: localBinding })
+    return nativeBinding
+      ? new Database(dbPath, { nativeBinding })
       : new Database(dbPath);
   } catch (e) {
     if (isBindingLoadError(e)) throw new BindingLoadError(dbPath, e as Error);
     throw e;
   }
+}
+
+/**
+ * Resolve the better-sqlite3 native addon through an ordered candidate chain,
+ * returning an absolute path or null if none resolves:
+ *
+ *   1. sibling of the running bundle — `join(__dirname, 'better_sqlite3.node')`.
+ *      Covers the local dev build (build.mjs stages `dist/better_sqlite3.node`)
+ *      and the installed bundles staged in `~/.recall/bin` (their __dirname).
+ *   2. the installer's own `node_modules/better-sqlite3`, via Node's real module
+ *      resolution — covers the npm-global layout, where the published tarball
+ *      ships NO sibling `.node` but the addon is a resolvable dependency. This
+ *      is the case the stripped-tarball publish blocker turned on.
+ *   3. `join(binDir(), 'better_sqlite3.node')` — the staged addon in
+ *      `~/.recall/bin`, for a bundle whose own __dirname has no sibling.
+ */
+function resolveNativeBinding(): string | null {
+  const sibling = join(__dirname, 'better_sqlite3.node');
+  if (existsSync(sibling)) return sibling;
+
+  const resolved = resolveInstalledBinding();
+  if (resolved) return resolved;
+
+  const staged = join(binDir(), 'better_sqlite3.node');
+  if (existsSync(staged)) return staged;
+
+  return null;
+}
+
+/**
+ * Resolve the installed better-sqlite3 addon via Node's real module resolution
+ * (respects hoisting), then locate its compiled `.node`. Mirrors the installer's
+ * own staging resolver (`install.ts` resolveInstalledBinding) — kept local here
+ * rather than shared because the installer already imports this module, and a
+ * back-import would create a db↔installer cycle.
+ */
+function resolveInstalledBinding(): string | null {
+  try {
+    const pkgJson = createRequire(__filename).resolve('better-sqlite3/package.json');
+    return findNativeBinding(dirname(pkgJson));
+  } catch {
+    return null;
+  }
+}
+
+/** Find better_sqlite3.node under a package dir: canonical gyp output first,
+ *  then a bounded recursive scan (covers prebuild-install `prebuilds/…`). */
+function findNativeBinding(baseDir: string): string | null {
+  for (const c of [
+    join(baseDir, 'build', 'Release', 'better_sqlite3.node'),
+    join(baseDir, 'build', 'Debug', 'better_sqlite3.node'),
+  ]) {
+    try {
+      if (statSync(c).isFile()) return c;
+    } catch {
+      // keep looking
+    }
+  }
+  const stack = [baseDir];
+  while (stack.length) {
+    const dir = stack.pop()!;
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const e of entries) {
+      const p = join(dir, e.name);
+      if (e.isDirectory()) stack.push(p);
+      else if (e.name.endsWith('.node')) return p;
+    }
+  }
+  return null;
 }
 
 function createAdapter(raw: RawDatabase): RecallDb {

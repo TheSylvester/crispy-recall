@@ -197,7 +197,7 @@ function stageNativeBinding(written: string[]): void {
 
   // ABI marker: `recall doctor` uses it to detect a Node-major drift (module
   // version mismatch) or a stale wasm-era install (marker absent) and advise
-  // `recall install --restage`.
+  // re-running `recall install` (which restages the binding on every run).
   const markerPath = join(binDir(), '.binding-info.json');
   writeFileSync(
     markerPath,
@@ -399,7 +399,7 @@ export async function runInstall(opts: InstallOptions = {}): Promise<InstallResu
         : ' Then re-run `recall install`.';
       let remediation: string;
       if (isBindingLoadError(e)) {
-        remediation = `The native SQLite binding failed to load (${emsg}). Run \`recall install --restage\` (or \`recall doctor\`).`;
+        remediation = `The native SQLite binding failed to load (${emsg}). Run \`recall install\` (or \`recall doctor\`).`;
       } else if (/database is locked|SQLITE_BUSY|busy_timeout/i.test(emsg)) {
         remediation = `A live session is holding the database. Exit all Claude/Codex sessions.${rerun}`;
       } else if (/expected WAL journal_mode/i.test(emsg)) {

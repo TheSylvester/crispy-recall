@@ -83,7 +83,7 @@ function checkBindingHealth(): BindingHealth {
   let abiOk: boolean | null = null;
   let pinnedNodeOk: boolean | null = null;
   if (!markerPresent) {
-    problems.push('no .binding-info.json marker — pre-migration (wasm-era) install; run `recall install --restage`');
+    problems.push('no .binding-info.json marker — pre-migration (wasm-era) install; run `recall install`');
   } else {
     try {
       const marker = JSON.parse(readFileSync(markerPath, 'utf-8')) as {
@@ -93,15 +93,15 @@ function checkBindingHealth(): BindingHealth {
       if (!abiOk) {
         problems.push(
           `binding ABI mismatch (staged for NODE_MODULE_VERSION ${marker.nodeModuleVersion}, ` +
-            `current ${process.versions.modules}) — run \`recall install --restage\``,
+            `current ${process.versions.modules}) — run \`recall install\``,
         );
       }
       pinnedNodeOk = !!marker.nodePath && existsSync(marker.nodePath);
       if (!pinnedNodeOk) {
-        problems.push(`pinned Node path missing (${marker.nodePath ?? 'unset'}) — run \`recall install --restage\``);
+        problems.push(`pinned Node path missing (${marker.nodePath ?? 'unset'}) — run \`recall install\``);
       }
     } catch {
-      problems.push('unreadable .binding-info.json marker — run `recall install --restage`');
+      problems.push('unreadable .binding-info.json marker — run `recall install`');
     }
   }
 
@@ -142,7 +142,7 @@ function checkBindingHealth(): BindingHealth {
       }
     } catch (e) {
       if (isBindingLoadError(e)) {
-        problems.push('better_sqlite3.node failed to load (ABI/dlopen) — run `recall install --restage`');
+        problems.push('better_sqlite3.node failed to load (ABI/dlopen) — run `recall install`');
       } else {
         problems.push(`could not read live DB journal_mode: ${(e as Error).message}`);
       }
@@ -158,7 +158,7 @@ function checkBindingHealth(): BindingHealth {
     } catch (e) {
       problems.push(
         isBindingLoadError(e)
-          ? 'better_sqlite3.node failed to load (ABI/dlopen) — run `recall install --restage`'
+          ? 'better_sqlite3.node failed to load (ABI/dlopen) — run `recall install`'
           : `binding self-test failed: ${(e as Error).message}`,
       );
     }
