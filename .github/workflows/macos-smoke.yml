@@ -266,13 +266,16 @@ jobs:
           exit 0
 
   # ===========================================================================
-  # PRE-FIX BASELINE — defect 4 (ABI-mismatch marker). npm runs under Node 22
+  # REGRESSION GUARD — defect 4 (ABI-mismatch marker). npm runs under Node 22
   # (fetches the ABI-127 prebuild); recall then runs under Node 24 (ABI 137).
-  # `recall install` stages the ABI-127 binding but writes the marker from the
-  # RUNNING node (137), so the marker vouches for a binding that cannot dlopen →
-  # phase-6 getDb throws BindingLoadError with a "re-run recall install"
-  # remediation that loops forever. This leg ASSERTS the bug is present (green);
-  # phase 2 flips it to expect a clean install once defect 4 is fixed.
+  # PRE-FIX: `recall install` staged the ABI-127 binding but wrote the marker from
+  # the RUNNING node (137), so the marker vouched for a binding that cannot dlopen
+  # and getDb looped on "re-run recall install". POST-FIX: install load-probes the
+  # staged binding first and aborts FAST at staging with a clear two-node message,
+  # never writing a lying marker. This leg asserts the post-fix behavior: non-zero
+  # exit, the two-node remediation text, the OLD looping text is gone, and doctor
+  # honestly reports bindingLoads=false AND abiOk=false (the marker stays truthful
+  # at 127 from the last successful Node-22 stage).
   # ===========================================================================
   regression-abi-mismatch:
     name: regression-abi-mismatch (npm@22 / recall@24)
@@ -313,39 +316,52 @@ jobs:
         with:
           node-version: 24
 
-      - name: Reproduce ABI-mismatch under Node 24  # PRE-FIX BASELINE — phase 2 flips this
+      - name: Assert Fix-4 staging abort under Node 24  # POST-FIX behavior
         run: |
           set -uo pipefail
           node -e 'console.log("recall runtime Node ABI:", process.versions.modules)'  # 137
-          echo "=== recall install --yes under mismatched Node 24 (expected to ABORT) ==="
+          echo "=== recall install --yes under mismatched Node 24 (expected: FAST staging abort) ==="
           # GitHub runs steps under `bash -e {0}`; `set -uo pipefail` does NOT clear
           # errexit, so a bare `OUT=$(failing-cmd)` aborts the step before any
           # assertion runs (masking WHY install failed). Capture via `if` — errexit
-          # is suppressed only for the tested command — so the documented assertions
-          # below (exit-code guard, BindingLoadError grep, doctor bindingLoads=false)
-          # actually execute and the real error text lands in the log.
+          # is suppressed only for the tested command — so the assertions below
+          # (exit-code guard, two-node grep, old-text absence, doctor check) run and
+          # the real error text lands in the log.
           if OUT=$("$RECALL_BIN" install --yes --no-backfill --json 2>&1); then CODE=0; else CODE=$?; fi
           echo "$OUT"
           echo "install exit=$CODE"
           if [ "$CODE" -eq 0 ]; then
-            echo "::error::PRE-FIX BASELINE BROKEN — install SUCCEEDED under mismatched Node (defect 4 fixed?). Flip this leg for phase 2."
+            echo "::error::install SUCCEEDED under mismatched Node — the Fix-4 staging probe should have aborted"
             exit 1
           fi
-          echo "$OUT" | grep -qiE 'native SQLite binding failed to load|failed to load the better-sqlite3 native binding' \
-            || { echo "::error::expected the BindingLoadError remediation text, not found in install output"; exit 1; }
-          echo "=== recall doctor --json under Node 24 (binding.bindingLoads must be false) ==="
+          # (1) The NEW two-node staging remediation must appear.
+          echo "$OUT" | grep -qiE 'built for a different Node|npm install -g crispy-recall' \
+            || { echo "::error::expected the Fix-4 two-node staging remediation, not found in install output"; exit 1; }
+          # (2) The OLD looping path (BindingLoadError at the getDb migration) must be
+          # GONE — staging aborts before getDb, proving we intercept earlier.
+          if echo "$OUT" | grep -qiE 'failed to load the better-sqlite3 native binding|migration aborted'; then
+            echo "::error::old migration-abort path still fired — the staging probe did not intercept first"
+            exit 1
+          fi
+          echo "=== recall doctor --json under Node 24 (honest marker: bindingLoads=false AND abiOk=false) ==="
           "$RECALL_BIN" doctor --json > reg24-doctor.json || true
           cat reg24-doctor.json
           node -e '
             const b = JSON.parse(require("fs").readFileSync("reg24-doctor.json","utf8")).binding || {};
-            if (b.bindingLoads !== false) { console.error("PRE-FIX BASELINE BROKEN: bindingLoads="+b.bindingLoads+" (expected false)"); process.exit(1); }
-            console.log("PRE-FIX BASELINE confirmed: doctor reports bindingLoads=false while abiOk="+b.abiOk+" — the marker vouches for a broken binding.");
+            const bad = [];
+            // The staged ABI-127 binding still cannot dlopen under Node 24.
+            if (b.bindingLoads !== false) bad.push("bindingLoads="+b.bindingLoads+" (want false)");
+            // KEY POST-FIX SIGNAL: install aborted before writing a lying 137 marker,
+            // so the marker stays at 127 from the last good Node-22 stage → abiOk=false.
+            if (b.abiOk !== false) bad.push("abiOk="+b.abiOk+" (want false: the marker must NOT vouch for a binding that cannot load)");
+            if (bad.length) { console.error("POST-FIX doctor assertion failed:\n  "+bad.join("\n  ")); process.exit(1); }
+            console.log("POST-FIX confirmed: doctor honestly reports bindingLoads=false AND abiOk=false — no lying marker.");
           '
           {
-            echo "## regression-abi-mismatch (PRE-FIX BASELINE)"
+            echo "## regression-abi-mismatch (POST-FIX)"
             echo "npm-installed under Node 22 (ABI 127); recall run under Node 24 (ABI 137)."
-            echo "- \`recall install\` aborted (exit $CODE) with the BindingLoadError \"re-run recall install\" remediation (loops forever)."
-            echo "- \`recall doctor\` reports \`binding.bindingLoads=false\` while \`abiOk=true\` — the marker vouches for a binding that cannot dlopen."
+            echo "- \`recall install\` aborted FAST at staging (exit $CODE) with the two-node \"built for a different Node / npm install -g crispy-recall\" remediation — no infinite \"re-run recall install\" loop."
+            echo "- \`recall doctor\` honestly reports \`binding.bindingLoads=false\` AND \`abiOk=false\` — the marker was never overwritten to vouch for a binding that cannot dlopen."
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ===========================================================================

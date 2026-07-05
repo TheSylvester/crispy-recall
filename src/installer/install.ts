@@ -20,7 +20,7 @@ import {
   existsSync, readFileSync, writeFileSync, copyFileSync, mkdirSync, openSync,
   realpathSync, readdirSync, statSync, unlinkSync,
 } from 'node:fs';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
 import { binDir, modelsDir, runDir, logsDir, recallRoot, dbPath } from '../paths.js';
@@ -149,7 +149,10 @@ function writeSkill(targetPath: string, templatePath: string, runnable: string):
   return true;
 }
 
-function stageBundles(distDir: string, written: string[]): void {
+/** Result of staging: ok, or a hard abort with the user-facing remediation. */
+type StageResult = { ok: true } | { ok: false; remediation: string };
+
+function stageBundles(distDir: string, written: string[]): StageResult {
   mkdirSync(binDir(), { recursive: true });
   for (const name of STAGED_BUNDLES) {
     const src = join(distDir, name);
@@ -161,7 +164,7 @@ function stageBundles(distDir: string, written: string[]): void {
     copyFileSync(src, dest);
     written.push(dest);
   }
-  stageNativeBinding(written);
+  return stageNativeBinding(written);
 }
 
 /**
@@ -175,7 +178,7 @@ function stageBundles(distDir: string, written: string[]): void {
  * compute `nativeBinding` as `join(__dirname, 'better_sqlite3.node')`, so it
  * must sit directly beside them in binDir().
  */
-function stageNativeBinding(written: string[]): void {
+function stageNativeBinding(written: string[]): StageResult {
   // Restage hygiene: drop a pre-migration wasm sidecar — the bundles now load
   // better_sqlite3.node and would ignore it, but leaving it is misleading.
   const staleWasm = join(binDir(), 'node-sqlite3-wasm.wasm');
@@ -190,16 +193,34 @@ function stageNativeBinding(written: string[]): void {
       level: 'warn',
       summary: 'better_sqlite3.node not found in node_modules — the CLI/hooks will fail to load SQLite until reinstalled',
     });
-    return;
+    return { ok: true };
   }
 
   const dest = join(binDir(), 'better_sqlite3.node');
   copyFileSync(binding, dest);
   written.push(dest);
 
-  // ABI marker: `recall doctor` uses it to detect a Node-major drift (module
-  // version mismatch) or a stale wasm-era install (marker absent) and advise
-  // re-running `recall install` (which restages the binding on every run).
+  // Verify the freshly-staged addon actually dlopens under THIS Node BEFORE
+  // writing the marker that vouches for it. A wrong-ABI binding — npm installed
+  // under a different Node than the one now running recall (e.g. Homebrew vs
+  // nvm) — fails to dlopen with ERR_DLOPEN_FAILED; abort with a clear two-node
+  // message instead of writing a lying marker and then looping at the getDb
+  // migration ("re-run recall install", which can never fix an ABI gap).
+  const probe = probeStagedBinding(dest);
+  if (!probe.ok) {
+    const remediation = isBindingLoadError({ message: probe.message })
+      ? `The SQLite binding npm installed was built for a different Node than the one running recall ` +
+        `(${process.execPath}, ${process.version}). This usually means \`npm install -g\` ran under a ` +
+        `different Node (e.g. Homebrew vs nvm). Re-run \`npm install -g crispy-recall\` using the same ` +
+        `node that is on your PATH, then \`recall install\`. (${probe.message})`
+      : `The staged SQLite binding could not be loaded (${probe.message}). Re-run ` +
+        `\`npm install -g crispy-recall\` with the node that is on your PATH, then \`recall install\`.`;
+    return { ok: false, remediation };
+  }
+
+  // ABI marker: written ONLY after the binding is proven to load under this
+  // Node, so nodeModuleVersion is truthful. `recall doctor` reads it to detect a
+  // Node-major drift or a stale wasm-era install (marker absent).
   const markerPath = join(binDir(), '.binding-info.json');
   writeFileSync(
     markerPath,
@@ -217,6 +238,30 @@ function stageNativeBinding(written: string[]): void {
     ),
   );
   written.push(markerPath);
+  return { ok: true };
+}
+
+/**
+ * Load-probe the staged `better_sqlite3.node` in a SHORT-LIVED child process.
+ *
+ * Deliberately NOT in-process: requiring the native addon from a fresh path in
+ * the long-lived installer (or vitest worker) leaves it loaded and crashes on
+ * teardown — better-sqlite3's destructors run over each distinct copied path.
+ * A throwaway `node -e 'require(<path>)'` isolates the dlopen: a matching-ABI
+ * binding exits 0; a wrong-ABI one exits non-zero with the ERR_DLOPEN_FAILED /
+ * NODE_MODULE_VERSION message on stderr, which the caller classifies.
+ */
+export function probeStagedBinding(dest: string): { ok: true } | { ok: false; message: string } {
+  const res = spawnSync(process.execPath, ['-e', 'require(process.argv[1])', dest], {
+    encoding: 'utf-8',
+    timeout: 20_000,
+    windowsHide: true,
+  });
+  if (res.status === 0) return { ok: true };
+  const message =
+    (res.stderr || res.stdout || '').trim() ||
+    (res.error ? res.error.message : `binding probe exited with code ${res.status}`);
+  return { ok: false, message };
 }
 
 /** Resolve the installed better-sqlite3 addon via Node's real module
@@ -344,7 +389,17 @@ export async function runInstall(opts: InstallOptions = {}): Promise<InstallResu
 
     // ---- 2/3. Resolve paths + scaffold ~/.recall/ ----
     for (const d of [binDir(), modelsDir(), runDir(), logsDir()]) mkdirSync(d, { recursive: true });
-    stageBundles(opts.distDir ?? defaultDistDir(), filesWritten);
+    const staged = stageBundles(opts.distDir ?? defaultDistDir(), filesWritten);
+    if (!staged.ok) {
+      // The staged SQLite binding cannot load under this Node — abort NOW, before
+      // the marker vouches for it and before getDb loops on "re-run recall install".
+      if (interactive) note(staged.remediation, 'Install aborted');
+      else log({ source: 'installer/install', level: 'error', summary: `install aborted: ${staged.remediation}` });
+      return {
+        aborted: true, abortReason: staged.remediation, report, selected: [...selected], gpu, filesWritten,
+        migration: { state: migration.state, coverage: migration.coverage, drainLaunched: false },
+      };
+    }
     say(`scaffolded ${recallRoot()}`);
 
     // ---- 4. CPU runtime (eager) — always the guaranteed fallback ----
