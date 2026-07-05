@@ -1,0 +1,463 @@
+# First-ever CI exposure of recall on real Apple hardware.
+#
+# WHY THIS EXISTS: recall 0.2.0 shipped native better-sqlite3 + WAL and llama.cpp
+# semantic vectors with ZERO macOS exposure — every prior test ran on Linux/WSL.
+# This workflow (a) proves a clean install works end-to-end on arm64 macOS,
+# (b) encodes regression legs for four audited macOS defects so a later fix phase
+# can flip the PRE-FIX baselines green, and (c) uploads a packed tarball for the
+# rented-Mac acceptance phase.
+#
+# RUNNERS: this repo is PUBLIC → GitHub-hosted macOS minutes are free/unlimited.
+# We pin `macos-26` (arm64, 3-vCPU M1, 7 GB RAM, 14 GB SSD): `macos-latest` is
+# mid-migration 15→26 and `macos-14` deprecates 2026-07-06. The macOS concurrency
+# cap is 5, so the PUSH path keeps macOS jobs at EXACTLY 5 (smoke-local×2 +
+# smoke-registry + regression-abi-mismatch + minos-floor-static). vitest-macos is
+# workflow_dispatch-only so it never pushes the count to 6; prebuild-coverage runs
+# on ubuntu.
+#
+# METAL: llama.cpp's macOS build uses the Apple Paravirtual Metal device on these
+# runners (llama.cpp CI runs -ngl tests here). It can flake — a flake is SIGNAL:
+# smoke-local logs it loudly, forces the CPU embedder (config.json), re-embeds and
+# continues, rather than treating it as noise.
+
+name: macos-smoke
+
+on:
+  push:
+    branches:
+      - 'fix/**'
+  workflow_dispatch:
+    inputs:
+      debug_tmate:
+        description: 'Open a tmate SSH session (actor-only) if smoke-local fails'
+        type: boolean
+        default: false
+
+# Read-only: prebuild-coverage-static reads better-sqlite3 GitHub releases via the
+# default token; artifact upload uses the actions API. No writes anywhere.
+permissions:
+  contents: read
+
+# Supersede an in-flight run on a rapid re-push of the same ref (cheaper iteration).
+concurrency:
+  group: macos-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Keep in sync with MODEL_FILENAME in src/recall/embedder.ts. Only used to key
+  # the model cache — a drift just yields a cold cache, never a wrong result.
+  RECALL_MODEL: nomic-embed-text-v1.5.Q8_0.gguf
+  # MUST equal LLAMA_RELEASE_TAG in src/recall/embedder.ts (minos-floor-static
+  # guards this, mirroring build-cuda-linux.yml's tag-sync step).
+  LLAMA_TAG: b5300
+
+jobs:
+  # ===========================================================================
+  # PRIMARY GATE — a clean install must work end-to-end on Apple silicon.
+  # Node 22 (ABI 127) and Node 24 (ABI 137) both have better-sqlite3 darwin
+  # prebuilds, so BOTH must go green. Steps are ordered so a red pinpoints the
+  # phase (install → doctor → seed → backfill → search → stop-hook).
+  # ===========================================================================
+  smoke-local:
+    name: smoke-local (node ${{ matrix.node }})
+    runs-on: macos-26
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      # The embedding model is ~146 MB from Hugging Face — cache it so reruns are
+      # fast and polite. Keyed on the model filename (version-pinned constant).
+      - name: Cache embedding model
+        uses: actions/cache@v4
+        with:
+          path: ~/.recall/models
+          key: recall-model-${{ env.RECALL_MODEL }}
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Build → strip sibling .node → pack (mirror the published tarball)
+        run: |
+          set -euo pipefail
+          npm run build
+          # LOAD-BEARING: build.mjs stages dist/better_sqlite3.node for local dev,
+          # but the PUBLISHED tarball is stripped of it by prepublishOnly. `npm
+          # pack` does NOT run prepublishOnly, so without this rm the tarball would
+          # ship a sibling .node that short-circuits candidate #1 of
+          # resolveNativeBinding (src/db.ts) — and we'd never exercise the
+          # npm-global resolution path (candidate #2) that real users hit.
+          rm -f dist/better_sqlite3.node
+          npm pack
+          ls -1 crispy-recall-*.tgz
+
+      - name: Global install + classify better-sqlite3 install path
+        run: |
+          set -euo pipefail
+          # --foreground-scripts surfaces better-sqlite3's prebuild-install output
+          # so we can distinguish a prebuilt binary from a node-gyp compile.
+          npm install -g --foreground-scripts ./crispy-recall-*.tgz 2>&1 | tee npm-install.log
+          # Node 22/24 both have darwin prebuilds → a compile is UNEXPECTED here
+          # (defect 3's Node-23 hole is tested separately). Record, don't fail:
+          # a compile that succeeds still yields a working install, and the real
+          # user-facing gate is `doctor` two steps down.
+          if grep -qiE 'node-gyp (rebuild|configure|build)|gyp info spawn' npm-install.log; then
+            echo "::warning::better-sqlite3 COMPILED via node-gyp under Node ${{ matrix.node }} — expected a prebuilt darwin binary"
+            echo "- ⚠️ Node ${{ matrix.node }}: better-sqlite3 compiled via node-gyp (expected prebuilt)" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "better-sqlite3 used a prebuilt darwin binary under Node ${{ matrix.node }}"
+            echo "- ✅ Node ${{ matrix.node }}: better-sqlite3 prebuilt darwin binary" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: recall install (headless; backfill deferred for determinism)
+        run: |
+          set -euo pipefail
+          # recall install HARD-FAILS without ~/.claude (preflight.ts). --no-backfill
+          # skips the detached embed child so it can't race the explicit foreground
+          # backfill below (which would contend on the embed lock).
+          mkdir -p ~/.claude
+          recall install --yes --no-backfill
+
+      - name: doctor — native WAL binding health (HARD GATE)
+        run: |
+          set -euo pipefail
+          # doctor exits 1 iff it finds problems; we capture regardless and assert
+          # the exact binding.* keys (src/installer/doctor.ts).
+          recall doctor --json > doctor.json || true
+          cat doctor.json
+          node scripts/ci/assert-doctor.mjs doctor.json
+
+      - name: Seed synthetic sessions
+        run: |
+          set -euo pipefail
+          node scripts/ci/seed-sessions.mjs \
+            --token "xylophone quantum cheese" --sessions 2 \
+            --cwd "$HOME/recall-ci-project" > seed.json
+          cat seed.json
+
+      - name: Backfill (foreground — ingest + embed)
+        timeout-minutes: 15
+        run: recall backfill --auto-embed
+
+      - name: Search + semantic assertion (Metal-flake resilient)
+        run: |
+          set -euo pipefail
+          recall "xylophone quantum cheese" --raw --all > search.json || true
+          echo "--- human output (Paths: line) ---"
+          recall "xylophone quantum cheese" --all || true
+          # Hard gate: at least one hit (FTS guarantees this for our token).
+          node scripts/ci/assert-search.mjs search.json
+          # Semantic must be available (live query embed succeeded). If not, treat
+          # it as a possible Metal flake: log loudly, force CPU, re-embed, retry.
+          if ! node scripts/ci/assert-search.mjs search.json --require-semantic; then
+            echo "::warning::Semantic UNAVAILABLE first pass (Node ${{ matrix.node }}) — suspected Metal flake on the paravirtual device. Forcing CPU embedder and re-embedding."
+            node scripts/ci/force-cpu.mjs
+            recall backfill --auto-embed
+            recall "xylophone quantum cheese" --raw --all > search2.json || true
+            node scripts/ci/assert-search.mjs search2.json --require-semantic
+          fi
+
+      - name: Stop-hook simulation (row-count-grew is the real check)
+        run: |
+          set -euo pipefail
+          SID=$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync("seed.json","utf8")).sessions[0].id)')
+          SPATH=$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync("seed.json","utf8")).sessions[0].path)')
+          # status is in T1_SKIP → no opportunistic catch-up, so messageCount moves
+          # ONLY because of the hook we fire (not a background scan).
+          recall status --json > st-before.json
+          BEFORE=$(node -e 'process.stdout.write(String(JSON.parse(require("fs").readFileSync("st-before.json","utf8")).messageCount))')
+          node scripts/ci/append-turn.mjs --session-path "$SPATH" --session-id "$SID" --token "wombat tuesday marmalade"
+          recall status --json > st-mid.json
+          MID=$(node -e 'process.stdout.write(String(JSON.parse(require("fs").readFileSync("st-mid.json","utf8")).messageCount))')
+          [ "$MID" -eq "$BEFORE" ] || { echo "::error::append alone changed messageCount ($BEFORE→$MID) — catch-up leaked; hook isolation broken"; exit 1; }
+          # Fire the hook under the PINNED node (byte-exact stdin contract). Exit 0
+          # proves NOTHING (the hook exits 0 on malformed payloads) — the count
+          # assertion below is the proof.
+          PINNED_NODE=$(node -e 'const fs=require("fs"),os=require("os");process.stdout.write(JSON.parse(fs.readFileSync(os.homedir()+"/.recall/bin/.binding-info.json","utf8")).nodePath)')
+          printf '{"session_id":"%s","transcript_path":"%s","cwd":"%s"}' "$SID" "$SPATH" "$HOME" | "$PINNED_NODE" "$HOME/.recall/bin/stop-hook.js"
+          echo "stop-hook exit=$?"
+          recall status --json > st-after.json
+          AFTER=$(node -e 'process.stdout.write(String(JSON.parse(require("fs").readFileSync("st-after.json","utf8")).messageCount))')
+          echo "messageCount: before=$BEFORE mid=$MID after=$AFTER"
+          [ "$AFTER" -gt "$BEFORE" ] || { echo "::error::Stop hook did not grow messageCount ($BEFORE→$AFTER)"; exit 1; }
+          # The newly appended token must now be searchable (--no-catchup so we
+          # attribute the ingest to the hook, not to T1).
+          recall "wombat tuesday marmalade" --raw --all --no-catchup > hooksearch.json || true
+          node scripts/ci/assert-search.mjs hooksearch.json
+
+      # Upload ONCE (from the Node 24 leg): the tgz is Node-version-independent and
+      # upload-artifact@v4 rejects a duplicate name across matrix legs. Consumed by
+      # the phase-2/3 rented-Mac acceptance run.
+      - name: Upload packed tarball
+        if: ${{ matrix.node == 24 }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: recall-tarball-${{ github.sha }}
+          path: crispy-recall-*.tgz
+          if-no-files-found: error
+
+      # Opt-in break-glass: only when manually dispatched with debug_tmate AND a
+      # step above failed. limit-access-to-actor keeps the SSH session private.
+      - name: Debug tmate (on failure, opt-in)
+        if: ${{ failure() && github.event_name == 'workflow_dispatch' && inputs.debug_tmate }}
+        uses: mxschmitt/action-tmate@v3
+        with:
+          limit-access-to-actor: true
+
+  # ===========================================================================
+  # INFORMATIONAL — does the PUBLISHED 0.2.0 (stripped tarball) install clean on
+  # a Mac? Its outcome is a headline finding either way, but it must NEVER block
+  # the matrix: the step self-reports PASS/FAIL to the run summary and exits 0.
+  # ===========================================================================
+  smoke-registry:
+    name: smoke-registry (crispy-recall@0.2.0)
+    runs-on: macos-26
+    timeout-minutes: 40
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4  # for scripts/ci/* assertion helpers
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Cache embedding model
+        uses: actions/cache@v4
+        with:
+          path: ~/.recall/models
+          key: recall-model-${{ env.RECALL_MODEL }}
+
+      - name: Registry install + full smoke (records PASS/FAIL to summary)
+        run: |
+          set +e
+          FAIL=""
+          step() {
+            local name="$1" cmd="$2"
+            [ -n "$FAIL" ] && return 0   # already failed — skip the rest
+            echo "::group::registry:$name"
+            bash -c "$cmd"
+            local rc=$?
+            echo "::endgroup::"
+            [ "$rc" -ne 0 ] && FAIL="$name"
+            return 0
+          }
+          step install-global 'npm install -g crispy-recall@0.2.0'
+          step recall-install 'mkdir -p ~/.claude && recall install --yes --no-backfill'
+          step doctor 'recall doctor --json > reg-doctor.json || true; cat reg-doctor.json; node scripts/ci/assert-doctor.mjs reg-doctor.json'
+          step seed 'node scripts/ci/seed-sessions.mjs --token "xylophone quantum cheese" --sessions 2 > reg-seed.json'
+          step backfill 'recall backfill --auto-embed'
+          step search 'recall "xylophone quantum cheese" --raw --all > reg-search.json || true; node scripts/ci/assert-search.mjs reg-search.json'
+          if [ -z "$FAIL" ]; then
+            echo "## smoke-registry (crispy-recall@0.2.0, Node 24): ✅ PASS" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "## smoke-registry (crispy-recall@0.2.0, Node 24): ❌ FAIL at stage \`$FAIL\`" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit 0
+
+  # ===========================================================================
+  # PRE-FIX BASELINE — defect 4 (ABI-mismatch marker). npm runs under Node 22
+  # (fetches the ABI-127 prebuild); recall then runs under Node 24 (ABI 137).
+  # `recall install` stages the ABI-127 binding but writes the marker from the
+  # RUNNING node (137), so the marker vouches for a binding that cannot dlopen →
+  # phase-6 getDb throws BindingLoadError with a "re-run recall install"
+  # remediation that loops forever. This leg ASSERTS the bug is present (green);
+  # phase 2 flips it to expect a clean install once defect 4 is fixed.
+  # ===========================================================================
+  regression-abi-mismatch:
+    name: regression-abi-mismatch (npm@22 / recall@24)
+    runs-on: macos-26
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache embedding model
+        uses: actions/cache@v4
+        with:
+          path: ~/.recall/models
+          key: recall-model-${{ env.RECALL_MODEL }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Global install under Node 22 (ABI 127) — healthy baseline
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run build
+          rm -f dist/better_sqlite3.node
+          npm pack
+          npm install -g ./crispy-recall-*.tgz
+          RECALL_BIN=$(command -v recall)
+          echo "RECALL_BIN=$RECALL_BIN" >> "$GITHUB_ENV"
+          node -e 'console.log("npm/install Node ABI:", process.versions.modules)'  # 127
+          mkdir -p ~/.claude
+          "$RECALL_BIN" install --yes --no-backfill
+          "$RECALL_BIN" doctor --json > reg22-doctor.json || true
+          node scripts/ci/assert-doctor.mjs reg22-doctor.json  # green under matched Node 22
+
+      # Switch the ACTIVE node to 24 WITHOUT reinstalling — the global recall and
+      # its ABI-127 binding are untouched on disk; only the interpreter changes.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Reproduce ABI-mismatch under Node 24  # PRE-FIX BASELINE — phase 2 flips this
+        run: |
+          set -uo pipefail
+          node -e 'console.log("recall runtime Node ABI:", process.versions.modules)'  # 137
+          echo "=== recall install --yes under mismatched Node 24 (expected to ABORT) ==="
+          OUT=$("$RECALL_BIN" install --yes --no-backfill --json 2>&1); CODE=$?
+          echo "$OUT"
+          echo "install exit=$CODE"
+          if [ "$CODE" -eq 0 ]; then
+            echo "::error::PRE-FIX BASELINE BROKEN — install SUCCEEDED under mismatched Node (defect 4 fixed?). Flip this leg for phase 2."
+            exit 1
+          fi
+          echo "$OUT" | grep -qiE 'native SQLite binding failed to load|failed to load the better-sqlite3 native binding' \
+            || { echo "::error::expected the BindingLoadError remediation text, not found in install output"; exit 1; }
+          echo "=== recall doctor --json under Node 24 (binding.bindingLoads must be false) ==="
+          "$RECALL_BIN" doctor --json > reg24-doctor.json || true
+          cat reg24-doctor.json
+          node -e '
+            const b = JSON.parse(require("fs").readFileSync("reg24-doctor.json","utf8")).binding || {};
+            if (b.bindingLoads !== false) { console.error("PRE-FIX BASELINE BROKEN: bindingLoads="+b.bindingLoads+" (expected false)"); process.exit(1); }
+            console.log("PRE-FIX BASELINE confirmed: doctor reports bindingLoads=false while abiOk="+b.abiOk+" — the marker vouches for a broken binding.");
+          '
+          {
+            echo "## regression-abi-mismatch (PRE-FIX BASELINE)"
+            echo "npm-installed under Node 22 (ABI 127); recall run under Node 24 (ABI 137)."
+            echo "- \`recall install\` aborted (exit $CODE) with the BindingLoadError \"re-run recall install\" remediation (loops forever)."
+            echo "- \`recall doctor\` reports \`binding.bindingLoads=false\` while \`abiOk=true\` — the marker vouches for a binding that cannot dlopen."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ===========================================================================
+  # PRE-FIX BASELINE — defect 1 (minos floor). The pinned b5300 macOS assets are
+  # built with LC_BUILD_VERSION minos = 14.0 (arm64) / 13.7 (x64). recall has no
+  # OS-version preflight, so macOS ≤13 aborts mid-install. This leg records the
+  # exact floor phase 2 must gate on. Green today; phase 2 adds the preflight.
+  # ===========================================================================
+  minos-floor-static:
+    name: minos-floor-static (b5300 macOS assets)
+    runs-on: macos-26
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      # Tag-sync guard (mirrors build-cuda-linux.yml): the minos numbers below are
+      # a property of the b5300 assets; if embedder.ts moves off b5300 they are
+      # stale and this leg must be re-derived.
+      - name: Guard — LLAMA_TAG matches embedder.ts
+        run: |
+          set -euo pipefail
+          PINNED=$(grep -oE "LLAMA_RELEASE_TAG\s*=\s*'[^']+'" src/recall/embedder.ts | grep -oE 'b[0-9]+')
+          echo "embedder.ts pins: $PINNED ; workflow pins: $LLAMA_TAG"
+          [ "$PINNED" = "$LLAMA_TAG" ] || { echo "::error::LLAMA_RELEASE_TAG ($PINNED) != workflow LLAMA_TAG ($LLAMA_TAG) — sync them"; exit 1; }
+
+      - name: Cache b5300 macOS zips
+        uses: actions/cache@v4
+        with:
+          path: ~/llama-zips
+          key: llama-${{ env.LLAMA_TAG }}-macos-zips
+
+      - name: Parse Mach-O minos for llama-embedding (expect arm64=14.0, x64=13.7)
+        run: |
+          set -euo pipefail
+          mkdir -p ~/llama-zips
+          base="https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_TAG}"
+          minos_of() {
+            local slug="$1"
+            local zip="$HOME/llama-zips/llama-${LLAMA_TAG}-bin-macos-${slug}.zip"
+            [ -f "$zip" ] || curl -fsSL -o "$zip" "${base}/llama-${LLAMA_TAG}-bin-macos-${slug}.zip"
+            local ex; ex=$(mktemp -d)
+            unzip -oq "$zip" -d "$ex"
+            local bin; bin=$(find "$ex" -name llama-embedding -type f | head -1)
+            [ -n "$bin" ] || { echo "::error::llama-embedding not found in ${slug} zip" >&2; exit 1; }
+            otool -l "$bin" | awk '/LC_BUILD_VERSION/{f=1} f&&/minos/{print $2; exit}'
+            rm -rf "$ex"   # disk hygiene (14 GB runner) — keep the zip (cached)
+          }
+          ARM=$(minos_of arm64)
+          X64=$(minos_of x64)
+          echo "arm64 minos=$ARM ; x64 minos=$X64"
+          {
+            echo "## minos-floor-static (llama.cpp ${LLAMA_TAG})"
+            echo "| asset | Mach-O minos |"
+            echo "| --- | --- |"
+            echo "| macos-arm64 llama-embedding | $ARM |"
+            echo "| macos-x64 llama-embedding | $X64 |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          [ "$ARM" = "14.0" ] || { echo "::error::arm64 minos=$ARM, expected 14.0"; exit 1; }
+          [ "$X64" = "13.7" ] || { echo "::error::x64 minos=$X64, expected 13.7"; exit 1; }
+          # TODO(phase-2): compare against a source-exported constant (the
+          # MIN_MACOS_VERSION preflight the defect-1 fix adds) instead of these
+          # literals, so the asset floor and the preflight check cannot drift.
+
+  # ===========================================================================
+  # PRE-FIX BASELINE — defect 3 (Node-23 prebuild hole). Static, on ubuntu (cheap).
+  # engines.node `>=22.16` permits Node 23 (ABI 131), but better-sqlite3 ships NO
+  # darwin prebuild for 131 → node-gyp fallback bricks `npm install -g` on Macs
+  # without Xcode CLT. This leg asserts the gap == {23} (and that smoke-local's
+  # Node 22/24 ARE covered). Green today; phase 2 narrows engines / adds coverage
+  # and flips the baseline in scripts/ci/prebuild-coverage.mjs.
+  # ===========================================================================
+  prebuild-coverage-static:
+    name: prebuild-coverage-static (better-sqlite3 darwin ABIs)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Assert engines-allowed Node majors have darwin prebuilds
+        run: |
+          set -euo pipefail
+          BSQL=$(node -e 'const l=require("./package-lock.json");process.stdout.write(l.packages?.["node_modules/better-sqlite3"]?.version||"")')
+          [ -n "$BSQL" ] || { echo "::error::could not resolve better-sqlite3 version from package-lock.json"; exit 1; }
+          echo "better-sqlite3 = $BSQL"
+          gh api "repos/WiseLibs/better-sqlite3/releases/tags/v${BSQL}" --jq '.assets[].name' > assets.txt
+          node scripts/ci/prebuild-coverage.mjs assets.txt >> "$GITHUB_STEP_SUMMARY"
+
+  # ===========================================================================
+  # Full vitest suite on Apple hardware. workflow_dispatch-ONLY to keep the push
+  # path at exactly 5 macOS jobs (the concurrency cap). Informational: a red here
+  # never blocks — review failures against the known-flake list.
+  # ===========================================================================
+  vitest-macos:
+    name: vitest-macos
+    runs-on: macos-26
+    timeout-minutes: 30
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install deps + build
+        run: npm ci && npm run build
+
+      - name: Run vitest (informational)
+        run: |
+          set -uo pipefail
+          if npm test 2>&1 | tee vitest.log; then
+            echo "## vitest-macos: ✅ suite passed" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "## vitest-macos: ❌ failures — review against the known-flake list" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            grep -iE 'fail|✗|×|✘' vitest.log | tail -40 >> "$GITHUB_STEP_SUMMARY" || true
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi
