@@ -19,8 +19,12 @@ import {
 import { homedir, platform as osPlatform, arch as osArch } from 'node:os';
 import { join } from 'node:path';
 import { request } from 'node:https';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { recallRoot, runDir } from '../paths.js';
 import { detectGpu, type GpuInfo } from './gpu.js';
+
+const execFileAsync = promisify(execFile);
 
 // ---------------------------------------------------------------------------
 // Report shape
@@ -50,6 +54,9 @@ export interface PreflightOptions {
   gpuDetect?: () => Promise<boolean>;
   platform?: NodeJS.Platform;
   arch?: string;
+  /** Injectable macOS product-version reader (tests). Returns e.g. "13.5", or
+   *  null when unavailable. Defaults to spawning `sw_vers -productVersion`. */
+  macosProductVersion?: () => Promise<string | null>;
 }
 
 // ---------------------------------------------------------------------------
@@ -172,6 +179,72 @@ function checkPlatform(report: PreflightReport, opts: PreflightOptions): void {
       check: 'platform.wsl',
       severity: 'WARN',
       message: 'Running under WSL — the installer configures the environment it is invoked in. Rerun under the other environment (Windows-native) to cover both.',
+    });
+  }
+}
+
+/** Read the running macOS product version (e.g. "13.5") via `sw_vers`, or null
+ *  if it cannot be determined (non-macOS, sw_vers missing, spawn error). */
+async function readMacosProductVersion(): Promise<string | null> {
+  try {
+    const { stdout } = await execFileAsync('sw_vers', ['-productVersion'], { timeout: 5000, windowsHide: true });
+    const v = stdout.trim();
+    return v.length > 0 ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Compare two dotted versions on major.minor only. <0, 0, >0 like a comparator. */
+function compareMajorMinor(a: string, b: string): number {
+  const pa = a.split('.').map((n) => parseInt(n, 10) || 0);
+  const pb = b.split('.').map((n) => parseInt(n, 10) || 0);
+  for (let i = 0; i < 2; i++) {
+    const da = pa[i] ?? 0;
+    const db = pb[i] ?? 0;
+    if (da !== db) return da - db;
+  }
+  return 0;
+}
+
+/**
+ * macOS OS-version floor: the pinned b5300 llama.cpp binaries are built with an
+ * LC_BUILD_VERSION minos of 14.0 (arm64) / 13.7 (x64), so an older macOS cannot
+ * dlopen them and semantic embedding is impossible. Fail fast in pre-flight with
+ * an actionable message instead of the cryptic mid-install `Binary validation
+ * failed` that `ensureBinary()` would otherwise surface. Non-macOS is a no-op.
+ * If the version can't be read, degrade to a WARN (never crash the installer).
+ */
+async function checkMacosFloor(report: PreflightReport, opts: PreflightOptions): Promise<void> {
+  const os = opts.platform ?? osPlatform();
+  if (os !== 'darwin') return;
+
+  const a = opts.arch ?? osArch();
+  const { MACOS_MIN_VERSION } = await import('../recall/embedder.js');
+  const floor = a === 'arm64' ? MACOS_MIN_VERSION.arm64 : MACOS_MIN_VERSION.x64;
+
+  const version = opts.macosProductVersion
+    ? await opts.macosProductVersion()
+    : await readMacosProductVersion();
+
+  if (!version) {
+    report.warnings.push({
+      check: 'platform.macos-version',
+      severity: 'WARN',
+      message: 'Could not determine the macOS version (sw_vers unavailable) — skipping the minimum-OS check for the bundled llama.cpp binaries.',
+    });
+    return;
+  }
+
+  if (compareMajorMinor(version, floor) < 0) {
+    report.failures.push({
+      check: 'platform.macos-version',
+      severity: 'FAIL',
+      message:
+        `macOS ${version} is below the minimum for recall's bundled llama.cpp binaries ` +
+        `(needs ${MACOS_MIN_VERSION.arm64}+ on Apple Silicon, ${MACOS_MIN_VERSION.x64}+ on Intel). ` +
+        'Semantic embedding cannot run.',
+      remediation: `Upgrade macOS to ${floor} or newer to install recall.`,
     });
   }
 }
@@ -321,6 +394,7 @@ export async function runPreflight(opts: PreflightOptions = {}): Promise<Preflig
   };
 
   checkPlatform(report, opts);
+  await checkMacosFloor(report, opts);
   checkClaude(report);
   checkCodex(report);
 

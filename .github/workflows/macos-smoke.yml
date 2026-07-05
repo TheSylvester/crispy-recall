@@ -349,10 +349,12 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ===========================================================================
-  # PRE-FIX BASELINE — defect 1 (minos floor). The pinned b5300 macOS assets are
-  # built with LC_BUILD_VERSION minos = 14.0 (arm64) / 13.7 (x64). recall has no
-  # OS-version preflight, so macOS ≤13 aborts mid-install. This leg records the
-  # exact floor phase 2 must gate on. Green today; phase 2 adds the preflight.
+  # DRIFT GUARD — defect 1 (minos floor). The pinned b5300 macOS assets are built
+  # with LC_BUILD_VERSION minos = 14.0 (arm64) / 13.7 (x64). The defect-1 fix adds
+  # a pre-flight OS-version floor (src/installer/preflight.ts) driven by the
+  # exported MACOS_MIN_VERSION constant (src/recall/embedder.ts). This leg parses
+  # that constant and asserts it EQUALS the assets' real Mach-O minos, so the
+  # preflight floor and the shipped binaries can never silently drift apart.
   # ===========================================================================
   minos-floor-static:
     name: minos-floor-static (b5300 macOS assets)
@@ -377,9 +379,18 @@ jobs:
           path: ~/llama-zips
           key: llama-${{ env.LLAMA_TAG }}-macos-zips
 
-      - name: Parse Mach-O minos for llama-embedding (expect arm64=14.0, x64=13.7)
+      - name: Parse Mach-O minos and assert it matches embedder.ts MACOS_MIN_VERSION
         run: |
           set -euo pipefail
+          # Source of truth: the exported constant the defect-1 preflight consumes.
+          # Parse it from embedder.ts (mirrors the tag-sync guard's grep style).
+          MMV=$(grep -oE "MACOS_MIN_VERSION\s*=\s*\{[^}]+\}" src/recall/embedder.ts || true)
+          EXP_ARM=$(printf '%s' "$MMV" | grep -oE "arm64:\s*'[0-9.]+'" | grep -oE "[0-9]+\.[0-9]+" || true)
+          EXP_X64=$(printf '%s' "$MMV" | grep -oE "x64:\s*'[0-9.]+'" | grep -oE "[0-9]+\.[0-9]+" || true)
+          [ -n "$EXP_ARM" ] && [ -n "$EXP_X64" ] \
+            || { echo "::error::could not parse MACOS_MIN_VERSION from src/recall/embedder.ts"; exit 1; }
+          echo "embedder.ts MACOS_MIN_VERSION: arm64=$EXP_ARM x64=$EXP_X64"
+
           mkdir -p ~/llama-zips
           base="https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_TAG}"
           minos_of() {
@@ -398,16 +409,15 @@ jobs:
           echo "arm64 minos=$ARM ; x64 minos=$X64"
           {
             echo "## minos-floor-static (llama.cpp ${LLAMA_TAG})"
-            echo "| asset | Mach-O minos |"
-            echo "| --- | --- |"
-            echo "| macos-arm64 llama-embedding | $ARM |"
-            echo "| macos-x64 llama-embedding | $X64 |"
+            echo "| arch | asset Mach-O minos | embedder.ts MACOS_MIN_VERSION |"
+            echo "| --- | --- | --- |"
+            echo "| arm64 | $ARM | $EXP_ARM |"
+            echo "| x64 | $X64 | $EXP_X64 |"
           } >> "$GITHUB_STEP_SUMMARY"
-          [ "$ARM" = "14.0" ] || { echo "::error::arm64 minos=$ARM, expected 14.0"; exit 1; }
-          [ "$X64" = "13.7" ] || { echo "::error::x64 minos=$X64, expected 13.7"; exit 1; }
-          # TODO(phase-2): compare against a source-exported constant (the
-          # MIN_MACOS_VERSION preflight the defect-1 fix adds) instead of these
-          # literals, so the asset floor and the preflight check cannot drift.
+          # The preflight floor MUST equal the assets' real minos — else macOS
+          # versions between the two would be gated wrong (false pass or false fail).
+          [ "$ARM" = "$EXP_ARM" ] || { echo "::error::arm64 asset minos=$ARM != embedder.ts MACOS_MIN_VERSION.arm64=$EXP_ARM — floor drifted from the shipped binary"; exit 1; }
+          [ "$X64" = "$EXP_X64" ] || { echo "::error::x64 asset minos=$X64 != embedder.ts MACOS_MIN_VERSION.x64=$EXP_X64 — floor drifted from the shipped binary"; exit 1; }
 
   # ===========================================================================
   # PRE-FIX BASELINE — defect 3 (Node-23 prebuild hole). Static, on ubuntu (cheap).

@@ -82,7 +82,11 @@ const MAX_ARG_BYTES = platform() === 'win32' ? 0 : 100_000;
 // --- Binary download config ---
 
 /** Last llama.cpp release that includes llama-embedding in prebuilt archives. */
-const LLAMA_RELEASE_TAG = 'b5300';
+export const LLAMA_RELEASE_TAG = 'b5300';
+
+/** Minimum macOS per arch for the pinned b5300 binaries (LC_BUILD_VERSION minos).
+ *  MUST be re-verified (otool -l | grep -A3 LC_BUILD_VERSION) whenever LLAMA_RELEASE_TAG changes. */
+export const MACOS_MIN_VERSION = { arm64: '14.0', x64: '13.7' } as const;
 
 const BIN_NAME = platform() === 'win32' ? 'llama-embedding.exe' : 'llama-embedding';
 const SERVER_BIN_NAME = platform() === 'win32' ? 'llama-server.exe' : 'llama-server';
