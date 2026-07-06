@@ -115,6 +115,13 @@ const SERVER_KILL_TIMEOUT_MS = 5_000;
 /** After server failure, suppress server attempts for this duration. */
 const SERVER_COOLDOWN_MS = 60_000;
 
+/** Max time to wait for archive extraction before falling back to the OS unzip.
+ *  extract-zip/yauzl has been observed to wedge mid-extraction with no timeout of
+ *  its own (macOS 0.2.1 acceptance — a fresh `recall install` hung ~18 min on a
+ *  stalled extract). Headroom is generous (a 22 MB CPU archive extracts in <1 s);
+ *  if a legitimately slow extract trips it, the OS-unzip fallback just takes over. */
+const EXTRACT_TIMEOUT_MS = 120_000;
+
 // ---------------------------------------------------------------------------
 // Embedding Mutex — serializes embed calls to prevent CPU contention
 // ---------------------------------------------------------------------------
@@ -390,6 +397,144 @@ async function performBinaryDownload(binPath: string): Promise<string> {
   throw new Error('No suitable llama-embedding binary found');
 }
 
+/**
+ * Race a promise against a timeout. The underlying operation is NOT cancelled on
+ * timeout — callers must ensure a late settle is harmless (we attach a no-op catch
+ * so a late rejection from the losing side can't surface as an unhandledRejection).
+ *
+ * Exported for testing.
+ */
+export function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`${label} timed out after ${Math.round(ms / 1000)}s`)),
+      ms,
+    );
+  });
+  // A late settle from the racing promise must not become an unhandledRejection.
+  promise.catch(() => { /* ignore */ });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
+/** PowerShell single-quoted literals escape an embedded quote by doubling it —
+ *  a home/temp path like C:\\Users\\O'Brien would otherwise close the literal early. */
+function psQuote(p: string): string {
+  return p.replace(/'/g, "''");
+}
+
+/**
+ * Ordered native-unzip fallback commands to try for `plat`, most-preferred first.
+ * `unzip` ships by default on macOS and virtually all Linux; macOS additionally
+ * has `ditto`; Windows uses PowerShell's Expand-Archive. Pure (no I/O) so the
+ * exact argv — including PS quoting — is unit-testable without the target OS.
+ *
+ * Exported for testing.
+ */
+export function buildUnzipInvocations(
+  plat: NodeJS.Platform,
+  archivePath: string,
+  dir: string,
+): Array<{ cmd: string; args: string[] }> {
+  if (plat === 'win32') {
+    return [{
+      cmd: 'powershell',
+      args: ['-NoProfile', '-NonInteractive', '-Command',
+        `Expand-Archive -LiteralPath '${psQuote(archivePath)}' -DestinationPath '${psQuote(dir)}' -Force`],
+    }];
+  }
+  const unzip = { cmd: 'unzip', args: ['-o', '-q', archivePath, '-d', dir] };
+  // macOS always ships ditto — try it if unzip fails.
+  return plat === 'darwin'
+    ? [unzip, { cmd: 'ditto', args: ['-x', '-k', archivePath, dir] }]
+    : [unzip];
+}
+
+/**
+ * Extract a zip using the platform's native tools — the fallback for when
+ * extract-zip wedges or fails. Tries buildUnzipInvocations() in order and returns
+ * on the first success. Each child is bounded by EXTRACT_TIMEOUT_MS so the
+ * fallback itself can't hang either.
+ */
+async function osUnzip(archivePath: string, dir: string): Promise<void> {
+  mkdirSync(dir, { recursive: true });
+  const invocations = buildUnzipInvocations(platform(), archivePath, dir);
+  let lastErr: unknown;
+  for (const { cmd, args } of invocations) {
+    try {
+      await execFileAsync(cmd, args, { timeout: EXTRACT_TIMEOUT_MS, windowsHide: true });
+      return;
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw lastErr instanceof Error
+    ? lastErr
+    : new Error(`Native unzip failed for ${archivePath}`);
+}
+
+/**
+ * Extract `archivePath` into `baseDir`, returning the directory that holds the
+ * extracted files. Primary path is extract-zip; on timeout or failure we fall
+ * back to the OS unzip into a fresh subdir (so a slow-but-live primary extract
+ * can't race the fallback writing the same files). The subdir lives under
+ * `baseDir`, so the caller's cleanup of `baseDir` reclaims it too.
+ *
+ * `timeoutMs` is injectable for tests; production uses EXTRACT_TIMEOUT_MS.
+ *
+ * Exported for testing.
+ */
+export async function extractArchive(
+  archivePath: string,
+  baseDir: string,
+  assetName: string,
+  timeoutMs: number = EXTRACT_TIMEOUT_MS,
+): Promise<string> {
+  try {
+    await withTimeout(extract(archivePath, { dir: baseDir }), timeoutMs, `Extracting ${assetName}`);
+    return baseDir;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log({
+      source: 'recall-catchup',
+      level: 'warn',
+      summary: `Bundled unzip failed for ${assetName} (${msg}); falling back to system unzip`,
+    });
+    const fallbackDir = join(baseDir, '__os_unzip__');
+    await osUnzip(archivePath, fallbackDir);
+    return fallbackDir;
+  }
+}
+
+/**
+ * Copy the wanted llama binaries + shared libraries out of an extracted archive
+ * directory into `destDir`, handling both the b5300 flat-root layout and the
+ * older build/bin/ layout. Returns the number of files copied — callers treat 0
+ * as "no binaries in archive". Reading from the dir extractArchive RETURNS (not
+ * the parent temp dir) is the contract that keeps the OS-unzip fallback working.
+ *
+ * Exported for testing.
+ */
+export async function installExtractedBinaries(
+  extractedDir: string,
+  destDir: string = binDir(),
+): Promise<number> {
+  // llama.cpp releases use either build/bin/ (older) or a flat root (b5300+).
+  const buildBinDir = join(extractedDir, 'build', 'bin');
+  const sourceDir = existsSync(buildBinDir) ? buildBinDir : extractedDir;
+
+  mkdirSync(destDir, { recursive: true });
+  let copiedCount = 0;
+  for (const file of await readdir(sourceDir)) {
+    if (!isWantedFile(file)) continue;
+    await cp(join(sourceDir, file), join(destDir, file), { force: true });
+    copiedCount++;
+  }
+  return copiedCount;
+}
+
 async function downloadAndExtract(assetName: string, binPath: string): Promise<void> {
   const url = `https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_RELEASE_TAG}/${assetName}`;
   const isGpu = assetName.includes('cuda') || assetName.includes('vulkan');
@@ -418,21 +563,8 @@ async function downloadAndExtract(assetName: string, binPath: string): Promise<v
     const tmpExtractDir = join(tmpdir(), `llama-extract-${Date.now()}`);
     mkdirSync(tmpExtractDir, { recursive: true });
     try {
-      await extract(archivePath, { dir: tmpExtractDir });
-
-      // Find the directory containing binaries — llama.cpp releases use either
-      // build/bin/ (older releases) or flat root (b5300+).
-      const buildBinDir = join(tmpExtractDir, 'build', 'bin');
-      const sourceDir = existsSync(buildBinDir) ? buildBinDir : tmpExtractDir;
-
-      let copiedCount = 0;
-      for (const file of await readdir(sourceDir)) {
-        if (!isWantedFile(file)) continue;
-        const src = join(sourceDir, file);
-        const dest = join(binDir(), file);
-        await cp(src, dest, { force: true });
-        copiedCount++;
-      }
+      const extractedDir = await extractArchive(archivePath, tmpExtractDir, assetName);
+      const copiedCount = await installExtractedBinaries(extractedDir);
 
       if (copiedCount === 0) {
         throw new Error(`No binaries found in archive ${assetName}`);
