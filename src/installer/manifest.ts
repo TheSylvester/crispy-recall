@@ -15,6 +15,7 @@
 
 import { multiselect, note, isCancel, cancel } from '@clack/prompts';
 import type { PreflightReport } from './preflight.js';
+import { readConfig } from './config.js';
 
 export interface ManifestItem {
   key: string;
@@ -78,6 +79,23 @@ export function buildManifest(report: PreflightReport): ManifestItem[] {
     mandatory: false,
     defaultSelected: true,
   });
+  // Opt-in (default OFF): only ever writes a statusLine into an EMPTY slot; for a
+  // user who already has one it prints how to add the session id and changes
+  // nothing. defaultSelected:false → --yes / non-interactive never enable it —
+  // EXCEPT when config.json records a prior opt-in: then it stays selected so
+  // plain re-installs/upgrades keep healing the pinned node, exactly like the
+  // Stop hook. Unchecking the pre-checked box only skips this run's
+  // maintenance — the true off switch is --no-statusline (say so in-detail).
+  const statuslinePersisted = readConfig()?.statusline?.installed === true;
+  items.push({
+    key: 'statusline',
+    label: 'Show the session id in your Claude Code statusline',
+    detail: statuslinePersisted
+      ? 'currently ON from a previous install; uncheck to skip this run — turn off with `recall install --no-statusline`'
+      : 'only if you have none; otherwise prints how to add it — reversible on uninstall',
+    mandatory: false,
+    defaultSelected: statuslinePersisted,
+  });
   if (report.codex) {
     items.push({
       key: 'codex-agentsmd',
@@ -124,8 +142,14 @@ export async function renderManifest(items: ManifestItem[], opts: RenderOptions 
 
   if (optOut.length > 0) {
     const result = await multiselect({
-      message: 'Optional steps — uncheck any you want to skip:',
-      options: optOut.map((i) => ({ value: i.key, label: i.label, hint: i.detail })),
+      // Some opt-out items default ON (uncheck to skip) and some default OFF
+      // (check to enable) — say both, and mark the default-off ones in-label.
+      message: 'Optional steps — check to enable, uncheck to skip:',
+      options: optOut.map((i) => ({
+        value: i.key,
+        label: i.defaultSelected ? i.label : `${i.label} (off by default)`,
+        hint: i.detail,
+      })),
       initialValues: optOut.filter((i) => i.defaultSelected).map((i) => i.key),
       required: false,
     });

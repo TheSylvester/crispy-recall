@@ -54,6 +54,11 @@ export function binDir(): string {
   return join(recallRoot(), 'bin');
 }
 
+/** Path to the staged statusLine command bundle (beside the other bundles). */
+export function statuslineScript(): string {
+  return join(binDir(), 'statusline.js');
+}
+
 /** Runtime directory for server sockets and PID files. */
 export function runDir(): string {
   return join(recallRoot(), 'run');

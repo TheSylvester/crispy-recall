@@ -34,7 +34,9 @@ import {
 } from './preflight.js';
 import { buildManifest, renderManifest } from './manifest.js';
 import { runGpuPhase, type GpuPhaseResult, type GpuProbeArgs, type OffloadProbeResult } from './gpu.js';
-import { mergeStopHook, removeStopHook, backupFile } from './settings-merge.js';
+import { mergeStopHook, removeStopHook, backupFile, mergeStatusLine, removeStatusLine } from './settings-merge.js';
+import { detectStatusline, renderStatuslineSuggestion } from './statusline-suggest.js';
+import { writeStatuslineConfig, clearStatuslineConfig, readConfig } from './config.js';
 import { stableNodePath } from './stable-node.js';
 import {
   classifyUpgrade, snapshotDb, handleIntegrity, backfillAlreadyRunning, migrationReportLine,
@@ -44,12 +46,16 @@ import { applyNudge } from './claudemd-nudge.js';
 import { ensureBinary, ensureModel, getBinaryPath, getModelPath } from '../recall/embedder.js';
 import { log } from '../log.js';
 
-const STAGED_BUNDLES = ['recall.js', 'stop-hook.js', 'embed-pending.js'];
+const STAGED_BUNDLES = ['recall.js', 'stop-hook.js', 'embed-pending.js', 'statusline.js'];
 
 export interface InstallOptions {
   yes?: boolean;
   offline?: boolean;
   noClaudemd?: boolean;
+  /** Opt in to the statusLine feature (enable-only; default off). */
+  statusline?: boolean;
+  /** Force the statusLine feature off (wins over --statusline if both passed). */
+  noStatusline?: boolean;
   noBackfill?: boolean;
   autoBackfill?: boolean; // foreground backfill with a spinner (for tests)
   json?: boolean;
@@ -351,6 +357,11 @@ export async function runInstall(opts: InstallOptions = {}): Promise<InstallResu
   });
   // Flag-driven opt-out: --no-claudemd deselects the CLAUDE.md/AGENTS.md nudge.
   if (opts.noClaudemd) { selected.delete('claudemd'); selected.delete('codex-agentsmd'); }
+  // Flag-driven opt-in: --statusline enables the (default-off) statusLine item.
+  // Delete LAST so --no-statusline wins if both flags are passed (phase 7 also
+  // treats --no-statusline as a true-off: removes recall's statusLine + record).
+  if (opts.statusline) selected.add('statusline');
+  if (opts.noStatusline) selected.delete('statusline');
 
   // ---- Acquire install lock (concurrent-install guard) ----
   const lock = acquireInstallLock();
@@ -524,6 +535,58 @@ export async function runInstall(opts: InstallOptions = {}): Promise<InstallResu
     if (report.codex && selected.has('codex-agentsmd')) {
       const r = applyNudge(codexAgentsPath());
       if (r.changed) filesWritten.push(codexAgentsPath());
+    }
+    // statusLine (opt-in, Claude-only): write ONLY into an empty slot; for a
+    // foreign status line print both options and change nothing.
+    if (opts.noStatusline) {
+      // True-off: remove recall's own statusLine (never a foreign one) and the
+      // config record, so nothing re-selects it on the next install.
+      const r = removeStatusLine(claudeSettingsPath());
+      if (r.changed) { filesWritten.push(claudeSettingsPath()); say('statusline disabled'); }
+      clearStatuslineConfig();
+    } else if (selected.has('statusline')) {
+      // EXPLICIT = the user asked THIS run (--statusline flag, or checked a box
+      // that was not pre-checked). PERSISTED-only selection is upgrade
+      // maintenance: it may heal recall's own slot but must never (re)enable —
+      // an empty slot then means the user deleted recall's statusLine on
+      // purpose, so back off and clear the record (what doctor promises).
+      const persisted = readConfig()?.statusline?.installed === true;
+      const explicit = Boolean(opts.statusline) || !persisted;
+      const cmd = `"${stableNodePath()}" "${join(binDir(), 'statusline.js')}"`;
+      const detected = detectStatusline(claudeSettingsPath());
+      const mayWrite = detected.kind === 'recall' || (detected.kind === 'none' && explicit);
+      const r = mayWrite
+        ? mergeStatusLine(claudeSettingsPath(), cmd)
+        : ({ state: 'refusedForeign', changed: false } as const);
+      if (r.state !== 'refusedForeign') {
+        if (r.changed) filesWritten.push(claudeSettingsPath());
+        // Refresh the record on EVERY owned pass, not just wroteEmpty: a heal
+        // rewrote the pinned node (keep the command corroboration current), and
+        // a lost/rebuilt config.json must be reconstructible. Keep the original
+        // installedAt when one exists.
+        const prevAt = readConfig()?.statusline?.installedAt;
+        writeStatuslineConfig({ installed: true, command: cmd, priorStatusLine: null, installedAt: prevAt ?? new Date().toISOString() });
+        say(r.state === 'wroteEmpty'
+          ? 'statusline enabled (session id will show in your Claude Code status bar)'
+          : r.changed
+            ? 'statusline re-pinned to the current Node (settings.json updated, backup kept)'
+            : 'statusline already enabled');
+      } else if (explicit) {
+        // Explicit opt-in against a FOREIGN status line: never touch it —
+        // print both options.
+        const msg = renderStatuslineSuggestion(detected);
+        if (interactive) note(msg, 'Add the session id to your existing statusline');
+        else log({ source: 'installer/install', level: 'info', summary: msg });
+      } else {
+        // Persisted opt-in, but the user has since removed or replaced recall's
+        // statusline: back off quietly and clear the record so doctor stops
+        // warning and future installs stop re-selecting it.
+        clearStatuslineConfig();
+        log({
+          source: 'installer/install', level: 'info',
+          summary: 'statusline: you removed or replaced it in settings.json — recall left it alone and cleared its record (re-enable with `recall install --statusline`)',
+        });
+      }
     }
     // An upgrade touches settings.json twice (quiesce-remove + phase-7 re-add) —
     // collapse to one entry so the count/report reflects distinct files.

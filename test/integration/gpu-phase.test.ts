@@ -45,7 +45,7 @@ describe('gpu-phase', () => {
     });
     expect(res.mode).toBe('cpu');
     expect(probed).toBe(false);
-    expect(readConfig()?.embedder.mode).toBe('cpu');
+    expect(readConfig()?.embedder?.mode).toBe('cpu');
   });
 
   it('GPU present + offload succeeds → GPU, reuses existing bin/libggml-cuda.so', async () => {
@@ -57,8 +57,8 @@ describe('gpu-phase', () => {
     // separate dir the GGML_BACKEND_DL loader never scans.
     expect(res.libDir?.endsWith('bin')).toBe(true);
     const cfg = readConfig()!;
-    expect(cfg.embedder.mode).toBe('gpu');
-    expect(cfg.embedder.libDir?.endsWith('bin')).toBe(true);
+    expect(cfg.embedder?.mode).toBe('gpu');
+    expect(cfg.embedder?.libDir?.endsWith('bin')).toBe(true);
   });
 
   it('GPU present + offload fails → silently falls back to CPU (no throw)', async () => {
@@ -66,7 +66,7 @@ describe('gpu-phase', () => {
     const res = await runGpuPhase({ platform: 'linux', arch: 'x64', detect: async () => true, probe: failProbe });
     expect(res.mode).toBe('cpu');
     expect(res.reason).toBeTruthy();
-    expect(readConfig()?.embedder.mode).toBe('cpu');
+    expect(readConfig()?.embedder?.mode).toBe('cpu');
   });
 
   it("Linux + GPU, no staged lib → 'prebuilt': stages our lib into bin/, then adopts on a good probe", async () => {
@@ -82,7 +82,7 @@ describe('gpu-phase', () => {
     expect(res.cudaAvailable).toBe('prebuilt');
     expect(res.mode).toBe('gpu');
     expect(res.libDir?.endsWith('bin')).toBe(true);
-    expect(readConfig()?.embedder.mode).toBe('gpu');
+    expect(readConfig()?.embedder?.mode).toBe('gpu');
   });
 
   it("Linux 'prebuilt' staging unavailable (offline / download fails) → silent CPU, no probe", async () => {
@@ -101,7 +101,7 @@ describe('gpu-phase', () => {
     expect(res.reason).toMatch(/published|prebuilt/i);
     expect(res.reason).toMatch(/libcudart|libcublas|CUDA runtime/i);
     expect(probed).toBe(false); // never probes when staging failed
-    expect(readConfig()?.embedder.mode).toBe('cpu');
+    expect(readConfig()?.embedder?.mode).toBe('cpu');
   });
 
   // Regression: only a REAL CUDA device/backend marker counts. The bare
@@ -156,6 +156,6 @@ describe('gpu-phase', () => {
     });
     expect(res.mode).toBe('cpu');
     expect(probed).toBe(false);
-    expect(readConfig()?.embedder.mode).toBe('cpu');
+    expect(readConfig()?.embedder?.mode).toBe('cpu');
   });
 });

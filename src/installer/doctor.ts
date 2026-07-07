@@ -9,13 +9,14 @@
  */
 
 import { existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, isAbsolute } from 'node:path';
 import Database from 'better-sqlite3';
-import { runPreflight, type PreflightReport } from './preflight.js';
+import { runPreflight, claudeSettingsPath, type PreflightReport } from './preflight.js';
 import { readConfig } from './config.js';
 import { integrityCheck } from './repair.js';
+import { detectStatusline } from './statusline-suggest.js';
 import { isBindingLoadError } from '../db.js';
-import { binDir, dbPath } from '../paths.js';
+import { binDir, dbPath, statuslineScript } from '../paths.js';
 import { EMBED_VERSION } from '../recall/embed-config.js';
 
 export interface DoctorOptions {
@@ -50,15 +51,68 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<number> {
   const report = await runPreflight({ ...(opts.offline ? { offline: true } : {}) });
   const embedder = readConfig()?.embedder ?? null;
   const binding = checkBindingHealth();
+  const statusline = checkStatuslineHealth();
 
   if (opts.json) {
-    console.log(JSON.stringify({ ...report, embedder, binding }, null, 2));
+    console.log(JSON.stringify({ ...report, embedder, binding, statusline }, null, 2));
   } else {
     printTable(report, embedder?.mode ?? 'cpu', embedder?.fallbackReason);
     printBinding(binding);
+    printStatusline(statusline);
   }
   const bindingFailed = binding.installed && binding.problems.length > 0;
+  // Statusline coverage is WARN-only — it never affects the exit code.
   return report.failures.length > 0 || bindingFailed ? 1 : 0;
+}
+
+/** Opt-in statusLine coverage. All findings are WARN — never exit-1. Gated on
+ *  a persisted `statusline.installed`; reports nothing when the feature is off. */
+export interface StatuslineHealth { installed: boolean; warnings: string[] }
+
+export function checkStatuslineHealth(): StatuslineHealth {
+  const s = readConfig()?.statusline;
+  if (!s?.installed) return { installed: false, warnings: [] };
+  const warnings: string[] = [];
+
+  // (a) still wired / not clobbered — is the live command still recall's?
+  const detected = detectStatusline(claudeSettingsPath());
+  if (detected.kind !== 'recall') {
+    warnings.push(
+      'recall statusline was configured but settings.json now points elsewhere (you edited it) — ' +
+        'recall will leave it alone; the next `recall install` clears this record, ' +
+        'or re-run `recall install --statusline` to re-enable',
+    );
+    return { installed: true, warnings };
+  }
+
+  // Wired and ours — check the two things the command depends on AS WRITTEN in
+  // settings.json (not staging-area proxies like .binding-info.json, which every
+  // install rewrites to the CURRENT node and so can vouch for a stale pin).
+  // (b) the wired script exists.
+  const script = detected.scriptPath ?? statuslineScript();
+  if (!existsSync(script)) {
+    warnings.push(`statusline command points at a missing script (${script}) — run \`recall install\``);
+  }
+
+  // (c) the Node pinned INSIDE the wired command still exists (the command is
+  // `"<node>" "<script>"`; only an absolute first token is checkable).
+  const pinnedNode = /^\s*"([^"]+)"/.exec(detected.command ?? '')?.[1];
+  if (pinnedNode && isAbsolute(pinnedNode) && !existsSync(pinnedNode)) {
+    warnings.push(`statusline pinned Node path missing (${pinnedNode}) — run \`recall install\``);
+  }
+
+  return { installed: true, warnings };
+}
+
+function printStatusline(h: StatuslineHealth): void {
+  if (!h.installed) return;
+  console.log('\nStatusline (opt-in)');
+  console.log('-------------------');
+  if (h.warnings.length === 0) {
+    console.log('Session id shown in the Claude Code status bar: OK');
+  } else {
+    for (const w of h.warnings) console.log(`  ⚠ ${w}`);
+  }
 }
 
 /** Path to the staged addon (beside the bundles). */

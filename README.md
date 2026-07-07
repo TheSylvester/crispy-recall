@@ -6,6 +6,21 @@ Searchable memory for your Claude Code and Codex sessions. Local, fast, no daemo
 
 A standalone spin-off of the recall feature from [Crispy](https://github.com/TheSylvester/crispy). See the parent project for the broader multi-agent orchestration GUI.
 
+## What's new in 0.2.2
+
+- **Opt-in statusline: the session id in your Claude Code status bar.** The
+  session id is recall's primary key — `recall <id>` reads that session, and
+  it's how you hand a conversation to another agent or pick it up tomorrow.
+  `recall install --statusline` puts `🔗 <session_id>` in the status bar so the
+  id of the session you're looking at is always one glance away. Off by
+  default, and it **never overwrites an existing statusline**: recall writes
+  only into an empty slot; if you already have one, it prints two ways to add
+  the id yourself (a paste-ready snippet for your script, or a ready-to-run
+  `claude -p` prompt) and changes nothing. `recall statusline --suggest`
+  re-prints that guidance anytime; `recall uninstall` removes the statusline
+  cleanly if recall installed it. See
+  [Session id in the status bar](#session-id-in-the-status-bar-statusline).
+
 ## What's new in 0.2.1
 
 - **macOS install support.** 0.2.0's native SQLite engine shipped without ever
@@ -184,11 +199,14 @@ a placeholder the installer substitutes, not an environment variable you set.)
 | `recall doctor` | Read-only health check (the install pre-flight suite). `--integrity` runs DB + FTS5 checks. |
 | `recall repair --fts \| --vectors \| --full` | Rebuild the FTS index, re-embed vectors, or full reingest from JSONL. |
 | `recall backfill [--auto-embed] [--vendor <v>] [--detach]` | Index historical transcripts. |
+| `recall statusline [--suggest]` | Print the `🔗 <session_id>` chip from Claude Code's statusline JSON (pipe it in), or with `--suggest` detect your current statusline and show how to add the id to it. |
 
 Add `--json` to `install`/`uninstall`/`status`/`doctor` for machine-readable
 output. `recall install` also takes `--offline` (use a pre-staged binary +
-model instead of downloading) and `--no-backfill` / `--auto-backfill` to control
-the initial history index. Run `recall --help` for the full flag set.
+model instead of downloading), `--no-backfill` / `--auto-backfill` to control
+the initial history index, and `--statusline` / `--no-statusline` for the
+opt-in status bar segment (see below). Run `recall --help` for the full flag
+set.
 
 ### Commit attribution (`--commit` / `--blame`)
 
@@ -206,13 +224,41 @@ recall --blame src/paths.ts:82-84                # sessions behind a line range
 recall --blame src/foo.ts:42 src/bar.ts:10-20 --limit 20   # union of specs
 ```
 
+### Session id in the status bar (`statusline`)
+
+Everything in recall keys off the session id — `recall <id>` reads a session,
+and telling an agent "recall `<id>`" hands it a whole prior conversation. The
+opt-in statusline feature keeps the current session's id visible in Claude
+Code's status bar as a `🔗 <session_id>` chip, so it's always there to copy.
+
+```bash
+recall install --statusline
+```
+
+It's **off by default** (a plain `recall install`, `--yes`, or an upgrade never
+touches your status bar), and it **never overwrites an existing statusline**:
+
+- **No statusline set** → recall wires a minimal one:
+  `<dir> · <model> · 🔗 <session_id>`.
+- **You already have one** → recall changes nothing and prints two ways to add
+  the id yourself: a paste-ready snippet for your script (Python/Node/shell,
+  matched to what you run), or a ready-to-run `claude -p` prompt that edits it
+  for you. `recall statusline --suggest` re-prints that guidance anytime.
+
+The wired command is a tiny standalone script (`~/.recall/bin/statusline.js`,
+~2.5 KB — it never touches the database), and `recall uninstall` removes the
+statusline again if recall installed it. If you'd rather compose the chip into
+your own statusline, pipe Claude Code's statusline JSON through
+`recall statusline` and append its output. `recall doctor` reports statusline
+health once enabled (warnings only — it never fails the check).
+
 ## Where things live
 
-- `~/.recall/` — the DB, model, binary, logs, and `config.json` (the resolved GPU/CPU embedder mode).
+- `~/.recall/` — the DB, model, binary, logs, and `config.json` (the resolved GPU/CPU embedder mode, plus the statusline record if enabled).
 - `~/.claude/skills/recall/SKILL.md` — the auto-discovered skill.
-- A hook entry in `~/.claude/settings.json`.
+- A hook entry in `~/.claude/settings.json` (and, only if you opted in, a `statusLine` entry).
 
-`recall uninstall` reverses all three. `recall uninstall --purge` also removes `~/.recall/`.
+`recall uninstall` reverses all of these. `recall uninstall --purge` also removes `~/.recall/`.
 
 ## Privacy
 

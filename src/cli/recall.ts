@@ -40,6 +40,7 @@ import {
   parseBlameSpec,
   type SessionMatch,
 } from '../git-attribution.js';
+import { renderStatuslineSegment, type StatuslineInput } from '../recall/statusline-segment.js';
 import { mkdirSync, openSync, writeFileSync, readFileSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { join } from 'node:path';
@@ -126,6 +127,9 @@ const FLAG_BOOLEAN = new Set([
   // installer subcommand flags
   '--yes', '--offline', '--json', '--purge', '--integrity',
   '--fts', '--vectors', '--full', '--no-claudemd', '--no-backfill', '--auto-backfill',
+  '--statusline', '--no-statusline',
+  // statusline subcommand flag
+  '--suggest',
 ]);
 
 const positional: string[] = [];
@@ -165,6 +169,9 @@ USAGE
   recall --blame <path>[:<line>[-<line>]]...  Sessions responsible for a file
                                      or a specific line/range (via git blame)
   recall backfill [flags]            Catch up FTS5 + embeddings against transcript files
+  recall statusline [--suggest]      Print the session-id chip for the Claude Code
+                                     statusline (or, with --suggest, detect your
+                                     current statusline and show how to add it)
 
 ARGUMENTS
   query         Free-text search (FTS5 + optional semantic)
@@ -193,6 +200,16 @@ FLAGS
   --no-catchup     Skip the per-invocation mtime catch-up scan (T1)
   --help, -h       Show this help
   --version, -v    Print the recall version
+
+INSTALL FLAGS (with 'recall install')
+  --statusline     Opt in to showing the session id in your Claude Code
+                   statusline. Writes ONLY into an empty slot; if you already
+                   have a statusline it changes nothing and prints how to add
+                   the id yourself. Stays on across upgrades once enabled.
+                   Reversible on uninstall. (default: off)
+  --no-statusline  Turn the statusline feature off: removes recall's statusline
+                   entry (never someone else's) and its record
+                   (wins over --statusline)
 
 BACKFILL FLAGS (with 'recall backfill')
   --auto-embed     Skip the interactive prompt for large embedding gaps
@@ -972,6 +989,8 @@ async function runInstallerSubcommand(cmd: string): Promise<void> {
       yes: hasFlag('--yes'),
       offline: hasFlag('--offline'),
       noClaudemd: hasFlag('--no-claudemd'),
+      statusline: hasFlag('--statusline'),
+      noStatusline: hasFlag('--no-statusline'),
       noBackfill: hasFlag('--no-backfill'),
       autoBackfill: hasFlag('--auto-backfill'),
       json,
@@ -1010,6 +1029,36 @@ async function runInstallerSubcommand(cmd: string): Promise<void> {
   }
 }
 
+/**
+ * `recall statusline` — manual/composition entry point for the Claude Code
+ * statusLine. NEVER opens the DB (dispatched before initDb/maybeRunT1).
+ *
+ *   recall statusline --suggest   Detect the current statusline + print guidance
+ *   <json> | recall statusline    Print recall's chip: "🔗 <session_id>"
+ *
+ * The WIRED status line is the lean dist/statusline.js bundle, not this — the
+ * full CLI statically imports db/embedder. This subcommand is for manual use.
+ */
+async function runStatuslineSubcommand(): Promise<void> {
+  if (hasFlag('--suggest')) {
+    const { detectStatusline, renderStatuslineSuggestion } = await import('../installer/statusline-suggest.js');
+    const { claudeSettingsPath } = await import('../installer/preflight.js');
+    console.log(renderStatuslineSuggestion(detectStatusline(claudeSettingsPath())));
+    exit(0);
+  }
+  // No piped stdin on a TTY → don't hang on `for await`; print usage and exit.
+  if (process.stdin.isTTY) {
+    console.log('Usage: pipe the Claude statusline JSON to `recall statusline`, or run `recall statusline --suggest`.');
+    exit(0);
+  }
+  let data = '';
+  for await (const chunk of process.stdin) data += chunk;
+  let json: StatuslineInput;
+  try { json = JSON.parse(data) as StatuslineInput; } catch { json = {}; }
+  process.stdout.write(renderStatuslineSegment(json ?? {}));
+  exit(0);
+}
+
 async function main() {
   if (showVersion) {
     console.log(getVersion());
@@ -1027,6 +1076,19 @@ async function main() {
   // (it reads git + raw transcript JSONL directly).
   if (hasFlag('--commit') || blameMode) {
     await runCommitAttribution();
+    exit(0);
+  }
+
+  // Statusline subcommand — AFTER the commit/blame block so `recall --blame
+  // statusline` (blaming a file literally named `statusline`) reaches git-blame,
+  // consistent with how backfill/installer subcommands are ordered. Still BEFORE
+  // any DB/embedder init and maybeRunT1: it never touches the DB, and its
+  // TTY-guarded stdin read must never open/block on the database. Only a LONE
+  // `statusline` dispatches — the subcommand takes no positional args, so a
+  // search like `recall statusline broken yesterday` falls through to search
+  // instead of being silently swallowed (exit 0, no output) on piped stdin.
+  if (positional[0] === 'statusline' && positional.length === 1) {
+    await runStatuslineSubcommand();
     exit(0);
   }
 

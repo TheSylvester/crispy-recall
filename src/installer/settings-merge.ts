@@ -12,6 +12,8 @@
 
 import { existsSync, readFileSync, writeFileSync, copyFileSync, renameSync, unlinkSync } from 'node:fs';
 import { stableNodePath } from './stable-node.js';
+import { readConfig } from './config.js';
+import { statuslineScript } from '../paths.js';
 
 const HOOK_ARRAYS = ['Stop', 'SubagentStop'] as const;
 
@@ -40,7 +42,8 @@ export function writeFileAtomic(path: string, contents: string): void {
 
 interface HookCommand { type?: string; command?: string }
 interface HookEntry { matcher?: string; hooks?: HookCommand[] }
-interface SettingsShape { hooks?: Record<string, HookEntry[]>; [k: string]: unknown }
+interface StatusLineShape { type?: string; command?: string }
+interface SettingsShape { hooks?: Record<string, HookEntry[]>; statusLine?: StatusLineShape; [k: string]: unknown }
 
 export interface MergeResult { changed: boolean; backup?: string }
 
@@ -197,6 +200,134 @@ export function removeStopHook(filePath: string): MergeResult {
   }
 
   if (!changed) return { changed: false };
+  const backup = backupFile(filePath);
+  writeFileAtomic(filePath, serialize(obj, raw));
+  return { changed: true, backup };
+}
+
+// ---------------------------------------------------------------------------
+// statusLine — a SINGLE object, not an array (unlike the hook helpers above).
+//
+// Claude Code allows exactly one `statusLine` command per settings scope, so
+// writing it means overwriting whatever is there. Many power users curate a
+// status line; clobbering it is unacceptable. The one rule: recall writes ONLY
+// into a genuinely EMPTY slot, or heals a slot it already owns. A foreign value
+// is NEVER modified.
+// ---------------------------------------------------------------------------
+
+/**
+ * Classify the raw `statusLine` value.
+ *   'empty'      — genuinely nothing to preserve: key absent, null, or an
+ *                  object whose command is absent/null/blank.
+ *   'unreadable' — PRESENT user content in a shape we can't read (a string
+ *                  value, an array, a non-string command, …). Treated as
+ *                  foreign downstream: it may be a hand-edit the user meant,
+ *                  so it is never overwritten.
+ *   { cmd }      — a readable command string.
+ */
+export type StatusLineSlot = 'empty' | 'unreadable' | { cmd: string };
+
+export function classifyStatusLineSlot(sl: unknown): StatusLineSlot {
+  if (sl === undefined || sl === null) return 'empty';
+  if (typeof sl === 'object' && !Array.isArray(sl)) {
+    const c = (sl as { command?: unknown }).command;
+    if (c === undefined || c === null) return 'empty';
+    if (typeof c === 'string') return c.trim().length === 0 ? 'empty' : { cmd: c };
+    return 'unreadable';
+  }
+  return 'unreadable';
+}
+
+/**
+ * A statusLine command is recall's iff it is EXACTLY the two-token shape recall
+ * writes — `"<node>" "<…statusline.js>"` — AND the script resolves to recall's:
+ * a `.recall/` path marker (survives a lost config.json, like isRecallCommand),
+ * the live statuslineScript() location (honors a custom RECALL_HOME), or the
+ * exact command recorded in config.json.
+ *
+ * Anchoring on the FULL shape is load-bearing: statusLine is a single slot, so
+ * a user command that merely EMBEDS recall's script (e.g. a composite
+ * `sh -c 'their-tool; "<node>" "<…statusline.js>"'`) must stay foreign —
+ * claiming it would rewrite or delete the user's half on heal/uninstall.
+ */
+export function isRecallStatusLine(cmd?: string): boolean {
+  if (!cmd) return false;
+  const m = /^\s*"([^"]+)"\s+"([^"]+statusline\.js)"\s*$/.exec(cmd);
+  if (!m) return false;
+  const script = m[2]!;
+  // Full `.recall` path segment — a dir merely SUFFIXED `.recall`
+  // (e.g. backups.recall/) is somebody else's.
+  if (/(^|[\\/])\.recall[\\/]/.test(script)) return true;
+  if (script === statuslineScript()) return true;
+  const recorded = readConfig()?.statusline?.command;
+  return recorded !== undefined && cmd === recorded;
+}
+
+export type MergeStatusLineResult =
+  | { state: 'wroteEmpty'; changed: true; backup?: string }      // slot was empty → wrote recall command
+  | { state: 'alreadyRecall'; changed: boolean; backup?: string } // healed the pin in place, or no-op
+  | { state: 'refusedForeign'; changed: false };                  // foreign value present → untouched
+
+/**
+ * Write recall's `statusLine` command ONLY into an empty-or-already-recall slot.
+ * NEVER overwrites a foreign value. Idempotent; heals a drifted recall pin in
+ * place (mirrors mergeStopHook's stale-path branch). Creates the file if absent.
+ */
+export function mergeStatusLine(filePath: string, command: string): MergeStatusLineResult {
+  const exists = existsSync(filePath);
+  const raw = exists ? readFileSync(filePath, 'utf-8') : null;
+  const obj: SettingsShape = raw && raw.trim().length > 0 ? parseTolerant(raw) : {};
+
+  const slot = classifyStatusLineSlot(obj.statusLine);
+
+  // Keep user-added sibling keys (Claude Code supports e.g. `padding`) when
+  // writing into an empty-but-object slot or healing an owned one.
+  const siblings = obj.statusLine && typeof obj.statusLine === 'object' && !Array.isArray(obj.statusLine)
+    ? (obj.statusLine as Record<string, unknown>)
+    : {};
+
+  // Empty slot (absent / null / blank command) → write recall's command.
+  if (slot === 'empty') {
+    obj.statusLine = { ...siblings, type: 'command', command };
+    const backup = exists ? backupFile(filePath) : undefined;
+    writeFileAtomic(filePath, serialize(obj, raw));
+    return backup ? { state: 'wroteEmpty', changed: true, backup } : { state: 'wroteEmpty', changed: true };
+  }
+
+  // Present but unreadable → user content in a shape we don't understand;
+  // refuse like any foreign value rather than misread it as empty.
+  if (slot === 'unreadable') return { state: 'refusedForeign', changed: false };
+
+  // Already recall's → no-op if unchanged, else heal the pinned node / path.
+  if (isRecallStatusLine(slot.cmd)) {
+    if (slot.cmd === command) return { state: 'alreadyRecall', changed: false };
+    obj.statusLine = { ...siblings, type: 'command', command };
+    const backup = backupFile(filePath);
+    writeFileAtomic(filePath, serialize(obj, raw));
+    return { state: 'alreadyRecall', changed: true, backup };
+  }
+
+  // Populated with a foreign value → never touch it.
+  return { state: 'refusedForeign', changed: false };
+}
+
+/**
+ * Remove recall's `statusLine` iff we still own it (isRecallStatusLine PRIMARY —
+ * a lost config.json must still allow cleanup). Restores a stashed prior value
+ * if config recorded one, else deletes the key. Leaves a foreign value alone.
+ */
+export function removeStatusLine(filePath: string): MergeResult {
+  if (!existsSync(filePath)) return { changed: false };
+  const raw = readFileSync(filePath, 'utf-8');
+  if (raw.trim().length === 0) return { changed: false };
+  const obj = parseTolerant(raw);
+  const slot = classifyStatusLineSlot(obj.statusLine);
+  if (slot === 'empty' || slot === 'unreadable' || !isRecallStatusLine(slot.cmd)) return { changed: false };
+
+  const prior = readConfig()?.statusline?.priorStatusLine ?? null;
+  if (prior) obj.statusLine = prior;
+  else delete obj.statusLine;
+
   const backup = backupFile(filePath);
   writeFileAtomic(filePath, serialize(obj, raw));
   return { changed: true, backup };

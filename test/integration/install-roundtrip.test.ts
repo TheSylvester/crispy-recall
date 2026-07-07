@@ -38,7 +38,7 @@ beforeAll(() => {
   mkdirSync(distDir, { recursive: true });
 
   // Dummy dist bundles (the detached backfill child just `node`s recall.js).
-  for (const b of ['recall.js', 'stop-hook.js', 'embed-pending.js']) {
+  for (const b of ['recall.js', 'stop-hook.js', 'embed-pending.js', 'statusline.js']) {
     writeFileSync(join(distDir, b), 'process.exit(0);\n');
   }
 
@@ -85,7 +85,7 @@ describe('install-roundtrip', () => {
     }
 
     // config.json — CPU in the offline sandbox (no GPU libs staged)
-    expect(readConfig()?.embedder.mode).toBe('cpu');
+    expect(readConfig()?.embedder?.mode).toBe('cpu');
 
     // skill installed with $RECALL_BIN substituted to the RUNNABLE form
     const skillPath = join(claudeDir, 'skills', 'recall', 'SKILL.md');
@@ -124,7 +124,7 @@ describe('install-roundtrip', () => {
     expect(afterSettings.hooks.PreToolUse[0].hooks[0].command).toBe('echo keep-me');
     // ~/.recall intact (no --purge): DB + config survive
     expect(existsSync(dbPath())).toBe(true);
-    expect(readConfig()?.embedder.mode).toBe('cpu');
+    expect(readConfig()?.embedder?.mode).toBe('cpu');
     expect(un.purged).toBe(false);
   }, 30_000);
 });

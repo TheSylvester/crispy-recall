@@ -37,7 +37,7 @@ beforeAll(() => {
   distDir = join(sandbox, 'dist');
   mkdirSync(claudeDir, { recursive: true }); // empty ~/.claude
   mkdirSync(distDir, { recursive: true });
-  for (const b of ['recall.js', 'stop-hook.js', 'embed-pending.js']) writeFileSync(join(distDir, b), 'process.exit(0);\n');
+  for (const b of ['recall.js', 'stop-hook.js', 'embed-pending.js', 'statusline.js']) writeFileSync(join(distDir, b), 'process.exit(0);\n');
   mkdirSync(join(recallHome, 'bin'), { recursive: true });
   mkdirSync(join(recallHome, 'models'), { recursive: true });
 
@@ -97,6 +97,6 @@ describe('manifest-optout', () => {
     expect(settings.hooks.Stop.length).toBeGreaterThan(0);
     expect(settings.hooks.SubagentStop.length).toBeGreaterThan(0);
     expect(existsSync(skillFile())).toBe(true);
-    expect(readConfig()?.embedder.mode).toBe('cpu');
+    expect(readConfig()?.embedder?.mode).toBe('cpu');
   });
 });

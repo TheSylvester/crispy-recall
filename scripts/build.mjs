@@ -4,6 +4,7 @@
  *   - dist/recall.js         (CLI entry point)
  *   - dist/stop-hook.js      (Claude Code / Codex Stop hook entry point)
  *   - dist/embed-pending.js  (detached child that drains unvectorized messages)
+ *   - dist/statusline.js     (Claude Code statusLine command — lean, stdlib-only)
  * All bundles get a `#!/usr/bin/env node` shebang and 0755 perms.
  */
 
@@ -50,11 +51,17 @@ await Promise.all([
     entryPoints: [join(root, 'src/cli/embed-pending.ts')],
     outfile: join(root, 'dist/embed-pending.js'),
   }),
+  build({
+    ...sharedOpts,
+    entryPoints: [join(root, 'src/hooks/statusline.ts')],
+    outfile: join(root, 'dist/statusline.js'),
+  }),
 ]);
 
 chmodSync(join(root, 'dist/recall.js'), 0o755);
 chmodSync(join(root, 'dist/stop-hook.js'), 0o755);
 chmodSync(join(root, 'dist/embed-pending.js'), 0o755);
+chmodSync(join(root, 'dist/statusline.js'), 0o755);
 
 // Copy the better-sqlite3 native addon alongside the bundle. The bundles load
 // it via an explicit `nativeBinding: join(__dirname, 'better_sqlite3.node')`
@@ -90,7 +97,7 @@ try {
   console.warn(`Warning: failed to copy SKILL.md.template: ${err.message}`);
 }
 
-console.log('Built dist/recall.js, dist/stop-hook.js, dist/embed-pending.js');
+console.log('Built dist/recall.js, dist/stop-hook.js, dist/embed-pending.js, dist/statusline.js');
 
 /**
  * Locate the compiled better-sqlite3 addon under its package dir. Prefers the

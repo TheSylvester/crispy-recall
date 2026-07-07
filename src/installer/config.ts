@@ -35,7 +35,19 @@ export interface EmbedderConfig {
 }
 
 export interface RecallConfig {
-  embedder: EmbedderConfig;
+  /** Optional so a statusline-only merge type-checks. In practice the GPU phase
+   *  always writes embedder before phase 7, so installs always carry it. */
+  embedder?: EmbedderConfig;
+  /** Opt-in statusLine feature record (present only when the user enabled it). */
+  statusline?: {
+    installed: boolean;
+    /** Exact recall command written — ownership corroboration alongside isRecallStatusLine. */
+    command: string;
+    /** Prior statusLine to restore on uninstall. Always null in this design
+     *  (recall only ever writes into an empty slot); kept for forward-compat. */
+    priorStatusLine: { type?: string; command?: string } | null;
+    installedAt: string; // ISO
+  };
 }
 
 /** Absolute path to ~/.recall/config.json. */
@@ -75,6 +87,40 @@ export function writeEmbedderConfig(embedder: EmbedderConfig): RecallConfig {
     summary: `config.json written (embedder.mode=${embedder.mode})`,
   });
   return merged;
+}
+
+/**
+ * Write the statusline record, merging over any existing config so the embedder
+ * decision survives. Creates ~/.recall/ if missing. Mirrors writeEmbedderConfig.
+ */
+export function writeStatuslineConfig(statusline: NonNullable<RecallConfig['statusline']>): RecallConfig {
+  const p = configPath();
+  mkdirSync(dirname(p), { recursive: true });
+  const existing = readConfig() ?? {};
+  const merged: RecallConfig = { ...existing, statusline };
+  writeFileAtomic(p, JSON.stringify(merged, null, 2) + '\n');
+  log({
+    source: 'installer/config',
+    level: 'info',
+    summary: `config.json written (statusline.installed=${statusline.installed})`,
+  });
+  return merged;
+}
+
+/**
+ * Drop the statusline record (uninstall / `--no-statusline` / reconciling after
+ * the user switched to their own statusline). No-op when there is none.
+ */
+export function clearStatuslineConfig(): void {
+  const existing = readConfig();
+  if (!existing?.statusline) return;
+  const { statusline: _dropped, ...rest } = existing;
+  writeFileAtomic(configPath(), JSON.stringify(rest, null, 2) + '\n');
+  log({
+    source: 'installer/config',
+    level: 'info',
+    summary: 'config.json statusline record cleared',
+  });
 }
 
 /**

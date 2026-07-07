@@ -119,7 +119,7 @@ function stageEnv(): void {
   mkdirSync(join(recallHome, 'models'), { recursive: true });
 
   // Harmless dist bundles — the detached backfill child just `node`s recall.js.
-  for (const b of ['recall.js', 'stop-hook.js', 'embed-pending.js']) writeFileSync(join(distDir, b), 'process.exit(0);\n');
+  for (const b of ['recall.js', 'stop-hook.js', 'embed-pending.js', 'statusline.js']) writeFileSync(join(distDir, b), 'process.exit(0);\n');
 
   prev['RECALL_HOME'] = process.env['RECALL_HOME'];
   prev['CLAUDE_CONFIG_DIR'] = process.env['CLAUDE_CONFIG_DIR'];

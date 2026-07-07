@@ -10,7 +10,8 @@
 
 import { existsSync, rmSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { removeStopHook } from './settings-merge.js';
+import { removeStopHook, removeStatusLine } from './settings-merge.js';
+import { clearStatuslineConfig } from './config.js';
 import { removeNudge } from './claudemd-nudge.js';
 import {
   claudeSettingsPath, claudeMdPath, claudeRecallSkillPath,
@@ -39,6 +40,14 @@ export function runUninstall(opts: UninstallOptions = {}): UninstallResult {
   // CLAUDE.md / AGENTS.md nudge.
   if (removeNudge(claudeMdPath()).changed) removed.push(claudeMdPath());
   if (removeNudge(codexAgentsPath()).changed) removed.push(codexAgentsPath());
+
+  // statusLine (Claude-only; Codex has none). Ownership via isRecallStatusLine,
+  // so it cleans up even if config.json is gone. BEFORE --purge deletes ~/.recall
+  // so readConfig() is still available and settings.json is left clean. The
+  // config record is cleared unconditionally (even when the user had already
+  // replaced recall's statusLine) so doctor/reinstall never act on a stale one.
+  if (removeStatusLine(claudeSettingsPath()).changed) removed.push(claudeSettingsPath());
+  clearStatuslineConfig();
 
   // ~/.recall/ only on --purge (includes DB + config.json).
   let purged = false;
