@@ -6,6 +6,22 @@ Searchable memory for your Claude Code and Codex sessions. Local, fast, no daemo
 
 A standalone spin-off of the recall feature from [Crispy](https://github.com/TheSylvester/crispy). See the parent project for the broader multi-agent orchestration GUI.
 
+## What's new in 0.2.1
+
+- **macOS install support.** 0.2.0's native SQLite engine shipped without ever
+  running on Apple hardware; 0.2.1 fixes the macOS install path and validates it
+  end-to-end on Apple Silicon. Fixes: a pre-flight macOS-version check (the
+  bundled llama.cpp embedding binaries need macOS 14+ on arm64, 13.7+ on Intel),
+  a Node path that stays valid across `brew upgrade node` during in-place
+  upgrades (it previously pinned a Homebrew Cellar path that a later upgrade
+  removes), an up-front rejection of Node 23 (no prebuilt SQLite binding) with an
+  explanation instead of a late failure, and a load-check of the staged SQLite
+  binding before the installer trusts it. Non-macOS installs are unaffected.
+- **`recall install` no longer hangs during setup.** Extraction of the embedding
+  binaries is now time-boxed with a fallback to the OS unzip tool
+  (`unzip`/`ditto`/`Expand-Archive`), so a stalled extract can no longer wedge
+  the installer.
+
 ## What's new in 0.2.0
 
 - **Native SQLite engine with real WAL.** The database now runs on
