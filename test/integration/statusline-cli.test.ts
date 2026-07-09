@@ -23,6 +23,9 @@ const suite = BUILT ? describe : describe.skip;
 
 const JSON_IN = '{"session_id":"abc-123","cwd":"/x/y/proj","model":{"display_name":"Opus"}}';
 
+/** Drop ANSI SGR codes — the wired standalone line is muted/colored. */
+const strip = (s: string): string => s.replace(/\x1b\[[0-9;]*m/g, '');
+
 let dir: string | undefined;
 afterEach(() => { if (dir && existsSync(dir)) rmSync(dir, { recursive: true, force: true }); dir = undefined; });
 
@@ -30,9 +33,37 @@ suite('statusline CLI / bundle (built)', () => {
   it('dist/statusline.js renders the STANDALONE line from stdin JSON and exits 0', () => {
     const r = spawnSync(process.execPath, [STATUSLINE_BUNDLE], { input: JSON_IN, encoding: 'utf-8', timeout: 15_000 });
     expect(r.status).toBe(0);
-    expect(r.stdout).toContain('🔗 abc-123');
-    expect(r.stdout).toContain('proj');   // proves renderStandaloneStatusline, not the bare chip
-    expect(r.stdout).toContain('Opus');
+    const out = strip(r.stdout);
+    expect(out).toContain('🔗 abc-123');
+    expect(out).toContain('proj');   // proves renderStandaloneStatusline, not the bare chip
+    expect(out).toContain('Opus');
+  });
+
+  it('dist/statusline.js renders the real git (branch*) via a live subprocess (workspace.current_dir)', () => {
+    dir = mkdtempSync(join(tmpdir(), 'recall-sl-git-'));
+    const git = (args: string[]) => spawnSync('git', args, { cwd: dir!, encoding: 'utf-8' });
+    if (git(['init']).status !== 0) return; // git unavailable → skip cleanly
+    git(['config', 'user.email', 't@t']);
+    git(['config', 'user.name', 't']);
+    git(['checkout', '-b', 'feat/live']);
+    writeFileSync(join(dir, 'a.txt'), 'hi');
+    git(['add', '.']);
+    if (git(['commit', '-m', 'init']).status !== 0) return; // e.g. commit hooks env → skip
+    // session JSON supplies workspace.current_dir (the precedence the git read uses).
+    const payload = JSON.stringify({
+      session_id: 'sid',
+      workspace: { current_dir: dir },
+      model: { display_name: 'Claude Opus 4.8' },
+    });
+    const run = () =>
+      strip(spawnSync(process.execPath, [STATUSLINE_BUNDLE], { input: payload, encoding: 'utf-8', timeout: 15_000 }).stdout);
+
+    const clean = run();
+    expect(clean).toContain('(feat/live)'); // branch via the REAL spawnSync + parseGitStatus
+    expect(clean).not.toContain('feat/live*'); // clean tree → no dirty marker
+
+    writeFileSync(join(dir, 'a.txt'), 'changed'); // dirty the tree
+    expect(run()).toContain('(feat/live*)'); // dirty marker via real `git status`
   });
 
   it('dist/statusline.js exits 0 and prints nothing on malformed JSON', () => {
