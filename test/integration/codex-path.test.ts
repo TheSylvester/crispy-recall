@@ -18,7 +18,7 @@ import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 
 import { adaptCodexJsonlRecords } from '../../src/adapters/codex/codex-jsonl-adapter.js';
-import { vendorForTranscript } from '../../src/hooks/stop-hook.js';
+import { resolveIngestTarget, vendorForTranscript } from '../../src/hooks/stop-hook.js';
 import { ingestSessionMessages } from '../../src/recall/message-ingest.js';
 import { mergeStopHook, removeStopHook } from '../../src/installer/settings-merge.js';
 import { _setTestRoot, dbPath } from '../../src/paths.js';
@@ -118,9 +118,37 @@ describe('codex vendor detection (stop-hook path classification)', () => {
     expect(vendorForTranscript('C:\\Users\\u\\.codex\\sessions\\2026\\rollout.jsonl')).toBe('codex');
   });
 
+  it('honors a custom CODEX_HOME path', () => {
+    expect(vendorForTranscript('/opt/codex-data/sessions/2026/rollout.jsonl', '/opt/codex-data')).toBe('codex');
+  });
+
   it('routes a non-codex transcript to claude', () => {
     expect(vendorForTranscript('C:\\Users\\u\\.claude\\projects\\p\\sess.jsonl')).toBe('claude');
     expect(vendorForTranscript('/home/u/.claude/projects/p/sess.jsonl')).toBe('claude');
+  });
+});
+
+describe('codex Stop payload targeting', () => {
+  it('uses the common session transcript for Stop', () => {
+    expect(resolveIngestTarget({
+      session_id: SID,
+      transcript_path: '/home/u/.codex/sessions/2026/rollout.jsonl',
+    })).toEqual({
+      sessionId: SID,
+      transcriptPath: '/home/u/.codex/sessions/2026/rollout.jsonl',
+    });
+  });
+
+  it('uses Codex agent_id and agent_transcript_path for SubagentStop', () => {
+    expect(resolveIngestTarget({
+      session_id: SID,
+      transcript_path: '/home/u/.codex/sessions/2026/parent.jsonl',
+      agent_id: 'agent-a1b2c3',
+      agent_transcript_path: '/home/u/.codex/sessions/2026/subagent.jsonl',
+    })).toEqual({
+      sessionId: 'agent-a1b2c3',
+      transcriptPath: '/home/u/.codex/sessions/2026/subagent.jsonl',
+    });
   });
 });
 

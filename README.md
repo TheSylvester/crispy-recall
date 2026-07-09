@@ -85,13 +85,11 @@ recall install
 ```
 
 `recall install` is the resident setup step. It scaffolds `~/.recall/` (the
-llama embedding binary, the model, and the SQLite DB), wires a Stop hook into
-Claude Code so your transcripts are indexed automatically as sessions end, and
-installs the `recall` skill. If Codex is detected it also gets the `recall`
-skill (so the agent can search), but not an automatic per-turn hook (yet) —
-index Codex history with `recall backfill --vendor codex`. After that, recall
-runs passively — you only invoke `recall` directly for `status`, `doctor`,
-`repair`, or `uninstall`.
+llama embedding binary, the model, and the SQLite DB), wires Stop and
+SubagentStop hooks into Claude Code, and installs the `recall` skill. If Codex
+is detected, it gets the same automatic hooks plus the skill. After that,
+transcripts are indexed as turns finish and recall runs passively — you only
+invoke `recall` directly for `status`, `doctor`, `repair`, or `uninstall`.
 
 Run it in the environment where you actually use Claude Code: **WSL and
 Windows-native are separate installs.** If you use both, run the install in each
@@ -110,10 +108,9 @@ Windows-native are separate installs.** If you use both, run the install in each
 
 Prerequisites: Node 22 LTS (≥ 22.16) or 24+ — Node 23 is unsupported (no
 prebuilt SQLite binding) — and Claude Code installed. If Codex is detected
-(`~/.codex/` exists), recall installs the `recall` skill into Codex (so the
-agent can search) and you can index your Codex history with
-`recall backfill --vendor codex`. Real-time per-turn Codex indexing is **not
-yet** supported.
+(`~/.codex/` exists), recall installs its lifecycle hooks in
+`~/.codex/hooks.json` and the `recall` skill so Codex sessions are indexed and
+searchable automatically.
 
 ### Upgrading from 0.1.x
 
@@ -154,7 +151,7 @@ What to expect:
 - A **Stop hook** ingests every turn into a local SQLite DB the moment a session ends — no daemon, no background polling.
 - The CLI **searches** your history two ways at once: FTS5 full-text and semantic vectors (Nomic Embed Text v1.5, run locally via llama.cpp).
 - A **`recall` skill** is dropped into Claude Code so the agent discovers and invokes it on its own — you rarely type `recall` yourself.
-- Works in **any project**. Claude Code sessions are indexed automatically; Codex transcripts are searchable too via `recall backfill --vendor codex`.
+- Works in **any project**, across both Claude Code and Codex.
 
 ## How an agent uses it
 
@@ -194,7 +191,7 @@ a placeholder the installer substitutes, not an environment variable you set.)
 | `recall "<query>" [--all] [--project <path>]` | Search past sessions (FTS5 + semantic). Defaults to the current project; `--all` searches every indexed project, `--project` targets one. |
 | `recall <session-id> [<message-id>]` | Read a session, optionally centered on a matched message. |
 | `recall install` | One-time setup: scaffold `~/.recall/`, wire the Stop hook, install the skill. |
-| `recall uninstall` | Reverse the install (skill, hook, CLAUDE.md block). `--purge` also removes `~/.recall/`. |
+| `recall uninstall` | Reverse the install (skills, hooks, CLAUDE.md/AGENTS.md blocks). `--purge` also removes `~/.recall/`. |
 | `recall status` | DB size, message count, last ingest, embedding gap, active backfill PID, GPU/CPU backend. |
 | `recall doctor` | Read-only health check (the install pre-flight suite). `--integrity` runs DB + FTS5 checks. |
 | `recall repair --fts \| --vectors \| --full` | Rebuild the FTS index, re-embed vectors, or full reingest from JSONL. |

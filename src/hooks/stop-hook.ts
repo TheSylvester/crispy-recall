@@ -1,8 +1,9 @@
 /**
  * Stop Hook — Claude Code / Codex Stop event entry point.
  *
- * Reads the Stop payload from stdin, dispatches vendor on transcript_path,
- * and ingests the just-finished session's messages into the FTS5 index.
+ * Reads the Stop payload from stdin, resolves the finished transcript (including
+ * Codex's separate SubagentStop transcript), and ingests its messages into the
+ * FTS5 index.
  *
  * Discipline: this hook MUST exit 0. Exit 2 blocks the agent from stopping
  * (recall failure must never block the user's turn). Any error is logged
@@ -26,9 +27,34 @@ import { join } from "path";
  * otherwise misroute every Codex session to the Claude adapter. Mirrors the
  * normalization in src/url-path-resolver.ts.
  */
-export function vendorForTranscript(transcriptPath: string): 'claude' | 'codex' {
+export function vendorForTranscript(
+  transcriptPath: string,
+  codexHome = process.env['CODEX_HOME'],
+): 'claude' | 'codex' {
   const p = transcriptPath.replace(/\\/g, '/');
-  return p.includes("/.codex/") ? "codex" : "claude";
+  const root = codexHome?.replace(/\\/g, '/').replace(/\/$/, '');
+  const underCodexHome = root ? p === root || p.startsWith(`${root}/`) : false;
+  return p.includes("/.codex/") || underCodexHome ? "codex" : "claude";
+}
+
+export interface StopHookPayload {
+  session_id?: string;
+  transcript_path?: string | null;
+  cwd?: string;
+  stop_hook_active?: boolean;
+  agent_id?: string;
+  agent_transcript_path?: string | null;
+}
+
+/** Codex SubagentStop keeps the parent in the common transcript fields. */
+export function resolveIngestTarget(
+  payload: StopHookPayload,
+): { sessionId: string; transcriptPath: string } | null {
+  const transcriptPath = payload.agent_transcript_path ?? payload.transcript_path;
+  const sessionId = payload.agent_transcript_path && payload.agent_id
+    ? payload.agent_id
+    : payload.session_id;
+  return sessionId && transcriptPath ? { sessionId, transcriptPath } : null;
 }
 
 /** Append a line to the stop-hook log, swallowing any error (must never throw). */
@@ -42,10 +68,11 @@ function logStopHook(line: string): void {
 async function runStopHook(): Promise<void> {
   let data = "";
   for await (const chunk of process.stdin) data += chunk;
-  let payload: { session_id?: string; transcript_path?: string; cwd?: string; stop_hook_active?: boolean };
+  let payload: StopHookPayload;
   try { payload = JSON.parse(data); } catch { process.exit(0); }
-  if (!payload?.session_id || !payload?.transcript_path) process.exit(0);
   if (payload.stop_hook_active) process.exit(0); // recursion guard
+  const target = resolveIngestTarget(payload);
+  if (!target) process.exit(0);
 
   try {
     // 5000 ms busy_timeout for hook DB writes. The wasm-era 500 ms was a
@@ -56,11 +83,11 @@ async function runStopHook(): Promise<void> {
     // always exit 0 and never block the user's turn.
     getDb(dbPath()).exec("PRAGMA busy_timeout = 5000;");
 
-    const vendor = vendorForTranscript(payload.transcript_path);
+    const vendor = vendorForTranscript(target.transcriptPath);
 
     const result = await ingestSessionMessages(
-      payload.session_id,
-      payload.transcript_path,
+      target.sessionId,
+      target.transcriptPath,
       vendor,
       { projectId: payload.cwd ?? undefined },
     );
@@ -68,12 +95,12 @@ async function runStopHook(): Promise<void> {
     // throwing — log those too, else they vanish silently.
     if (result?.error) {
       logStopHook(
-        `${new Date().toISOString()} ingest-failed sid=${payload.session_id} err=${result.error}\n`,
+        `${new Date().toISOString()} ingest-failed sid=${target.sessionId} err=${result.error}\n`,
       );
     }
   } catch (e) {
     logStopHook(
-      `${new Date().toISOString()} ingest-failed sid=${payload.session_id} err=${(e as Error).message}\n`,
+      `${new Date().toISOString()} ingest-failed sid=${target.sessionId} err=${(e as Error).message}\n`,
     );
   }
 
@@ -82,7 +109,7 @@ async function runStopHook(): Promise<void> {
   // across the host; siblings exit 0 silently when the lock is held.
   spawn(
     process.execPath,
-    [join(binDir(), "embed-pending.js"), payload.session_id],
+    [join(binDir(), "embed-pending.js"), target.sessionId],
     {
       detached: true,
       stdio: "ignore",

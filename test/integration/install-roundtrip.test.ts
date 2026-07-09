@@ -20,6 +20,7 @@ import { readConfig } from '../../src/installer/config.js';
 
 let recallHome: string;
 let claudeDir: string;
+let codexDir: string;
 let distDir: string;
 let restore: () => void;
 let prevClaude: string | undefined;
@@ -33,8 +34,10 @@ beforeAll(() => {
   const sandbox = mkdtempSync(join(tmpdir(), 'recall-install-'));
   recallHome = join(sandbox, '.recall');
   claudeDir = join(sandbox, '.claude');
+  codexDir = join(sandbox, '.codex');
   distDir = join(sandbox, 'dist');
   mkdirSync(claudeDir, { recursive: true });
+  mkdirSync(codexDir, { recursive: true });
   mkdirSync(distDir, { recursive: true });
 
   // Dummy dist bundles (the detached backfill child just `node`s recall.js).
@@ -57,11 +60,17 @@ beforeAll(() => {
       PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command: 'echo keep-me' }] }],
     },
   }, null, 2));
+  writeFileSync(join(codexDir, 'hooks.json'), JSON.stringify({
+    hooks: {
+      Stop: [{ hooks: [{ type: 'command', command: '/usr/bin/codex-existing-hook' }] }],
+      PreToolUse: [{ matcher: '^Bash$', hooks: [{ type: 'command', command: 'codex-keep-me' }] }],
+    },
+  }, null, 2));
 
   prevClaude = process.env['CLAUDE_CONFIG_DIR'];
   prevCodex = process.env['CODEX_HOME'];
   process.env['CLAUDE_CONFIG_DIR'] = claudeDir;
-  process.env['CODEX_HOME'] = join(sandbox, '.codex-absent');
+  process.env['CODEX_HOME'] = codexDir;
   _resetDb();
 });
 
@@ -106,8 +115,18 @@ describe('install-roundtrip', () => {
     expect(settings.hooks.Stop.some((e: any) => e.hooks[0].command === 'node /pre/existing.js')).toBe(true);
     expect(settings.hooks.PreToolUse[0].hooks[0].command).toBe('echo keep-me');
 
+    // Codex gets the same hooks and skill without clobbering existing hooks.
+    expect(res.selected).toContain('codex-hook');
+    const codexHooks = JSON.parse(readFileSync(join(codexDir, 'hooks.json'), 'utf-8'));
+    expect(recallEntries(codexHooks.hooks.Stop)).toHaveLength(1);
+    expect(recallEntries(codexHooks.hooks.SubagentStop)).toHaveLength(1);
+    expect(codexHooks.hooks.Stop.some((e: any) => e.hooks[0].command === '/usr/bin/codex-existing-hook')).toBe(true);
+    expect(codexHooks.hooks.PreToolUse[0].hooks[0].command).toBe('codex-keep-me');
+    expect(existsSync(join(codexDir, 'skills', 'recall', 'SKILL.md'))).toBe(true);
+
     // backup file written before the edit
     expect(readdirSync(claudeDir).some((f) => f.startsWith('settings.json.bak.'))).toBe(true);
+    expect(readdirSync(codexDir).some((f) => f.startsWith('hooks.json.bak.'))).toBe(true);
 
     // backfill launched DETACHED by default (no foreground spinner blocked)
     expect(res.backfillPid).toBeTypeOf('number');
@@ -116,12 +135,18 @@ describe('install-roundtrip', () => {
     // ---- uninstall ----
     const un = runUninstall({});
     expect(existsSync(join(claudeDir, 'skills', 'recall'))).toBe(false);
+    expect(existsSync(join(codexDir, 'skills', 'recall'))).toBe(false);
     const afterSettings = JSON.parse(readFileSync(join(claudeDir, 'settings.json'), 'utf-8'));
     expect(recallEntries(afterSettings.hooks.Stop ?? [])).toHaveLength(0);
     expect(afterSettings.hooks.SubagentStop).toBeUndefined();
     // other hooks still present
     expect(afterSettings.hooks.Stop.some((e: any) => e.hooks[0].command === 'node /pre/existing.js')).toBe(true);
     expect(afterSettings.hooks.PreToolUse[0].hooks[0].command).toBe('echo keep-me');
+    const afterCodexHooks = JSON.parse(readFileSync(join(codexDir, 'hooks.json'), 'utf-8'));
+    expect(recallEntries(afterCodexHooks.hooks.Stop ?? [])).toHaveLength(0);
+    expect(afterCodexHooks.hooks.SubagentStop).toBeUndefined();
+    expect(afterCodexHooks.hooks.Stop[0].hooks[0].command).toBe('/usr/bin/codex-existing-hook');
+    expect(afterCodexHooks.hooks.PreToolUse[0].hooks[0].command).toBe('codex-keep-me');
     // ~/.recall intact (no --purge): DB + config survive
     expect(existsSync(dbPath())).toBe(true);
     expect(readConfig()?.embedder?.mode).toBe('cpu');

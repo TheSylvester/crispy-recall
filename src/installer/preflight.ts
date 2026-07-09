@@ -309,11 +309,18 @@ function checkCodex(report: PreflightReport): void {
   const hooks = codexHooksPath();
   const agents = codexAgentsPath();
   const paths = { dir, hooks, agents };
-  // v0.1.0 no longer installs a Codex Stop hook (Codex doesn't consume a
-  // Claude-shaped hooks.json) — only the recall skill + AGENTS.md nudge are
-  // written, and uninstall still cleans up any legacy hooks.json. So there is
-  // no hooks-writability precondition to check here.
-  report.codex = { ok: true, status: 'ready', paths };
+  let ok = true;
+  let status = 'ready';
+  if (existsSync(hooks) && !canWrite(hooks)) {
+    ok = false;
+    status = 'hooks-readonly';
+    report.warnings.push({
+      check: 'codex.hooks.writable',
+      severity: 'WARN',
+      message: `${hooks} is not writable — Codex hook setup may fail.`,
+    });
+  }
+  report.codex = { ok, status, paths };
 }
 
 function checkDisk(): { disk: string; issue?: PreflightIssue } {

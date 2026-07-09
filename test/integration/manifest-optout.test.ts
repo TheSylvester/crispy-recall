@@ -76,16 +76,28 @@ describe('manifest-optout', () => {
     expect(manifest.find((i) => i.key.startsWith('codex'))).toBeUndefined();
   });
 
+  it('makes the Codex hook mandatory when Codex is detected', async () => {
+    const report = await runPreflight({ offline: true, gpuDetect: async () => false });
+    report.codex = { ok: true, status: 'ready', paths: {} };
+    const manifest = buildManifest(report);
+
+    expect(manifest.find((i) => i.key === 'codex-hook')).toMatchObject({
+      mandatory: true,
+      defaultSelected: true,
+    });
+    expect(manifest.find((i) => i.key === 'codex-skill')?.mandatory).toBe(true);
+  });
+
   it('applies the opt-out CLAUDE.md nudge by default under --yes', async () => {
     if (existsSync(claudeMd())) rmSync(claudeMd());
-    const res = await runInstall({ yes: true, offline: true, distDir, gpuDetect: async () => false });
+    const res = await runInstall({ yes: true, offline: true, noBackfill: true, distDir, gpuDetect: async () => false });
     expect(res.aborted).toBeFalsy();
     expect(readFileSync(claudeMd(), 'utf-8')).toMatch(/^## Recall$/m);
   });
 
   it('--no-claudemd skips ONLY the nudge; mandatory items still land', async () => {
     if (existsSync(claudeMd())) rmSync(claudeMd());
-    const res = await runInstall({ yes: true, offline: true, distDir, noClaudemd: true, gpuDetect: async () => false });
+    const res = await runInstall({ yes: true, offline: true, noBackfill: true, distDir, noClaudemd: true, gpuDetect: async () => false });
     expect(res.aborted).toBeFalsy();
 
     // opt-out skipped

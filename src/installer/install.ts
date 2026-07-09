@@ -525,6 +525,10 @@ export async function runInstall(opts: InstallOptions = {}): Promise<InstallResu
       const r = mergeStopHook(claudeSettingsPath(), hookScript);
       if (r.changed) filesWritten.push(claudeSettingsPath());
     }
+    if (report.codex && selected.has('codex-hook')) {
+      const r = mergeStopHook(codexHooksPath(), hookScript);
+      if (r.changed) filesWritten.push(codexHooksPath());
+    }
     if (report.codex && selected.has('codex-skill')) {
       if (writeSkill(codexRecallSkillPath(), templatePath, runnable)) filesWritten.push(codexRecallSkillPath());
     }
