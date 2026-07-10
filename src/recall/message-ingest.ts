@@ -9,9 +9,13 @@
  * embedded with Nomic Embed Code and stored as q8 vectors for dual-path search.
  *
  * Preserves message boundaries and uses the entry's uuid as the primary key.
- * Sub-agent entries (those with parentToolUseID) are excluded — the parent
- * session's assistant entries already contain sub-agent output via the Task
- * tool result.
+ * Sub-agent progress entries (those with parentToolUseID) are excluded from
+ * the parent's rows. NOTE: parent transcripts do NOT retain Task/agent output
+ * through this pipeline — stripToolContent removes tool_use/tool_result
+ * blocks, so the parent's row is only its own authored narration. That is why
+ * subagent LEAF transcripts are ingested too, classified retrieval_class
+ * 'agent': durable and explicitly readable, but excluded from default
+ * retrieval, vectors, and every embedding selector.
  *
  * Also owns the IngestResult/IngestOptions types used by both this module
  * and the backfill CLI.
@@ -29,7 +33,10 @@ import {
   insertMessages,
   insertMessageVectors,
 } from './message-store.js';
-import type { MessageRecord, MessageVectorRecord } from './message-store.js';
+import type {
+  MessageRecord, MessageVectorRecord, SessionAliasRecord, SessionProvenanceRecord,
+} from './message-store.js';
+import { classifySession, type HookContext } from './session-classifier.js';
 import { DOC_PREFIX, EMBED_VERSION, buildEmbedText } from './embed-config.js';
 import { getDb } from '../db.js';
 import { dbPath } from '../paths.js';
@@ -46,16 +53,23 @@ import type { TranscriptEntry } from '../transcript.js';
 // ============================================================================
 
 export interface IngestResult {
+  /** The CANONICAL session id the messages were stored under (may differ from
+   *  the requested id — e.g. a Codex child resolved to its rollout UUID). */
   sessionId: string;
   chunksCreated: number;
   skipped: boolean;
   error?: string;
+  /** How the session was classified ('agent' = cold leaf). Callers use this
+   *  to skip embed-pending spawns for subagent-only ingests. */
+  retrievalClass?: 'hot' | 'agent';
 }
 
 export interface IngestOptions {
   projectId?: string;
   force?: boolean;
   verbose?: boolean;
+  /** Hook-supplied classification evidence (Stop/SubagentStop payload). */
+  hook?: HookContext;
 }
 
 // ============================================================================
@@ -120,8 +134,40 @@ export async function ingestSessionMessages(
   vendor: 'claude' | 'codex',
   options?: IngestOptions,
 ): Promise<IngestResult> {
-  // 1. Check if already processed (batch/backfill only — real-time always appends)
-  //    When force is not set, we still proceed to INSERT OR IGNORE new messages.
+  // 0. Classify FIRST — the canonical id must be resolved BEFORE the Codex
+  //    adapter synthesizes message_ids from it (message_id is the dedup PK;
+  //    ingesting one child under two identities would insert it twice).
+  const classification = classifySession({
+    sessionId,
+    transcriptPath,
+    vendor,
+    ...(options?.hook ? { hook: options.hook } : {}),
+  });
+  if (classification.unresolvable) {
+    return {
+      sessionId,
+      chunksCreated: 0,
+      skipped: true,
+      error: 'subagent transcript has no derivable canonical identity — skipped (conservative)',
+    };
+  }
+  const canonicalId = classification.canonicalSessionId;
+  const retrievalClass: 'hot' | 'agent' = classification.kind === 'agent' ? 'agent' : 'hot';
+
+  const provenance: SessionProvenanceRecord = {
+    sessionId: canonicalId,
+    vendor,
+    kind: classification.kind,
+    parentSessionId: classification.parentSessionId,
+    agentDepth: classification.agentDepth,
+    agentMeta: classification.agentMeta,
+    transcriptPath: transcriptPath.replace(/\\/g, '/'),
+  };
+  const aliases: SessionAliasRecord[] = classification.aliases.map((aliasId) => ({
+    aliasId,
+    sessionId: canonicalId,
+    source: options?.hook?.agentId === aliasId ? 'hook-agent-id' : 'ingest-request-id',
+  }));
 
   // 2. Load entries via vendor-dispatched reader on the given transcript path
   let rawEntries: TranscriptEntry[];
@@ -131,19 +177,27 @@ export async function ingestSessionMessages(
       rawEntries = adaptClaudeEntries(raw as unknown as Record<string, unknown>[]);
     } else {
       const envelopes = parseCodexJsonlFile(transcriptPath);
-      rawEntries = adaptCodexJsonlRecords(envelopes, sessionId);
+      rawEntries = adaptCodexJsonlRecords(envelopes, canonicalId);
     }
   } catch (err) {
     return {
-      sessionId,
+      sessionId: canonicalId,
       chunksCreated: 0,
       skipped: false,
       error: `Failed to load session: ${err instanceof Error ? err.message : String(err)}`,
+      retrievalClass,
     };
   }
 
   if (rawEntries.length === 0) {
-    return { sessionId, chunksCreated: 0, skipped: true };
+    // A force re-ingest of a now-empty transcript must still clear the old
+    // rows — an early return here would strand stale hot rows and vectors.
+    if (options?.force) {
+      try {
+        insertMessages([], { replaceSessionId: canonicalId, provenance, aliases });
+      } catch { /* best-effort clear */ }
+    }
+    return { sessionId: canonicalId, chunksCreated: 0, skipped: true, retrievalClass };
   }
 
   // 3. Resolve project_id. The Stop hook passes the session cwd explicitly;
@@ -177,37 +231,50 @@ export async function ingestSessionMessages(
 
     records.push({
       message_id: entry.uuid,
-      session_id: sessionId,
+      session_id: canonicalId,
       message_seq: i,
       message_text: text,
       project_id: projectId,
       created_at: createdAt,
       message_role: entry.message?.role ?? entry.type ?? null,
+      retrieval_class: retrievalClass,
     });
   }
 
   if (records.length === 0) {
-    return { sessionId, chunksCreated: 0, skipped: true };
+    if (options?.force) {
+      try {
+        insertMessages([], { replaceSessionId: canonicalId, provenance, aliases });
+      } catch { /* best-effort clear */ }
+    }
+    return { sessionId: canonicalId, chunksCreated: 0, skipped: true, retrievalClass };
   }
 
-  // 6 & 7. Batch insert messages. When force is set, the session's existing
-  // rows are cleared inside the SAME transaction as the insert (atomic replace)
-  // so a crash can't leave the session transiently empty in the index.
+  // 6 & 7. Batch insert messages + provenance/aliases in ONE transaction.
+  // When force is set, the session's existing rows are cleared inside the
+  // SAME transaction as the insert (atomic replace) so a crash can't leave
+  // the session transiently empty in the index.
   try {
-    insertMessages(records, options?.force ? { replaceSessionId: sessionId } : undefined);
+    insertMessages(records, {
+      ...(options?.force ? { replaceSessionId: canonicalId } : {}),
+      provenance,
+      aliases,
+    });
   } catch (err) {
     return {
-      sessionId,
+      sessionId: canonicalId,
       chunksCreated: 0,
       skipped: false,
       error: `DB insert failed: ${err instanceof Error ? err.message : String(err)}`,
+      retrievalClass,
     };
   }
 
   return {
-    sessionId,
+    sessionId: canonicalId,
     chunksCreated: records.length,
     skipped: false,
+    retrievalClass,
   };
 }
 
@@ -313,19 +380,21 @@ export async function embedSessionMessages(
   // Only fetch messages that don't have vectors yet (unless force). The
   // correlated prev_text subquery fetches the immediately-preceding turn so
   // buildEmbedText can context-enrich short messages (embed input only).
+  // HOT-only (force included): agent leaves are never embedded — a forced
+  // re-embed of a leaf session must be a no-op, not a resurrection.
   const rows = d.all(
     force
       ? `SELECT m.message_id, m.message_text,
            (SELECT p.message_text FROM messages p
-             WHERE p.session_id = m.session_id AND p.message_seq < m.message_seq
+             WHERE p.session_id = m.session_id AND p.message_seq < m.message_seq AND p.retrieval_class = 'hot'
              ORDER BY p.message_seq DESC LIMIT 1) AS prev_text
-         FROM messages m WHERE m.session_id = ? ORDER BY m.message_seq ASC`
+         FROM messages m WHERE m.session_id = ? AND m.retrieval_class = 'hot' ORDER BY m.message_seq ASC`
       : `SELECT m.message_id, m.message_text,
            (SELECT p.message_text FROM messages p
-             WHERE p.session_id = m.session_id AND p.message_seq < m.message_seq
+             WHERE p.session_id = m.session_id AND p.message_seq < m.message_seq AND p.retrieval_class = 'hot'
              ORDER BY p.message_seq DESC LIMIT 1) AS prev_text
          FROM messages m
-         WHERE m.session_id = ?
+         WHERE m.session_id = ? AND m.retrieval_class = 'hot'
            AND NOT EXISTS (SELECT 1 FROM message_vectors mv WHERE mv.message_id = m.message_id AND mv.embed_version = ?)
          ORDER BY m.message_seq ASC`,
     force ? [sessionId] : [sessionId, EMBED_VERSION],

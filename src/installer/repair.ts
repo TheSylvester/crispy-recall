@@ -38,7 +38,11 @@ export function integrityCheck(): IntegrityResult {
   let ftsOk = true;
   let ftsError: string | undefined;
   try {
-    d.exec("INSERT INTO messages_fts(messages_fts) VALUES('integrity-check');");
+    // RANK-1 form, always: for an external-content FTS5 table the rank-less
+    // 'integrity-check' does NOT compare the index against its content source,
+    // so a filtered-view/index mismatch passes silently. rank=1 forces the
+    // comparison (empirically verified in test/unit/fts-filtered-view.test.ts).
+    d.exec("INSERT INTO messages_fts(messages_fts, rank) VALUES('integrity-check', 1);");
   } catch (e) {
     ftsOk = false;
     ftsError = (e as Error).message;
@@ -47,10 +51,12 @@ export function integrityCheck(): IntegrityResult {
   return { mainOk, mainDetail, ftsOk, ...(ftsError ? { ftsError } : {}) };
 }
 
-/** Rebuild the messages_fts index from the messages table. Idempotent. */
+/** Rebuild the messages_fts index. Idempotent. Reads the FILTERED
+ *  searchable_messages view, so a rebuild can never resurrect agent-leaf
+ *  content into default retrieval. */
 export function repairFts(): void {
   db().exec("INSERT INTO messages_fts(messages_fts) VALUES('rebuild');");
-  log({ source: 'installer/repair', level: 'info', summary: 'messages_fts rebuilt' });
+  log({ source: 'installer/repair', level: 'info', summary: 'messages_fts rebuilt (hot rows only — filtered view)' });
 }
 
 /** Drop all embeddings; the next embed-pending sweep rebuilds them. */
@@ -89,6 +95,10 @@ export async function repairFull(opts: RepairFullOptions = {}): Promise<void> {
     d.exec('DELETE FROM messages;');
     // REQUIRED: otherwise steady-state catch-up sees "no change" and reingests nothing.
     d.exec('DELETE FROM ingest_watermark;');
+    // Provenance/aliases are rebuilt by the reingest's classifier — stale rows
+    // would otherwise pin old classifications onto freshly reingested sessions.
+    d.exec('DELETE FROM session_provenance;');
+    d.exec('DELETE FROM session_aliases;');
     d.exec('COMMIT');
   } catch (e) {
     try { d.exec('ROLLBACK'); } catch { /* ignore */ }

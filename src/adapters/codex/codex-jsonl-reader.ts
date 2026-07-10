@@ -43,13 +43,25 @@ export interface CodexSessionMeta {
     branch?: string;
     repository_url?: string;
   };
+  /** Raw `payload.source` — carries subagent/thread_spawn provenance for
+   *  child rollouts (parent_thread_id, depth, agent path/type). Passed
+   *  through untyped; the session classifier parses it defensively. */
+  source?: Record<string, unknown>;
 }
 
 // ============================================================================
 // Constants
 // ============================================================================
 
-const CODEX_SESSIONS_DIR = path.join(os.homedir(), '.codex', 'sessions');
+/** ~/.codex/sessions, honoring the CODEX_HOME override — resolved lazily so a
+ *  test/sandbox env set after module import still takes effect (a module-level
+ *  const froze the REAL home and leaked reads outside sandboxes). */
+function codexSessionsDir(): string {
+  const root = process.env['CODEX_HOME'];
+  return root && root.length > 0
+    ? path.join(root, 'sessions')
+    : path.join(os.homedir(), '.codex', 'sessions');
+}
 
 /**
  * Match Codex session filenames and extract the UUID.
@@ -109,11 +121,12 @@ export function parseCodexJsonlFile(filepath: string): CodexJsonlEnvelope[] {
  */
 export function findCodexSessionFile(sessionId: string): string | null {
   try {
-    if (!fs.existsSync(CODEX_SESSIONS_DIR)) return null;
+    const sessionsDir = codexSessionsDir();
+    if (!fs.existsSync(sessionsDir)) return null;
 
     // Walk YYYY/MM/DD directory tree
-    for (const year of readdirSafe(CODEX_SESSIONS_DIR)) {
-      const yearPath = path.join(CODEX_SESSIONS_DIR, year);
+    for (const year of readdirSafe(sessionsDir)) {
+      const yearPath = path.join(sessionsDir, year);
       if (!isDirectory(yearPath)) continue;
 
       for (const month of readdirSafe(yearPath)) {
@@ -174,6 +187,9 @@ export function extractCodexSessionMeta(
       cwd: payload.cwd as string,
       cli_version: payload.cli_version as string | undefined,
       git: payload.git as CodexSessionMeta['git'],
+      ...(payload.source && typeof payload.source === 'object'
+        ? { source: payload.source as Record<string, unknown> }
+        : {}),
     };
   } catch {
     return null;
@@ -208,10 +224,11 @@ export function scanCodexSessionFiles(): Array<{
   }> = [];
 
   try {
-    if (!fs.existsSync(CODEX_SESSIONS_DIR)) return results;
+    const sessionsDir = codexSessionsDir();
+    if (!fs.existsSync(sessionsDir)) return results;
 
-    for (const year of readdirSafe(CODEX_SESSIONS_DIR)) {
-      const yearPath = path.join(CODEX_SESSIONS_DIR, year);
+    for (const year of readdirSafe(sessionsDir)) {
+      const yearPath = path.join(sessionsDir, year);
       if (!isDirectory(yearPath)) continue;
 
       for (const month of readdirSafe(yearPath)) {

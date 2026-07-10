@@ -20,7 +20,7 @@
  * @module recall/vector-search
  */
 
-import { embed } from './embedder.js';
+import { coordinatedQueryEmbed } from './query-embed-coordinator.js';
 import { quantizeToQ8, computeNorm } from './quantize.js';
 import { searchMessagesFts, searchMessagesSemantic, getEmbedVersionStats } from './message-store.js';
 import type { MessageSearchResult } from './message-store.js';
@@ -129,7 +129,10 @@ export async function dualPathSearch(
   let semanticAvailable = true;
 
   try {
-    const queryF32 = await embed(QUERY_PREFIX + query);
+    // Cross-process burst single-flight: concurrent CLI searches coalesce into
+    // at most one query-model load per overlapping batch (one-shot path only —
+    // never llama-server). Throws on terminal failure → FTS-only fallback below.
+    const queryF32 = await coordinatedQueryEmbed(QUERY_PREFIX + query);
     queryNorm = computeNorm(queryF32);
     const quantized = quantizeToQ8(queryF32);
     queryQ8 = quantized.q8;

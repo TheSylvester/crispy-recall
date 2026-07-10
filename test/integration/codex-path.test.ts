@@ -129,26 +129,46 @@ describe('codex vendor detection (stop-hook path classification)', () => {
 });
 
 describe('codex Stop payload targeting', () => {
-  it('uses the common session transcript for Stop', () => {
+  it('uses the common session transcript for Stop (root evidence forwarded)', () => {
     expect(resolveIngestTarget({
       session_id: SID,
       transcript_path: '/home/u/.codex/sessions/2026/rollout.jsonl',
     })).toEqual({
       sessionId: SID,
       transcriptPath: '/home/u/.codex/sessions/2026/rollout.jsonl',
+      hook: { payloadSessionId: SID, isSubagent: false },
     });
   });
 
-  it('uses Codex agent_id and agent_transcript_path for SubagentStop', () => {
+  it('targets the CHILD transcript for SubagentStop; agent_id is evidence, never the child id', () => {
+    // The canonical child id comes from the child transcript's own
+    // session-meta/basename (resolved in the ingest classifier) — the hook's
+    // agent_id is preserved as an alias, and payload.session_id is the PARENT.
     expect(resolveIngestTarget({
       session_id: SID,
       transcript_path: '/home/u/.codex/sessions/2026/parent.jsonl',
       agent_id: 'agent-a1b2c3',
       agent_transcript_path: '/home/u/.codex/sessions/2026/subagent.jsonl',
     })).toEqual({
-      sessionId: 'agent-a1b2c3',
+      sessionId: 'subagent',
       transcriptPath: '/home/u/.codex/sessions/2026/subagent.jsonl',
+      hook: { payloadSessionId: SID, agentId: 'agent-a1b2c3', isSubagent: true },
     });
+  });
+
+  it('SubagentStop WITHOUT agent_id still targets the child — never the parent id', () => {
+    // Regression guard for the resolveIngestTarget mis-pairing: agent_id
+    // absent used to fall back to payload.session_id (the parent), stapling
+    // child messages onto the parent session.
+    const target = resolveIngestTarget({
+      session_id: SID,
+      transcript_path: '/home/u/.codex/sessions/2026/parent.jsonl',
+      agent_transcript_path: '/home/u/.codex/sessions/2026/rollout-2026-01-01T00-00-00-11111111-2222-3333-4444-555555555555.jsonl',
+    });
+    expect(target).not.toBeNull();
+    expect(target!.sessionId).not.toBe(SID);
+    expect(target!.hook.isSubagent).toBe(true);
+    expect(target!.hook.payloadSessionId).toBe(SID);
   });
 });
 
@@ -176,10 +196,18 @@ describe('codex ingest (reader → adapter → store)', () => {
 
     const res = await ingestSessionMessages('codex-sess-1', jsonlPath, 'codex');
     expect(res.error).toBeUndefined();
+    // Canonicalization: the transcript's own session-meta UUID wins over the
+    // caller-proposed id, which is preserved as an alias.
+    expect(res.sessionId).toBe(SID);
+    const alias = getDb(dbPath()).get(
+      'SELECT session_id FROM session_aliases WHERE alias_id = ?',
+      ['codex-sess-1'],
+    ) as { session_id: string } | undefined;
+    expect(alias?.session_id).toBe(SID);
 
     const rows = getDb(dbPath()).all(
       'SELECT message_text, message_role FROM messages WHERE session_id = ? ORDER BY message_seq',
-      ['codex-sess-1'],
+      [SID],
     ) as Array<{ message_text: string; message_role: string }>;
 
     // Exactly the two text turns — tool call/result + developer + reasoning stripped.

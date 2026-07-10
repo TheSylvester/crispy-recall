@@ -29,7 +29,7 @@ import { runDir } from "../paths.js";
 import { embedSessionMessages, embedMessageBatch } from "../recall/message-ingest.js";
 import { getUnembeddedMessages } from "../recall/message-store.js";
 import { disposeEmbedder } from "../recall/embedder.js";
-import { tryAcquireEmbedLock, releaseEmbedLock, LOCK_PATH } from "../recall/embed-lock.js";
+import { tryAcquireEmbedLock, releaseEmbedLock, embedLockPath } from "../recall/embed-lock.js";
 import { mtimeScan } from "../recall/mtime-scan.js";
 
 const CATCHUP_BATCH_SIZE = 80;
@@ -58,7 +58,7 @@ const HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000;
   // look stale to a competing child. unref() so the interval doesn't keep
   // the process alive on its own.
   const heartbeat = setInterval(() => {
-    try { utimesSync(LOCK_PATH, new Date(), new Date()); } catch { /* ignore */ }
+    try { utimesSync(embedLockPath(), new Date(), new Date()); } catch { /* ignore */ }
   }, HEARTBEAT_INTERVAL_MS);
   heartbeat.unref();
 
@@ -118,4 +118,10 @@ const HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000;
     try { await disposeEmbedder(); } catch { /* ignore */ }
     releaseEmbedLock();
   }
-})();
+})().catch(() => {
+  // A throw that escapes the loop (e.g. a pending-migration fail-closed DB
+  // open inside mtimeScan) must not crash a detached background child with an
+  // unhandled rejection — exit 0 quietly; the attended migration and the
+  // next sweep pick the work back up.
+  process.exit(0);
+});

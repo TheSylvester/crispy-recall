@@ -19,7 +19,11 @@ import { readEmbedderConfig } from './config.js';
 export interface StatusReport {
   dbPath: string;
   dbSizeBytes: number;
+  /** HOT (canonical, searchable) messages — the retrieval/embedding denominator. */
   messageCount: number;
+  /** Cold agent-leaf messages: durable and explicitly readable, never searched
+   *  or embedded. Reported separately so they don't inflate the denominator. */
+  agentMessageCount: number;
   lastIngest: string | null;
   embeddingGap: { totalMessages: number; gapCount: number };
   /** Per-version vector coverage — surfaces an in-progress embed_version re-embed. */
@@ -31,7 +35,14 @@ export interface StatusReport {
 
 export function getStatus(): StatusReport {
   const d = getDb(dbPath());
-  const messageCount = (d.get('SELECT COUNT(*) AS c FROM messages') as { c: number }).c;
+  const counts = d.get(
+    `SELECT
+       COALESCE(SUM(CASE WHEN retrieval_class = 'hot' THEN 1 ELSE 0 END), 0) AS hot,
+       COALESCE(SUM(CASE WHEN retrieval_class != 'hot' THEN 1 ELSE 0 END), 0) AS agent
+     FROM messages`,
+  ) as { hot: number; agent: number };
+  const messageCount = counts.hot;
+  const agentMessageCount = counts.agent;
   const lastRow = d.get('SELECT MAX(created_at) AS m FROM messages') as { m: number | null };
   const lastIngest = lastRow.m ? new Date(lastRow.m).toISOString() : null;
   const dbSizeBytes = existsSync(dbPath()) ? statSync(dbPath()).size : 0;
@@ -53,6 +64,7 @@ export function getStatus(): StatusReport {
     dbPath: dbPath(),
     dbSizeBytes,
     messageCount,
+    agentMessageCount,
     lastIngest,
     embeddingGap,
     embedVersions,
@@ -72,7 +84,7 @@ export function printStatus(json: boolean): void {
   console.log('recall status');
   console.log('-------------');
   console.log(`DB:            ${s.dbPath} (${mb} MB)`);
-  console.log(`Messages:      ${s.messageCount}`);
+  console.log(`Messages:      ${s.messageCount} searchable${s.agentMessageCount > 0 ? ` (+${s.agentMessageCount} agent-leaf, cold/explicit-read only)` : ''}`);
   console.log(`Last ingest:   ${s.lastIngest ?? 'never'}`);
   console.log(`Embedding gap: ${s.embeddingGap.gapCount} of ${s.embeddingGap.totalMessages} unembedded`);
   if (s.embedVersions.coverage < 1) {

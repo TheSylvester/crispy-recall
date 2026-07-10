@@ -76,6 +76,24 @@ export class BindingLoadError extends Error {
   }
 }
 
+/**
+ * Typed error for a database that predates the retrieval-class schema.
+ * Normal commands FAIL CLOSED on it (no unattended rewrite); only the
+ * attended `recall install` migration path may open such a DB (via
+ * `getDb(path, { allowPendingMigration: true })`) and perform DDL. The Stop
+ * hook's existing catch-and-swallow keeps its exit-0 invariant — a pending
+ * migration never blocks the user's turn; T1 re-ingests the gap afterwards.
+ */
+export class MigrationPendingError extends Error {
+  constructor(public readonly dbPath: string) {
+    super(
+      'recall: this database needs a one-time schema migration — run `recall install` to finish it. ' +
+        '(Normal commands refuse to rewrite the index unattended.)',
+    );
+    this.name = 'MigrationPendingError';
+  }
+}
+
 /** Heuristic: does this error look like a native-binding load failure? */
 export function isBindingLoadError(e: unknown): boolean {
   if (!e || typeof e !== 'object') return false;
@@ -95,14 +113,31 @@ export function isBindingLoadError(e: unknown): boolean {
 let db: RecallDb | null = null;
 let currentDbPath: string | null = null;
 
+/** Options for getDb — only the installer's migration mode sets any of these. */
+export interface GetDbOptions {
+  /**
+   * Allow opening a database whose retrieval-class migration is pending.
+   * ONLY the attended installer migration may pass this; when the DB is
+   * pending, ensureSchema is skipped entirely (normal code performs ZERO
+   * migrating DDL — the migration module owns all DDL for old DBs).
+   */
+  allowPendingMigration?: boolean;
+}
+
 /**
  * Get or create the SQLite database singleton.
  *
  * On first call, opens the database file (creating it if needed),
  * sets concurrency pragmas, and runs schema setup. Subsequent calls
  * return the cached instance if the path matches.
+ *
+ * Old-generation databases (a `messages` table without the durable
+ * retrieval-class marker) FAIL CLOSED with MigrationPendingError — layered on
+ * top of the existing WAL gate in configurePragmas, not replacing it. Fresh
+ * empty databases initialize directly in the new schema (marker included,
+ * atomically with the DDL).
  */
-export function getDb(dbPath: string): RecallDb {
+export function getDb(dbPath: string, opts?: GetDbOptions): RecallDb {
   if (db && currentDbPath === dbPath) return db;
 
   // Close any existing connection before opening a new one
@@ -132,13 +167,60 @@ export function getDb(dbPath: string): RecallDb {
     throw e;
   }
 
-  db = createAdapter(raw);
+  const adapter = createAdapter(raw);
+
+  // Read-only marker check BEFORE any schema mutation: an old-generation DB
+  // must never be mutated by a normal command.
+  if (isRetrievalMigrationPending(adapter)) {
+    if (!opts?.allowPendingMigration) {
+      raw.close();
+      throw new MigrationPendingError(dbPath);
+    }
+    // Installer migration mode: hand back the connection with NO ensureSchema —
+    // the migration module owns every piece of DDL against an old DB.
+    db = adapter;
+    currentDbPath = dbPath;
+    log({ source: 'db', level: 'info', summary: `DB: opened pending-migration DB at ${dbPath} (installer mode)` });
+    return db;
+  }
+
+  db = adapter;
   currentDbPath = dbPath;
 
   ensureSchema(db);
   log({ source: 'db', level: 'info', summary: `DB: initialized at ${dbPath}` });
 
   return db;
+}
+
+/** The durable marker row that says the retrieval-class schema is in place. */
+export const RETRIEVAL_MIGRATION_KEY = 'retrieval_class_migration';
+
+/**
+ * Pending iff a `messages` table already exists but the durable
+ * retrieval-class marker does not say 'complete'. A fresh/empty DB is never
+ * pending (ensureSchema initializes it new-generation, marker included).
+ * Read-only — safe to run before any DDL decision.
+ */
+export function isRetrievalMigrationPending(d: RecallDb): boolean {
+  try {
+    const hasMessages = d.get(
+      `SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'messages'`,
+    );
+    if (!hasMessages) return false;
+    const hasMeta = d.get(
+      `SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_meta'`,
+    );
+    if (!hasMeta) return true;
+    const row = d.get(
+      `SELECT value FROM schema_meta WHERE key = ?`,
+      [RETRIEVAL_MIGRATION_KEY],
+    ) as { value?: string } | undefined;
+    return row?.value !== 'complete';
+  } catch {
+    // Unreadable state → treat as pending (fail closed).
+    return true;
+  }
 }
 
 /**
@@ -332,19 +414,26 @@ function cleanupWasmArtifacts(dbPath: string): void {
 // Schema — recall tables only
 // ============================================================================
 
-function ensureSchema(db: RecallDb): void {
-  // ====================================================================
-  // messages — recall message index
-  // ====================================================================
-  db.exec(`
+/**
+ * The retrieval-class schema DDL — shared verbatim between fresh-DB init
+ * (here) and the attended migration (installer/retrieval-class-migration.ts),
+ * so the two can never drift. Everything is CREATE … IF NOT EXISTS with the
+ * SAME object names and tokenizer as the pre-migration schema — an older
+ * binary's ensureSchema no-ops against a migrated DB instead of recreating
+ * unfiltered triggers beside the filtered design.
+ */
+export const RETRIEVAL_SCHEMA_DDL = {
+  /** messages + provenance tables + indexes (no FTS objects). */
+  tables: `
     CREATE TABLE IF NOT EXISTS messages (
-      message_id    TEXT PRIMARY KEY,
-      session_id    TEXT NOT NULL,
-      message_seq   INTEGER NOT NULL,
-      message_text  TEXT NOT NULL,
-      project_id    TEXT,
-      created_at    INTEGER NOT NULL,
-      message_role  TEXT,
+      message_id      TEXT PRIMARY KEY,
+      session_id      TEXT NOT NULL,
+      message_seq     INTEGER NOT NULL,
+      message_text    TEXT NOT NULL,
+      project_id      TEXT,
+      created_at      INTEGER NOT NULL,
+      message_role    TEXT,
+      retrieval_class TEXT NOT NULL DEFAULT 'hot',
       UNIQUE(session_id, message_id)
     );
 
@@ -356,99 +445,165 @@ function ensureSchema(db: RecallDb): void {
     -- embed drain and every Stop-hook catch-up. This index serves the ORDER BY so
     -- the planner walks it and early-terminates at LIMIT instead.
     CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at);
-  `);
 
-  // ====================================================================
-  // messages_fts — full-text search over messages
-  // ====================================================================
-  db.exec(`
+    -- session_provenance — durable per-session classification evidence:
+    -- canonical id, vendor, root-vs-agent kind, parent thread, hook/agent
+    -- metadata, and the transcript path → canonical id mapping that lets
+    -- later T1/mtime scans resolve a child to ONE identity.
+    CREATE TABLE IF NOT EXISTS session_provenance (
+      session_id        TEXT PRIMARY KEY,
+      vendor            TEXT NOT NULL,
+      kind              TEXT NOT NULL,
+      parent_session_id TEXT,
+      agent_depth       INTEGER,
+      agent_meta        TEXT,
+      transcript_path   TEXT,
+      updated_at        INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_provenance_path ON session_provenance(transcript_path);
+
+    -- session_aliases — alternate identifiers (e.g. a hook agent_id that
+    -- differs from the child rollout's session-meta UUID) → canonical id.
+    CREATE TABLE IF NOT EXISTS session_aliases (
+      alias_id   TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      source     TEXT,
+      created_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS schema_meta (
+      key   TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    );
+  `,
+
+  /** Filtered external-content view + FTS + four-state triggers + vocab. */
+  fts: `
+    -- Filtered external-content source: FTS5 rebuild/integrity-check read
+    -- THIS view, so 'rebuild' repopulates only hot rows and the (rank-1)
+    -- integrity check compares against the filtered corpus.
+    CREATE VIEW IF NOT EXISTS searchable_messages AS
+      SELECT rowid, message_text FROM messages WHERE retrieval_class = 'hot';
+
     CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
       message_text,
-      content=messages,
+      content=searchable_messages,
       content_rowid=rowid,
       tokenize='porter unicode61'
     );
 
-    CREATE TRIGGER IF NOT EXISTS messages_fts_ai AFTER INSERT ON messages BEGIN
+    -- Four-state trigger behavior:
+    --   insert hot → add        | insert agent → no-op
+    --   delete hot → delete     | delete agent → no-op
+    --   update hot→hot → delete old + add new
+    --   update hot→agent → delete old only
+    --   update agent→hot → add new only
+    --   update agent→agent → no-op
+    CREATE TRIGGER IF NOT EXISTS messages_fts_ai AFTER INSERT ON messages
+      WHEN new.retrieval_class = 'hot'
+    BEGIN
       INSERT INTO messages_fts(rowid, message_text) VALUES (new.rowid, new.message_text);
     END;
 
-    CREATE TRIGGER IF NOT EXISTS messages_fts_ad AFTER DELETE ON messages BEGIN
+    CREATE TRIGGER IF NOT EXISTS messages_fts_ad AFTER DELETE ON messages
+      WHEN old.retrieval_class = 'hot'
+    BEGIN
       INSERT INTO messages_fts(messages_fts, rowid, message_text)
       VALUES ('delete', old.rowid, old.message_text);
     END;
 
     CREATE TRIGGER IF NOT EXISTS messages_fts_au AFTER UPDATE ON messages BEGIN
       INSERT INTO messages_fts(messages_fts, rowid, message_text)
-      VALUES ('delete', old.rowid, old.message_text);
-      INSERT INTO messages_fts(rowid, message_text) VALUES (new.rowid, new.message_text);
+        SELECT 'delete', old.rowid, old.message_text WHERE old.retrieval_class = 'hot';
+      INSERT INTO messages_fts(rowid, message_text)
+        SELECT new.rowid, new.message_text WHERE new.retrieval_class = 'hot';
     END;
-  `);
 
-  // ====================================================================
-  // messages_fts_vocab — term statistics for IDF-based query filtering
-  // ====================================================================
-  db.exec(`
     CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts_vocab
       USING fts5vocab(messages_fts, 'row');
-  `);
+  `,
+} as const;
 
-  // ====================================================================
-  // _stem — helper table to resolve porter stems via FTS5's own tokenizer
-  // ====================================================================
-  db.exec(`
-    CREATE VIRTUAL TABLE IF NOT EXISTS _stem USING fts5(
-      t, tokenize='porter unicode61'
-    );
-    CREATE VIRTUAL TABLE IF NOT EXISTS _stem_vocab
-      USING fts5vocab(_stem, 'row');
-  `);
+function ensureSchema(db: RecallDb): void {
+  // One transaction: a crash between "CREATE TABLE messages" and the marker
+  // write would otherwise make a half-initialized FRESH DB look like a
+  // pending-migration OLD DB to the next opener. DDL is transactional in
+  // SQLite, so fresh init is atomic (concurrent openers serialize on the
+  // write lock and each statement is IF NOT EXISTS).
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    db.exec(RETRIEVAL_SCHEMA_DDL.tables);
+    db.exec(RETRIEVAL_SCHEMA_DDL.fts);
 
-  // ====================================================================
-  // message_vectors — embedding vectors for semantic search
-  // ====================================================================
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS message_vectors (
-      message_id    TEXT PRIMARY KEY REFERENCES messages(message_id) ON DELETE CASCADE,
-      embedding_q8  BLOB NOT NULL,
-      norm          REAL NOT NULL,
-      quant_scale   REAL NOT NULL,
-      embed_version INTEGER NOT NULL DEFAULT 1
-    );
-  `);
+    // ====================================================================
+    // _stem — helper table to resolve porter stems via FTS5's own tokenizer
+    // ====================================================================
+    db.exec(`
+      CREATE VIRTUAL TABLE IF NOT EXISTS _stem USING fts5(
+        t, tokenize='porter unicode61'
+      );
+      CREATE VIRTUAL TABLE IF NOT EXISTS _stem_vocab
+        USING fts5vocab(_stem, 'row');
+    `);
 
-  // Idempotent, race-safe migration for existing DBs: add embed_version if
-  // absent. ensureSchema runs inside getDb(), which several processes (parallel
-  // Stop hooks, embed-pending, CLI, backfill) hit at once, so the ALTER can lose
-  // a race two ways — another process already added the column ("duplicate
-  // column name"), or the writer lock is contended (SQLITE_BUSY/"database is
-  // locked"). On ANY failure, re-check table_info: treat it as success if the
-  // column now exists; only throw if it genuinely still isn't there.
-  const hasEmbedVersion = () =>
-    (db.all(`PRAGMA table_info(message_vectors)`) as Array<{ name: string }>)
-      .some((c) => c.name === 'embed_version');
-  if (!hasEmbedVersion()) {
-    try {
-      db.exec(`ALTER TABLE message_vectors ADD COLUMN embed_version INTEGER NOT NULL DEFAULT 1`);
-    } catch (e) {
-      // A racing process may have added it, or the lock was contended. Re-check;
-      // only surface the error if the column genuinely isn't there.
-      if (!hasEmbedVersion()) throw e;
+    // ====================================================================
+    // message_vectors — embedding vectors for semantic search
+    // ====================================================================
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS message_vectors (
+        message_id    TEXT PRIMARY KEY REFERENCES messages(message_id) ON DELETE CASCADE,
+        embedding_q8  BLOB NOT NULL,
+        norm          REAL NOT NULL,
+        quant_scale   REAL NOT NULL,
+        embed_version INTEGER NOT NULL DEFAULT 1
+      );
+    `);
+
+    // Idempotent, race-safe migration for existing DBs: add embed_version if
+    // absent. ensureSchema runs inside getDb(), which several processes (parallel
+    // Stop hooks, embed-pending, CLI, backfill) hit at once, so the ALTER can lose
+    // a race two ways — another process already added the column ("duplicate
+    // column name"), or the writer lock is contended (SQLITE_BUSY/"database is
+    // locked"). On ANY failure, re-check table_info: treat it as success if the
+    // column now exists; only throw if it genuinely still isn't there.
+    const hasEmbedVersion = () =>
+      (db.all(`PRAGMA table_info(message_vectors)`) as Array<{ name: string }>)
+        .some((c) => c.name === 'embed_version');
+    if (!hasEmbedVersion()) {
+      try {
+        db.exec(`ALTER TABLE message_vectors ADD COLUMN embed_version INTEGER NOT NULL DEFAULT 1`);
+      } catch (e) {
+        // A racing process may have added it, or the lock was contended. Re-check;
+        // only surface the error if the column genuinely isn't there.
+        if (!hasEmbedVersion()) throw e;
+      }
     }
-  }
 
-  // ====================================================================
-  // ingest_watermark — steady-state catch-up tracking (plan §5.4 / §5.14
-  // justified deviation #2). The only documented schema addition for
-  // the standalone.
-  // ====================================================================
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS ingest_watermark (
-      transcript_path TEXT PRIMARY KEY,
-      last_mtime      INTEGER NOT NULL,
-      last_size       INTEGER NOT NULL,
-      vendor          TEXT NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS idx_watermark_vendor ON ingest_watermark(vendor);
-  `);
+    // ====================================================================
+    // ingest_watermark — steady-state catch-up tracking (plan §5.4 / §5.14
+    // justified deviation #2).
+    // ====================================================================
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS ingest_watermark (
+        transcript_path TEXT PRIMARY KEY,
+        last_mtime      INTEGER NOT NULL,
+        last_size       INTEGER NOT NULL,
+        vendor          TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_watermark_vendor ON ingest_watermark(vendor);
+    `);
+
+    // Marker LAST, inside the same transaction as the DDL: a fresh DB is
+    // either fully new-generation (marker present) or absent — never a state
+    // a concurrent opener could misread as "pending migration".
+    db.exec(`
+      INSERT OR IGNORE INTO schema_meta(key, value)
+      VALUES ('${RETRIEVAL_MIGRATION_KEY}', 'complete');
+    `);
+
+    db.exec('COMMIT');
+  } catch (e) {
+    try { db.exec('ROLLBACK'); } catch { /* ignore */ }
+    throw e;
+  }
 }
