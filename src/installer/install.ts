@@ -33,10 +33,7 @@ import {
   codexAgentsPath, codexHooksPath, codexRecallSkillPath,
   type PreflightReport,
 } from './preflight.js';
-import {
-  retrievalMigrationPending, runRetrievalClassMigration, RetrievalMigrationAbort,
-  type RetrievalMigrationResult,
-} from './retrieval-class-migration.js';
+import type { RetrievalMigrationResult } from './retrieval-class-migration.js';
 import { buildManifest, renderManifest } from './manifest.js';
 import { runGpuPhase, type GpuPhaseResult, type GpuProbeArgs, type OffloadProbeResult } from './gpu.js';
 import { mergeStopHook, removeStopHook, backupFile, mergeStatusLine, removeStatusLine } from './settings-merge.js';
@@ -387,7 +384,12 @@ export async function runInstall(opts: InstallOptions = {}): Promise<InstallResu
   const migration = classifyUpgrade();
   // Retrieval-class schema migration pending? (read-only probe; the actual
   // rewrite runs attended in phase 6.7 below.)
-  const retrievalPending = retrievalMigrationPending();
+  // Keep the migration module out of fresh-install subprocesses. Its broad
+  // native/module graph can destabilize rapid better-sqlite3 fork teardown.
+  const retrievalMigration = existsSync(dbPath())
+    ? await import('./retrieval-class-migration.js')
+    : undefined;
+  const retrievalPending = retrievalMigration?.retrievalMigrationPending() ?? false;
 
   const filesWritten: string[] = [];
   let gpu: GpuPhaseResult = { mode: 'cpu', libDir: null, ngl: 0, cudaAvailable: 'none' };
@@ -560,7 +562,7 @@ export async function runInstall(opts: InstallOptions = {}): Promise<InstallResu
     // purge + durable marker in ONE transaction. Idempotent on re-run.
     if (retrievalPending) {
       try {
-        retrieval = await runRetrievalClassMigration();
+        retrieval = await retrievalMigration!.runRetrievalClassMigration();
         if (retrieval.performed) {
           say(
             `retrieval-class migration: ${retrieval.agentSessions} agent sessions reclassified ` +
@@ -571,7 +573,7 @@ export async function runInstall(opts: InstallOptions = {}): Promise<InstallResu
           );
         }
       } catch (e) {
-        const remediation = e instanceof RetrievalMigrationAbort
+        const remediation = e instanceof retrievalMigration!.RetrievalMigrationAbort
           ? e.message
           : `Retrieval-class migration failed (${(e as Error).message}). The transaction rolled back — ` +
             'your data is unchanged. Re-run `recall install` to retry; `recall doctor --integrity` to inspect.';
