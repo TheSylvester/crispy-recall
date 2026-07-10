@@ -49,7 +49,23 @@ import { join } from 'node:path';
 // Constants
 // ---------------------------------------------------------------------------
 
-const UUID_PREFIX = /^[0-9a-f]{8}/i;
+/**
+ * "Session-shaped" — the NARROW test that routes an implicit positional to a
+ * read instead of a search. A positional qualifies only if it contains no
+ * whitespace and matches either:
+ *   - an 8+ hex-char UUID prefix (up to a full 36-char UUID), or
+ *   - the stored `agent-<hex>` leaf pattern (NOT any string beginning
+ *     "agent-": `recall agent-based retrieval` must remain a search).
+ * Anything else falls through to search. Opaque/descriptive references that
+ * don't fit this shape are still readable via the explicit `recall read`
+ * form, and a search can always be forced with `recall search …`.
+ */
+const UUIDISH_SESSION = /^[0-9a-f]{8}[0-9a-f-]{0,28}$/i;
+const AGENT_SESSION = /^agent-[0-9a-f]+$/i;
+
+function isSessionShaped(s: string): boolean {
+  return UUIDISH_SESSION.test(s) || AGENT_SESSION.test(s);
+}
 
 // ---------------------------------------------------------------------------
 // Args
@@ -162,8 +178,14 @@ recall — Unified CLI — session transcript memory.
 
 USAGE
   recall "query"                     Search sessions by text
+  recall search <terms…>             Search explicitly (escape hatch when a
+                                     term looks like a session/message ID)
   recall <session-id>                Read messages from a session
   recall <session-id> <message-id>   Read centered on matched message
+  recall read <session-ref> [<message-ref>]
+                                     Explicit read — references are opaque
+                                     stored IDs or literal prefixes; a failed
+                                     read exits nonzero (never searches)
   recall --list                      List recent sessions
   recall --commit <hash>             Sessions that produced a commit
   recall --blame <path>[:<line>[-<line>]]...  Sessions responsible for a file
@@ -175,8 +197,16 @@ USAGE
 
 ARGUMENTS
   query         Free-text search (FTS5 + optional semantic)
-  session-id    Full or prefix UUID of a session
-  message-id    Full or prefix UUID of a message within the session
+  session-id    Full stored session ID or a literal prefix of one. IDs are
+                opaque — UUIDs and agent-<hex> subagent leaves both work.
+  message-id    Full stored message ID or a literal prefix, resolved within
+                the session. Opaque — non-UUID IDs (e.g. codex-jsonl-*) work.
+
+  Displayed IDs always round-trip: any session/message reference shown by
+  search, list, or read output can be passed back to the CLI as-is.
+  Bare-word dispatch only treats a first argument as a session reference if
+  it looks like a UUID prefix (8+ hex chars) or agent-<hex>; anything else
+  searches. Use \`recall read\` / \`recall search\` to force either mode.
 
 FLAGS
   --limit N        Max results for search/list modes (search: 200, list: 50)
@@ -254,41 +284,125 @@ function initDb() {
   getDb(getDbPath());
 }
 
-/** Resolve a session ID prefix to a full UUID via the messages table. */
-function resolveSessionId(prefix: string): string {
-  const clean = prefix.trim().replace(/[^0-9a-f-]/gi, '');
-  if (clean.length >= 36) return clean.slice(0, 36);
-  const rows = getDb(getDbPath()).all(
-    'SELECT DISTINCT session_id FROM messages WHERE session_id LIKE ? ORDER BY session_id ASC LIMIT 2',
-    [`${clean}%`],
-  ) as { session_id: string }[];
-  if (rows.length === 0) {
-    console.error(`No session found matching prefix: ${prefix}`);
-    exit(1);
-  }
-  if (rows.length > 1) {
-    console.error(`Ambiguous prefix "${prefix}" — matches multiple sessions:`);
-    for (const r of rows) console.error(`  ${r.session_id}`);
-    exit(1);
-  }
-  return rows[0]!.session_id;
+/** Cap on candidate IDs printed for an ambiguous reference. */
+const AMBIGUITY_LIST_MAX = 20;
+
+/** How the user can force a search when a reference was misread as an ID. */
+function searchEscapeHint(): string {
+  return `To search for these terms instead, run: recall search ${positional.join(' ')}`;
 }
 
-/** Resolve a message ID prefix to a full UUID within a session. */
-function resolveMessageId(sessionId: string, prefix: string): string {
-  const clean = prefix.trim().replace(/[^0-9a-f-]/gi, '');
-  if (clean.length >= 36) return clean.slice(0, 36);
-  const rows = getDb(getDbPath()).all(
-    'SELECT DISTINCT message_id FROM messages WHERE session_id = ? AND message_id LIKE ? ORDER BY message_id ASC LIMIT 2',
-    [sessionId, `${clean}%`],
+/**
+ * Resolve a stored session reference LITERALLY: exact stored ID first, then
+ * exact alias (e.g. a hook agent_id recorded for a canonical Codex child),
+ * then literal prefix over stored IDs and aliases. No character class is
+ * assumed — `agent-*`, uppercase, `%`, `_`, and hyphens are all taken as-is
+ * (prefix matching uses substr(), never LIKE, so no wildcard semantics leak).
+ * A reference that does not resolve is an ID error (exit 1) — it must never
+ * silently become a semantic search.
+ */
+function resolveSessionRef(ref: string): string {
+  const d = getDb(getDbPath());
+  const t = ref.trim();
+  if (!t) {
+    console.error('Empty session reference.');
+    exit(1);
+  }
+
+  // Exact stored ID.
+  if (d.get('SELECT 1 FROM messages WHERE session_id = ? LIMIT 1', [t])) return t;
+
+  // Exact alias → canonical (session_aliases may predate this schema; tolerate absence).
+  const viaAlias = lookupAliasExact(t);
+  if (viaAlias) return viaAlias;
+
+  // Literal prefix over stored IDs ∪ alias IDs (mapped to canonical).
+  const candidates = new Set<string>();
+  const rows = d.all(
+    `SELECT DISTINCT session_id FROM messages
+     WHERE substr(session_id, 1, ?) = ?
+     ORDER BY session_id ASC LIMIT ${AMBIGUITY_LIST_MAX + 1}`,
+    [t.length, t],
+  ) as { session_id: string }[];
+  for (const r of rows) candidates.add(r.session_id);
+  for (const canonical of lookupAliasPrefix(t)) candidates.add(canonical);
+
+  if (candidates.size === 0) {
+    console.error(`No session found matching "${ref}".`);
+    console.error(searchEscapeHint());
+    exit(1);
+  }
+  if (candidates.size > 1) {
+    console.error(`Ambiguous session reference "${ref}" — matches multiple sessions:`);
+    for (const id of [...candidates].sort().slice(0, AMBIGUITY_LIST_MAX)) console.error(`  ${id}`);
+    if (candidates.size > AMBIGUITY_LIST_MAX) console.error(`  …and ${candidates.size - AMBIGUITY_LIST_MAX} more`);
+    console.error(searchEscapeHint());
+    exit(1);
+  }
+  return [...candidates][0]!;
+}
+
+/** Exact alias lookup; null when absent (or on a pre-migration DB without the table). */
+function lookupAliasExact(aliasId: string): string | null {
+  try {
+    const row = getDb(getDbPath()).get(
+      'SELECT session_id FROM session_aliases WHERE alias_id = ?',
+      [aliasId],
+    ) as { session_id: string } | undefined;
+    return row?.session_id ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** Alias prefix lookup → canonical session IDs (empty on a pre-migration DB). */
+function lookupAliasPrefix(prefix: string): string[] {
+  try {
+    const rows = getDb(getDbPath()).all(
+      `SELECT DISTINCT session_id FROM session_aliases
+       WHERE substr(alias_id, 1, ?) = ?
+       ORDER BY session_id ASC LIMIT ${AMBIGUITY_LIST_MAX + 1}`,
+      [prefix.length, prefix],
+    ) as { session_id: string }[];
+    return rows.map((r) => r.session_id);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Resolve a message reference within the (already canonical) session:
+ * exact stored ID first, then literal prefix. Opaque — `codex-jsonl-*` and
+ * other non-UUID IDs resolve like any other string.
+ */
+function resolveMessageRef(sessionId: string, ref: string): string {
+  const d = getDb(getDbPath());
+  const t = ref.trim();
+  if (!t) {
+    console.error('Empty message reference.');
+    exit(1);
+  }
+
+  if (d.get('SELECT 1 FROM messages WHERE session_id = ? AND message_id = ? LIMIT 1', [sessionId, t])) {
+    return t;
+  }
+
+  const rows = d.all(
+    `SELECT DISTINCT message_id FROM messages
+     WHERE session_id = ? AND substr(message_id, 1, ?) = ?
+     ORDER BY message_id ASC LIMIT ${AMBIGUITY_LIST_MAX + 1}`,
+    [sessionId, t.length, t],
   ) as { message_id: string }[];
+
   if (rows.length === 0) {
-    console.error(`No message found in session ${sessionId.slice(0, 8)} matching prefix: ${prefix}`);
+    console.error(`No message found in session ${sessionId} matching "${ref}".`);
+    console.error(searchEscapeHint());
     exit(1);
   }
   if (rows.length > 1) {
-    console.error(`Ambiguous message ID prefix "${prefix}" — matches multiple messages:`);
-    for (const r of rows) console.error(`  ${r.message_id}`);
+    console.error(`Ambiguous message reference "${ref}" — matches multiple messages in session ${sessionId}:`);
+    for (const r of rows.slice(0, AMBIGUITY_LIST_MAX)) console.error(`  ${r.message_id}`);
+    if (rows.length > AMBIGUITY_LIST_MAX) console.error(`  …and more`);
     exit(1);
   }
   return rows[0]!.message_id;
@@ -313,8 +427,10 @@ function runList() {
     return;
   }
 
-  // Table output
-  const idW = 10;
+  // Table output — session IDs are shown IN FULL (dynamic width) so every
+  // displayed reference is copy-pasteable back into the CLI. IDs are opaque
+  // (UUIDs, agent-<hex>, …); fixed truncation would break round-tripping.
+  const idW = Math.max('Session'.length, ...sessions.map((s) => s.session_id.length)) + 2;
   const dateW = 12;
   const msgsW = 6;
 
@@ -324,14 +440,14 @@ function runList() {
     'Msgs'.padStart(msgsW) + '  ' +
     'Title'
   );
-  console.log('-'.repeat(70));
+  console.log('-'.repeat(idW + dateW + msgsW + 10));
 
   for (const s of sessions) {
     const date = s.last_activity
       ? new Date(s.last_activity).toISOString().slice(0, 10)
       : 'unknown';
     console.log(
-      s.session_id.slice(0, 8).padEnd(idW) +
+      s.session_id.padEnd(idW) +
       date.padEnd(dateW) +
       String(s.message_count).padStart(msgsW) + '  ' +
       (s.title || '(untitled)')
@@ -718,9 +834,13 @@ async function runSearch(query: string) {
     }
     console.log('---');
 
+    // Session/message references are shown IN FULL with dynamic column widths
+    // so every displayed row round-trips into `recall <session> <message>`.
+    // IDs are opaque (UUIDs, agent-<hex>, codex-jsonl-*, …) — fixed 8-char
+    // truncation produced ambiguous, non-resolvable references.
     const rankW = 4;
-    const idW = 10;
-    const msgW = 10;
+    const idW = Math.max('Session'.length, ...page.map((s) => s.session_id.length)) + 2;
+    const msgW = Math.max('Msg'.length, ...page.map((s) => s.best_message_id.length)) + 2;
     const dateW = 12;
     const tagW = 17;
     const hitsW = 6;
@@ -738,8 +858,8 @@ async function runSearch(query: string) {
     for (const s of page) {
       console.log(
         String(s.rank).padStart(rankW) + '  ' +
-        s.short_id.padEnd(idW) +
-        s.best_message_id.slice(0, 8).padEnd(msgW) +
+        s.session_id.padEnd(idW) +
+        s.best_message_id.padEnd(msgW) +
         s.date.padEnd(dateW) +
         s.tag.padEnd(tagW) +
         String(s.hits).padStart(hitsW) + '  ' +
@@ -1112,19 +1232,47 @@ async function main() {
     exit(0);
   }
 
-  // Two UUID-like positional args → turn read
-  if (positional.length >= 2 && UUID_PREFIX.test(positional[0]!) && UUID_PREFIX.test(positional[1]!)) {
-    initDb();
-    const sessionId = resolveSessionId(positional[0]!);
-    const messageId = resolveMessageId(sessionId, positional[1]!);
-    runReadTurn(sessionId, messageId);
+  // Explicit read: `recall read <session-ref> [<message-ref>]`. References are
+  // OPAQUE stored IDs or literal prefixes — no shape requirement, so
+  // descriptive agent IDs and other non-UUID identifiers are reachable here.
+  // A failed explicit read always exits nonzero; it never becomes a search.
+  if (positional[0] === 'read') {
+    const refs = positional.slice(1);
+    if (refs.length === 0 || refs.length > 2) {
+      console.error(`recall read takes a session reference and an optional message reference (${refs.length} given).`);
+      console.error('Usage: recall read <session-ref> [<message-ref>]');
+      exit(1);
+    }
+    runRead(refs[0]!, refs[1]);
     exit(0);
   }
 
-  // Single UUID-like positional arg → session read
-  if (positional.length === 1 && UUID_PREFIX.test(positional[0]!)) {
-    initDb();
-    runReadSession(resolveSessionId(positional[0]!));
+  // Explicit search: `recall search <terms…>` — the documented escape hatch
+  // when a query would otherwise be captured by read dispatch (e.g. a leading
+  // hex-shaped or agent-<hex>-shaped token).
+  if (positional[0] === 'search') {
+    const query = positional.slice(1).join(' ');
+    if (!query) {
+      console.error('recall search requires at least one term. Usage: recall search <terms…>');
+      exit(1);
+    }
+    await runSearch(query);
+    exit(0);
+  }
+
+  // Implicit read dispatch — only for narrowly session-shaped first tokens
+  // (see isSessionShaped). Exactly one positional → session read; exactly two
+  // → centered read with the second treated as an OPAQUE message reference
+  // (no UUID grammar — codex-jsonl-* etc. resolve literally). Three or more
+  // positionals in a read shape are an error, never truncated to two.
+  if (positional.length >= 1 && isSessionShaped(positional[0]!)) {
+    if (positional.length > 2) {
+      console.error(`"${positional[0]}" looks like a session reference, but ${positional.length} positional arguments were given — reads take at most a session and a message reference.`);
+      console.error(`  To read:   recall read ${positional[0]} [<message-ref>]`);
+      console.error(`  To search: recall search ${positional.join(' ')}`);
+      exit(1);
+    }
+    runRead(positional[0]!, positional[1]);
     exit(0);
   }
 
@@ -1137,6 +1285,18 @@ async function main() {
 
   await runSearch(query);
   exit(0);
+}
+
+/** Shared read driver: resolve refs literally, then read/center. */
+function runRead(sessionRef: string, messageRef?: string): void {
+  initDb();
+  const sessionId = resolveSessionRef(sessionRef);
+  if (messageRef !== undefined) {
+    const messageId = resolveMessageRef(sessionId, messageRef);
+    runReadTurn(sessionId, messageId);
+  } else {
+    runReadSession(sessionId);
+  }
 }
 
 main()

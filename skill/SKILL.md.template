@@ -62,8 +62,15 @@ CLI usage:
   $RECALL_BIN <session-id> <message-id>   Read centered on matched message (use this after search)
   $RECALL_BIN <session-id>                Read from beginning (only when you need full arc)
   $RECALL_BIN <session-id> --offset N     Continue reading from offset N (shown in output footer)
+  $RECALL_BIN read <session-ref> [<message-ref>]  Explicit read for any stored ID (opaque; exits
+                                          nonzero on failure — never falls back to search)
+  $RECALL_BIN search <terms...>           Force a search when a term looks like an ID
   $RECALL_BIN --list --since YYYY-MM-DD   List recent sessions
   $RECALL_BIN --help                      Full flag reference
+
+Session/message IDs are OPAQUE strings (UUIDs, agent-<hex> subagent leaves,
+codex-jsonl-* message ids). Paste them back exactly as displayed — full ID or
+a literal prefix both resolve.
 
 DATE HANDLING: Any date the user mentions MUST become a flag — never search text:
   --since YYYY-MM-DD   Only sessions on or after this date
