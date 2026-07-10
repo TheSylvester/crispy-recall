@@ -1,280 +1,267 @@
 # crispy-recall
 
-Searchable memory for your Claude Code and Codex sessions. Local, fast, no daemon.
+**Save every session. Recall any conversation. Continue where you left off.**
 
-**Status:** in development.
+Each conversation with your agent lands in a transcript on disk, waiting for Claude Code's [startup cleanup (30 days by default)](https://code.claude.com/docs/en/settings) to delete it. recall indexes user and assistant turns as they end — verbatim, on your machine — so your agent can search, read, and continue the conversation even after its transcript is gone.
 
-A standalone spin-off of the recall feature from [Crispy](https://github.com/TheSylvester/crispy). See the parent project for the broader multi-agent orchestration GUI.
+**Local session memory for Claude Code, with Codex support.** Hybrid text and semantic search. Verbatim conversation history.
 
-## What's new in 0.2.2
+No daemon, no cron, no cloud. A Stop hook and a SQLite file.
 
-- **Opt-in statusline: the session id in your Claude Code status bar.** The
-  session id is recall's primary key — `recall <id>` reads that session, and
-  it's how you hand a conversation to another agent or pick it up tomorrow.
-  `recall install --statusline` puts `🔗 <session_id>` in the status bar so the
-  id of the session you're looking at is always one glance away. Off by
-  default, and it **never overwrites an existing statusline**: recall writes
-  only into an empty slot; if you already have one, it prints two ways to add
-  the id yourself (a paste-ready snippet for your script, or a ready-to-run
-  `claude -p` prompt) and changes nothing. `recall statusline --suggest`
-  re-prints that guidance anytime; `recall uninstall` removes the statusline
-  cleanly if recall installed it. See
-  [Session id in the status bar](#session-id-in-the-status-bar-statusline).
+## Quick start
 
-## What's new in 0.2.1
-
-- **macOS install support.** 0.2.0's native SQLite engine shipped without ever
-  running on Apple hardware; 0.2.1 fixes the macOS install path and validates it
-  end-to-end on Apple Silicon. Fixes: a pre-flight macOS-version check (the
-  bundled llama.cpp embedding binaries need macOS 14+ on arm64, 13.7+ on Intel),
-  a Node path that stays valid across `brew upgrade node` during in-place
-  upgrades (it previously pinned a Homebrew Cellar path that a later upgrade
-  removes), an up-front rejection of Node 23 (no prebuilt SQLite binding) with an
-  explanation instead of a late failure, and a load-check of the staged SQLite
-  binding before the installer trusts it. Non-macOS installs are unaffected.
-- **`recall install` no longer hangs during setup.** Extraction of the embedding
-  binaries is now time-boxed with a fallback to the OS unzip tool
-  (`unzip`/`ditto`/`Expand-Archive`), so a stalled extract can no longer wedge
-  the installer.
-
-## What's new in 0.2.0
-
-- **Native SQLite engine with real WAL.** The database now runs on
-  better-sqlite3 with write-ahead logging instead of the previous WebAssembly
-  binding — which never actually engaged WAL and could silently corrupt the
-  index when multiple processes wrote at once. That failure mode is eliminated
-  at the root. `recall doctor` gains a SQLite-binding health section.
-  **Node.js 22 LTS (≥ 22.16) or 24+ is now required** (Node 23 has no prebuilt
-  SQLite binding).
-- **Git provenance: `--commit` and `--blame`.** `recall --commit <hash>` lists
-  the session(s) that produced a commit; `recall --blame <path>[:line[-line]]`
-  traces a file or line range back to the conversations responsible. Matching
-  is structural (your sessions' actual edits vs the commit's diff), not
-  timestamp-based. These flags were documented in the skill but missing from
-  the shipped CLI; they now work as documented.
-- **Better semantic retrieval (embedding v3).** Stored messages and queries now
-  carry the task prefixes the embedding model was trained on, and short turns
-  (one-line answers, approvals, decisions) are embedded together with their
-  preceding context so they're finally findable by meaning. Measurably improves
-  retrieval on the LoCoMo benchmark (recall@5 54.9 → 58.4).
-- **Semantic search stays available during migrations.** Upgrading re-embeds
-  your history in the background; until it finishes, search transparently
-  blends old- and new-format vectors and tags output with
-  `(migrating: N% re-embedded)` instead of going dark.
-- **Relevance-first ranking.** The hidden age penalty is off by default —
-  older sessions now rank purely by relevance (previously the right old result
-  could rank 2× worse just for being old). Pass `--recent` to prefer newer
-  sessions explicitly.
-- **Faster indexing on large databases.** A new index removes a full-table
-  scan from every embedding batch and end-of-turn catch-up (~0.3 s → ~0.05 s
-  at ~287K messages). Created automatically on first run.
-- **Safe in-place upgrade for existing installs.** `recall install` migrates
-  an existing database in place: rollback snapshot → WAL conversion →
-  integrity check with auto-repair → background re-embed. See
-  [Upgrading from 0.1.x](#upgrading-from-01x).
-- **New scripting flags.** `--raw-messages` (full ranked per-message JSON) and
-  `--no-idf` (keep common words in keyword search), both off by default.
-
-## Install
-
-Install the command globally, then run the one-time setup:
+Requires Claude Code and either Node.js 22 LTS (`>=22.16`) or Node.js 24+. Install recall in the same environment where you run Claude Code:
 
 ```bash
 npm install -g crispy-recall
 recall install
 ```
 
-`recall install` is the resident setup step. It scaffolds `~/.recall/` (the
-llama embedding binary, the model, and the SQLite DB), wires Stop and
-SubagentStop hooks into Claude Code, and installs the `recall` skill. If Codex
-is detected, it gets the same automatic hooks plus the skill. After that,
-transcripts are indexed as turns finish and recall runs passively — you only
-invoke `recall` directly for `status`, `doctor`, `repair`, or `uninstall`.
+recall downloads a local embedding runtime and model, sets up a `Stop` hook in Claude Code, installs the recall Agent Skill, and starts indexing the session history still on disk. If Codex is detected, recall sets up the same integration there.
 
-Run it in the environment where you actually use Claude Code: **WSL and
-Windows-native are separate installs.** If you use both, run the install in each
-— the installer only configures the environment it is invoked in.
+## How to use recall
 
-> **macOS: use Node 22 LTS or 24+.** Node 23 has no prebuilt SQLite binding, so
-> `npm install -g` would fall back to compiling it and fail without Xcode
-> Command Line Tools. macOS 14+ (Apple Silicon) / 13.7+ (Intel) is required for
-> the bundled semantic-embedding binaries.
+### Ask your agent
 
-> **Don't install via `npx`.** recall must stay resident. `npx` runs from an
-> ephemeral cache and leaves no `recall` command on your PATH, so follow-up
-> commands (`recall status` / `doctor` / `repair` / `uninstall`) and the
-> installed skill's command contract have nothing to call. Use the global
-> install above.
+**Your agent starts every session from zero — until you say the word.**
 
-Prerequisites: Node 22 LTS (≥ 22.16) or 24+ — Node 23 is unsupported (no
-prebuilt SQLite binding) — and Claude Code installed. If Codex is detected
-(`~/.codex/` exists), recall installs its lifecycle hooks in
-`~/.codex/hooks.json` and the `recall` skill so Codex sessions are indexed and
-searchable automatically.
+The word is `recall`. Say it in a prompt and your agent goes and gets exactly what it needs: a top-level conversation by UUID, messages by keyword or meaning, or the Claude Code session that wrote the code behind a commit.
 
-### Upgrading from 0.1.x
+Use it naturally:
+
+| Say this | What your agent can recover |
+|---|---|
+| `Recall where we left off.` | The decisions, unfinished work, and next step from prior sessions. |
+| `Recall — we solved this before.` | The earlier fix, even when your new wording doesn't match the transcript. |
+| `Recall <session-uuid> and continue.` | A UUID-backed conversation in a fresh session, centered on the relevant part. |
+| `Recall why this line exists.` | The session behind a commit or line, including alternatives discussed at the time. |
+
+The installed skill teaches Claude Code and Codex when and how to search, so your agent can invoke recall without you typing a special command.
+
+### Use the CLI directly
+
+Search first:
+
+```bash
+recall "why did we choose this retry policy?"
+```
+
+Every result includes a session id and the matched message id. For UUID-based Claude Code results, read the promising result centered on the match:
+
+```bash
+recall <session-uuid> <message-uuid>
+```
+
+Search defaults to the current project's sessions. Expand only when needed:
+
+```bash
+recall --all "the decision may have happened in another repo"
+recall --project ~/dev/other-repo "the decision"
+recall "the latest release issue" --recent
+```
+
+recall surfaces evidence, not truth. Good agents check recovered context against git HEAD, the current files, and fresh tests before acting on it.
+
+## Why recall?
+
+> My agent burned 20 minutes re-diagnosing a failure. The one-line fix sat in 24 prior sessions.
+
+So I built crispy-recall — local, verbatim search across my agent's past sessions.
+
+Your agent doesn't need to guess what will matter later. It needs a way to search what actually happened once the question becomes clear.
+
+## What makes recall different
+
+### The conversation, not a summary
+
+recall keeps the user and assistant conversation word-for-word. It doesn't replace the record with a model's guess about which details might matter later.
+
+That distinction matters when you need the exact constraint, command, promise, rejected idea, or one-line fix that a summary would reasonably discard.
+
+**`/compact` summarizes. recall quotes.**
+
+Auto-memory saves what you knew to keep. recall finds what you didn't know you'd need. They complement each other: one keeps selected facts close; the other searches the verbatim conversation record on demand.
+
+Tool calls, tool output, and hidden thinking are intentionally excluded from the searchable conversation. Tool output is re-runnable; the conversation that interpreted it isn't.
+
+### Continue without replaying the session
+
+Read a past conversation by UUID-shaped session id:
+
+```text
+Recall fe6cc221-2e63-4928-8417-65ec1587d062 and continue the release.
+```
+
+recall reads the indexed conversation instead of replaying an entire raw transcript. Reads can open on the matched message, paginate forward, and combine context from several past sessions. That means your agent can recover the few facts that matter without pouring every old tool result back into its context window.
+
+`/resume` dies with the transcript; recall doesn't. recall reads the relevant indexed turns instead of replaying one whole session, and it can combine facts from other sessions.
+
+### From a line of code back to the conversation
+
+`git blame` can tell you who changed a line. `recall --blame` can take you back to the conversation that produced it.
+
+```bash
+recall --commit 25dd0f8
+recall --blame src/paths.ts:82-84
+recall --blame src/foo.ts:42 src/bar.ts:10-20 --limit 20
+```
+
+Matching is structural: recall compares edits recorded in sessions with commit diffs instead of guessing from timestamps. A commit message summarizes intent; the conversation holds the reasoning, tradeoffs, and rejected alternatives.
+
+Commit and blame attribution currently scans Claude Code transcripts. Codex sessions remain searchable by text and meaning, but aren't yet attributed to commits.
+
+**`git blame` tells you who. `recall --blame` tells you why.**
+
+### Search for the idea, not just the words
+
+You rarely remember the exact phrase an agent used three weeks ago. recall searches two ways at once:
+
+- SQLite FTS5 finds exact words and phrases quickly.
+- Local semantic embeddings find the same idea under different wording.
+- Rank fusion combines both result sets.
+- Project scoping keeps everyday searches focused; `--all` crosses repositories when the project itself is the thing you forgot.
+
+```bash
+recall "the mac installer hang we fixed"
+recall --all "why we stopped using the wasm sqlite binding"
+recall --project ~/dev/my-app "booking slot id decision"
+```
+
+### Grep is still the right tool sometimes
+
+If you know the exact string and the transcript still exists, use grep. recall earns its keep when:
+
+- the transcript has already been deleted;
+- your wording doesn't match the original conversation;
+- the answer spans several sessions or repositories;
+- you need to move from a commit or line of code back to the session that produced it; or
+- you want your agent to retrieve the context itself instead of manually hunting through JSONL files.
+
+Claude Code deletes transcripts after 30 days by default. The recall index doesn't. You can and often should raise `cleanupPeriodDays`; longer retention keeps more source files, while recall makes the record searchable after those files are gone.
+
+**Grep can't search a deleted file.**
+
+## How it works
+
+Under the hood, recall is deliberately boring:
+
+1. Stop and SubagentStop hooks index conversation text as turns finish.
+2. A local llama.cpp embedding model vectorizes it on your machine.
+3. SQLite stores the text, FTS5 index, vectors, and session metadata in `~/.recall/`.
+4. A small skill teaches your agent to search first when prior work is likely to matter.
+5. Search results enter the context only when the agent asks for them.
+
+There's no resident daemon, and recall makes no LLM calls of its own. Indexing and search don't consume model tokens; retrieved text costs context tokens only when your agent reads it, like any other local file.
+
+Install-time backfill indexes the Claude Code and Codex sessions still present on disk, so recall is useful on day one rather than only after day one.
+
+## Install
+
+### Requirements
+
+- Node.js 22 LTS (`>=22.16`) or Node.js 24+
+- Claude Code (required); Codex session indexing and search are also configured when Codex is detected
+- Linux x64/arm64, macOS x64/arm64, or Windows x64
+- macOS 14+ on Apple Silicon or macOS 13.7+ on Intel
+- 500 MB free recommended for installation; an upgrade from 0.1.x also needs free space roughly equal to the existing database for its rollback snapshot
+
+Node 23 is unsupported because no prebuilt SQLite binding is available for it.
 
 ```bash
 npm install -g crispy-recall
-recall install   # run this FIRST, before any other recall command
+recall install
 ```
 
-Exit any running Claude/Codex sessions first, then make `recall install` the
-first recall command you run after the npm upgrade — it performs a one-time,
-in-place migration of your existing database (rollback snapshot → WAL
-conversion → integrity check → background re-embed). If a live session is
-still holding the database the installer aborts cleanly and asks you to
-re-run; re-running is always safe and picks up where it left off.
+> **Don't use `npx`.** recall installs persistent hooks, a skill, a model, and a command that must remain available after setup.
 
-What to expect:
+Run the installer in the environment where you use your agent. WSL and Windows-native are separate environments, so install once in each if you use both.
 
-- **Your indexed history is preserved — even without the original
-  transcripts.** Claude Code deletes session `.jsonl` files after 30 days by
-  default; the migration never reads them. It works on the database in place,
-  and the re-embed sources text from the database itself.
-- A rollback snapshot is written to `~/.recall/recall.db.pre-upgrade-<stamp>`
-  (needs free disk roughly equal to your DB size; delete it once you're
-  satisfied).
-- A background re-embed upgrades your vectors to the new format — roughly an
-  hour per 20K messages on CPU, minutes on GPU. Search works the entire time
-  (output shows `migrating: N% re-embedded`); watch progress with
-  `recall status`. It resumes automatically after reboots.
-- The migration is one-way: **don't downgrade** to ≤ 0.1.6 afterwards — the
-  old engine fails closed on the converted database.
-- **Avoid `recall repair --full` unless you accept losing older history** — it
-  rebuilds the index from the transcripts still on disk, which for most
-  machines means only the last 30 days. Your database is the store of record;
-  the pre-upgrade snapshot is the rollback path if anything looks wrong.
+The installer:
 
-## What it does
+- creates `~/.recall/`;
+- downloads the llama.cpp binary and local embedding model;
+- installs Claude Code and Codex lifecycle hooks when each harness is detected;
+- installs the recall skill and a short AGENTS.md/CLAUDE.md nudge; and
+- backfills the session history that is still on disk.
 
-- A **Stop hook** ingests every turn into a local SQLite DB the moment a session ends — no daemon, no background polling.
-- The CLI **searches** your history two ways at once: FTS5 full-text and semantic vectors (Nomic Embed Text v1.5, run locally via llama.cpp).
-- A **`recall` skill** is dropped into Claude Code so the agent discovers and invokes it on its own — you rarely type `recall` yourself.
-- Works in **any project**, across both Claude Code and Codex.
+Use `recall doctor` if setup reports a problem. Use `recall install --offline` with pre-staged assets for an offline install.
 
-## How an agent uses it
+### Upgrading from 0.1.x
 
-Two steps. First, search for the relevant session:
+Close active Claude Code and Codex sessions, then make `recall install` the first recall command you run after upgrading:
 
 ```bash
-recall "the thing you're trying to remember"
+npm install -g crispy-recall
+recall install
 ```
 
-That returns a table of matching sessions. Then read one, centered on the match:
+The installer snapshots the database, migrates it to native SQLite/WAL, checks integrity, and re-embeds in the background. Search remains available during migration; use `recall status` to watch progress. If a live session holds the database, the installer aborts cleanly so you can exit the session and rerun it. Don't downgrade to `<=0.1.6` after converting the database.
 
-```bash
-recall <session-id> <message-id>
-```
+Migration works from `recall.db`, not the source transcripts, so indexed history is preserved even when the original JSONL has already been cleaned up. Before changing the database, the installer writes `~/.recall/recall.db.pre-upgrade-<stamp>`; keep free disk roughly equal to the current database size and delete the snapshot only after you're satisfied. The background re-embed resumes after interruption or reboot. Your database is the store of record; if old transcripts are gone, `recall repair --full` cannot recreate them.
 
-Search and list default to the **current directory's project** — from inside one
-repo you only see that repo's sessions. Add `--all` to search across every
-indexed project (use it for cross-repo questions, or when a scoped search comes
-back thin), or `--project <path>` to target a specific repo regardless of where
-you are:
+## Command reference
 
-```bash
-recall --all "the thing you're trying to remember"
-```
-
-The skill's frontmatter teaches Claude *when* to reach for this (before
-non-trivial tasks, architectural decisions, or work with obvious prior
-history), so in practice the agent calls it for you. (Inside the installed skill
-the command is written out as `node ~/.recall/bin/recall.js` so it works even
-when `recall` isn't on the agent's `PATH` — `$RECALL_BIN` in the skill source is
-a placeholder the installer substitutes, not an environment variable you set.)
-
-## Commands
-
-| Command | What it does |
+| Command | Purpose |
 |---|---|
-| `recall "<query>" [--all] [--project <path>]` | Search past sessions (FTS5 + semantic). Defaults to the current project; `--all` searches every indexed project, `--project` targets one. |
-| `recall <session-id> [<message-id>]` | Read a session, optionally centered on a matched message. |
-| `recall install` | One-time setup: scaffold `~/.recall/`, wire the Stop hook, install the skill. |
-| `recall uninstall` | Reverse the install (skills, hooks, CLAUDE.md/AGENTS.md blocks). `--purge` also removes `~/.recall/`. |
-| `recall status` | DB size, message count, last ingest, embedding gap, active backfill PID, GPU/CPU backend. |
-| `recall doctor` | Read-only health check (the install pre-flight suite). `--integrity` runs DB + FTS5 checks. |
-| `recall repair --fts \| --vectors \| --full` | Rebuild the FTS index, re-embed vectors, or full reingest from JSONL. |
-| `recall backfill [--auto-embed] [--vendor <v>] [--detach]` | Index historical transcripts. |
-| `recall statusline [--suggest]` | Print the `🔗 <session_id>` chip from Claude Code's statusline JSON (pipe it in), or with `--suggest` detect your current statusline and show how to add the id to it. |
+| `recall "<query>"` | Hybrid text + semantic search in the current project. |
+| `recall "<query>" --all` | Search every indexed project. |
+| `recall <session-uuid> [<message-uuid>]` | Read a UUID-backed session, optionally centered on a UUID-backed match. |
+| `recall --commit <hash>` | Find Claude Code sessions that produced a commit. |
+| `recall --blame <path>[:line[-line]]` | Trace current code back to its producing Claude Code conversations. |
+| `recall install` | Install or upgrade the hooks, skills, local assets, and history index. |
+| `recall backfill [--auto-embed] [--vendor <v>] [--detach]` | Index session transcripts currently on disk, optionally for one vendor or as a detached job. |
+| `recall status` | Show database size, message counts, embedding gap/migration progress, and active backfill state. |
+| `recall doctor [--integrity]` | Run read-only install and database checks. |
+| `recall repair --fts \| --vectors \| --full` | Rebuild FTS5, clear vectors for re-embedding, or fully reingest on-disk transcripts. |
+| `recall statusline [--suggest]` | Print the session-id chip or integration guidance. |
+| `recall uninstall [--purge]` | Remove the integration; `--purge` also deletes recall's data. |
 
-Add `--json` to `install`/`uninstall`/`status`/`doctor` for machine-readable
-output. `recall install` also takes `--offline` (use a pre-staged binary +
-model instead of downloading), `--no-backfill` / `--auto-backfill` to control
-the initial history index, and `--statusline` / `--no-statusline` for the
-opt-in status bar segment (see below). Run `recall --help` for the full flag
-set.
+Run `recall --help` for the full search and read flag set. Add `--json` to `install`, `uninstall`, `status`, or `doctor` for machine-readable output. Installer options include `--offline`, `--no-backfill`, `--auto-backfill`, `--statusline`, and `--no-statusline`.
 
-### Commit attribution (`--commit` / `--blame`)
-
-Find the session(s) that produced a commit, or the session(s) responsible for
-the current state of a file or line. Matching is structural — session
-Edit/Write/MultiEdit tool calls are compared against the commit's diff via
-tri-gram intersection, not clock proximity. `--blame` is HEAD-relative: it runs
-`git blame` to find the commits behind the current file (or line range) and
-attributes each; sessions overwritten by a later commit won't appear. Results
-list top-level sessions and subagent leaves chronologically (oldest first).
-
-```bash
-recall --commit 25dd0f8                          # sessions that produced a commit
-recall --blame src/paths.ts:82-84                # sessions behind a line range
-recall --blame src/foo.ts:42 src/bar.ts:10-20 --limit 20   # union of specs
-```
-
-### Session id in the status bar (`statusline`)
-
-Everything in recall keys off the session id — `recall <id>` reads a session,
-and telling an agent "recall `<id>`" hands it a whole prior conversation. The
-opt-in statusline feature keeps the current session's id visible in Claude
-Code's status bar as a `🔗 <session_id>` chip, so it's always there to copy.
+### Optional statusline
 
 ```bash
 recall install --statusline
 ```
 
-It's **off by default** (a plain `recall install`, `--yes`, or an upgrade never
-touches your status bar), and it **never overwrites an existing statusline**:
+It is off by default: accepting the installer defaults, using `--yes` or a non-interactive install, or upgrading an install that has never enabled it will not opt you in. Once enabled, it stays enabled across upgrades. If Claude Code has no statusline, recall installs a muted line with the current folder and git branch, model, context use, and a `🔗 <session_id>` chip. If you already have a statusline, recall leaves it unchanged and prints paste-ready integration guidance; `recall statusline --suggest` repeats it later.
 
-- **No statusline set** → recall wires a minimal one:
-  `<dir> · <model> · 🔗 <session_id>`.
-- **You already have one** → recall changes nothing and prints two ways to add
-  the id yourself: a paste-ready snippet for your script (Python/Node/shell,
-  matched to what you run), or a ready-to-run `claude -p` prompt that edits it
-  for you. `recall statusline --suggest` re-prints that guidance anytime.
+The installed statusline never opens the database. Its only I/O is one guarded `git status` call with a 400 ms timeout; failure simply drops the git segment, and any segment whose input is missing is omitted. For composition with your own statusline, `recall statusline` prints only the bare, uncolored session-id chip. Uninstall removes the line only if recall still owns it, and doctor reports statusline problems as warnings.
 
-The wired command is a tiny standalone script (`~/.recall/bin/statusline.js`,
-~2.5 KB — it never touches the database), and `recall uninstall` removes the
-statusline again if recall installed it. If you'd rather compose the chip into
-your own statusline, pipe Claude Code's statusline JSON through
-`recall statusline` and append its output. `recall doctor` reports statusline
-health once enabled (warnings only — it never fails the check).
+> **Warning:** `recall repair --full` is destructive: it replaces the index contents from the transcripts still on disk. If older source transcripts have already been cleaned up, their indexed history cannot be rebuilt. Prefer `--fts` or `--vectors` unless a full reingest is truly necessary.
 
-## Where things live
+## Privacy and data
 
-- `~/.recall/` — the DB, model, binary, logs, and `config.json` (the resolved GPU/CPU embedder mode, plus the statusline record if enabled).
-- `~/.claude/skills/recall/SKILL.md` — the auto-discovered skill.
-- A hook entry in `~/.claude/settings.json` (and, only if you opted in, a `statusLine` entry).
+- Your index lives in `~/.recall/recall.db`.
+- Search and indexing stay on your machine.
+- There is no telemetry.
+- The database is plain SQLite and inspectable with ordinary SQLite tools.
+- Network access is limited to downloading the embedding runtime and model when missing, plus host reachability probes during install and doctor checks.
+- `recall uninstall --purge` removes the local store completely.
 
-`recall uninstall` reverses all of these. `recall uninstall --purge` also removes `~/.recall/`.
+The installed integration is inspectable too: Claude's skill and hook live under `~/.claude/skills/recall/` and `~/.claude/settings.json`. When Codex is detected, recall also uses `~/.codex/skills/recall/` and `~/.codex/hooks.json`.
 
-## Privacy
+The index deliberately outlives source-transcript cleanup. recall doesn't encrypt `recall.db`; treat `~/.recall/` with the same care as your original Claude Code and Codex histories.
 
-Everything is local. No telemetry. The only data transfer is the one-time
-binary + model download at install (from llama.cpp's GitHub releases and
-HuggingFace); `recall install` and `recall doctor` also send lightweight
-reachability probes to those two hosts. Nothing else leaves your machine. The DB
-is plain SQLite — open it with any SQLite browser if you want to poke around.
+## Limitations
 
-## Troubleshooting
+- It isn't automatic fact injection into every prompt. Retrieval is pull-based.
+- It isn't a replacement for documentation, tests, or git.
+- It doesn't claim recalled context is still correct.
+- It doesn't preserve tool output or hidden thinking in the searchable conversation.
+- It doesn't yet offer per-session deletion; forgetting is database-level today.
+- Centered CLI reads currently require UUID-style session and message IDs. Opaque `agent-*` sessions and Codex `codex-jsonl-*` message IDs remain searchable, but aren't yet accepted by the direct-read dispatcher.
 
-Run `recall doctor` — it reports platform, harness, runtime, disk, network, and
-the resolved embedding backend, with remediation hints for anything off.
+## Project status
 
-## Attribution
+crispy-recall is in active development and was spun out of the recall subsystem in [Crispy](https://github.com/TheSylvester/crispy). See [GitHub Releases](https://github.com/TheSylvester/crispy-recall/releases) for version history.
 
-Lifted and adapted from the recall subsystem of
-[Crispy](https://github.com/TheSylvester/crispy), the Claude Code / Codex GUI.
+Issues and contributions are welcome at [github.com/TheSylvester/crispy-recall](https://github.com/TheSylvester/crispy-recall).
 
 ## License
 
 MIT — see [LICENSE](./LICENSE).
+
+---
+
+**Memory, lazily evaluated.**
