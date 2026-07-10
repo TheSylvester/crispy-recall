@@ -172,21 +172,47 @@ function checkBindingHealth(): BindingHealth {
         : new Database(dbFile, { readonly: true, fileMustExist: true });
       bindingLoads = true;
       journalMode = String(raw.pragma('journal_mode', { simple: true }));
-      // Embed-version coverage on the SAME readonly connection (never flips WAL).
+      // Embed-version coverage on the SAME readonly connection (never flips
+      // WAL). HOT-only join: agent-leaf rows are excluded from embedding, so
+      // they must not distort the coverage denominator doctor reports.
       try {
         const row = raw
           .prepare(
             `SELECT COUNT(*) AS total,
-                    COALESCE(SUM(CASE WHEN embed_version = ? THEN 1 ELSE 0 END), 0) AS current
-             FROM message_vectors`,
+                    COALESCE(SUM(CASE WHEN mv.embed_version = ? THEN 1 ELSE 0 END), 0) AS current
+             FROM message_vectors mv
+             JOIN messages m ON m.message_id = mv.message_id
+             WHERE m.retrieval_class = 'hot'`,
           )
           .get(EMBED_VERSION) as { total: number; current: number } | undefined;
         const total = row ? Number(row.total) : 0;
         const current = row ? Number(row.current ?? 0) : 0;
         embedCoverage = total === 0 ? null : current / total;
       } catch {
-        embedCoverage = null; // no vectors table / no embed_version column
+        embedCoverage = null; // no vectors table / pre-migration schema
       }
+      // Pending retrieval-class migration (read-only detection): a messages
+      // table without the schema_meta 'complete' marker means normal commands
+      // fail closed until `recall install` finishes the migration.
+      try {
+        const hasMessages = raw
+          .prepare(`SELECT 1 AS x FROM sqlite_master WHERE type='table' AND name='messages'`)
+          .get();
+        if (hasMessages) {
+          let complete = false;
+          try {
+            const marker = raw
+              .prepare(`SELECT value FROM schema_meta WHERE key='retrieval_class_migration'`)
+              .get() as { value?: string } | undefined;
+            complete = marker?.value === 'complete';
+          } catch {
+            complete = false; // no schema_meta table at all
+          }
+          if (!complete) {
+            problems.push('retrieval-class schema migration pending — run `recall install` to finish it');
+          }
+        }
+      } catch { /* detection is best-effort */ }
       raw.close();
       if (journalMode !== 'wal') {
         problems.push(

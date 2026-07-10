@@ -118,4 +118,10 @@ const HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000;
     try { await disposeEmbedder(); } catch { /* ignore */ }
     releaseEmbedLock();
   }
-})();
+})().catch(() => {
+  // A throw that escapes the loop (e.g. a pending-migration fail-closed DB
+  // open inside mtimeScan) must not crash a detached background child with an
+  // unhandled rejection — exit 0 quietly; the attended migration and the
+  // next sweep pick the work back up.
+  process.exit(0);
+});

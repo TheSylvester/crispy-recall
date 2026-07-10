@@ -36,6 +36,28 @@ export interface MessageRecord {
   project_id: string | null;
   created_at: number;         // unix timestamp ms
   message_role: string | null;
+  /** 'hot' (canonical root; default) or 'agent' (durable leaf provenance —
+   *  explicitly readable, excluded from default retrieval and vectors). */
+  retrieval_class?: 'hot' | 'agent';
+}
+
+/** Durable per-session provenance persisted alongside an ingest. */
+export interface SessionProvenanceRecord {
+  sessionId: string;
+  vendor: 'claude' | 'codex';
+  kind: 'root' | 'agent';
+  parentSessionId: string | null;
+  agentDepth: number | null;
+  /** JSON-able metadata bag (agent path/type, hook agent_id, …). */
+  agentMeta: Record<string, unknown> | null;
+  transcriptPath: string | null;
+}
+
+/** Alias identifier → canonical session mapping (e.g. hook agent_id). */
+export interface SessionAliasRecord {
+  aliasId: string;
+  sessionId: string;
+  source: string;
 }
 
 // ============================================================================
@@ -62,17 +84,28 @@ function ensureDir() {
 
 /**
  * Batch-insert messages into the messages table.
- * Uses a transaction for atomicity. FTS5 sync triggers fire automatically.
+ * Uses a transaction for atomicity. FTS5 sync triggers fire automatically
+ * (four-state: only 'hot' rows enter/leave the filtered index).
  *
  * When `opts.replaceSessionId` is set, the existing rows for that session are
  * deleted inside the SAME transaction as the insert, so a force re-ingest can
  * never leave the session transiently empty in the index on a crash/rollback.
+ *
+ * `opts.provenance` / `opts.aliases` persist the session's classification in
+ * the SAME transaction. When provenance reclassifies an already-ingested
+ * session to 'agent' (e.g. a SubagentStop arriving after a T1 scan indexed a
+ * Codex child as hot), existing rows are flipped cold and their vectors
+ * deleted here — INSERT OR IGNORE alone would leave stale hot rows behind.
  */
 export function insertMessages(
   messages: MessageRecord[],
-  opts?: { replaceSessionId?: string },
+  opts?: {
+    replaceSessionId?: string;
+    provenance?: SessionProvenanceRecord;
+    aliases?: SessionAliasRecord[];
+  },
 ): void {
-  if (messages.length === 0 && !opts?.replaceSessionId) return;
+  if (messages.length === 0 && !opts?.replaceSessionId && !opts?.provenance) return;
 
   ensureDir();
   const d = db();
@@ -96,8 +129,8 @@ export function insertMessages(
     }
     const stmt = d.prepare(
       `INSERT OR IGNORE INTO messages
-       (message_id, session_id, message_seq, message_text, project_id, created_at, message_role)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+       (message_id, session_id, message_seq, message_text, project_id, created_at, message_role, retrieval_class)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     );
     for (const m of messages) {
       stmt.run([
@@ -108,8 +141,56 @@ export function insertMessages(
         m.project_id,
         m.created_at,
         m.message_role,
+        m.retrieval_class ?? 'hot',
       ]);
     }
+
+    if (opts?.provenance) {
+      const p = opts.provenance;
+      d.run(
+        `INSERT INTO session_provenance
+           (session_id, vendor, kind, parent_session_id, agent_depth, agent_meta, transcript_path, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(session_id) DO UPDATE SET
+           vendor = excluded.vendor,
+           kind = excluded.kind,
+           parent_session_id = COALESCE(excluded.parent_session_id, session_provenance.parent_session_id),
+           agent_depth = COALESCE(excluded.agent_depth, session_provenance.agent_depth),
+           agent_meta = COALESCE(excluded.agent_meta, session_provenance.agent_meta),
+           transcript_path = COALESCE(excluded.transcript_path, session_provenance.transcript_path),
+           updated_at = excluded.updated_at`,
+        [
+          p.sessionId, p.vendor, p.kind, p.parentSessionId, p.agentDepth,
+          p.agentMeta ? JSON.stringify(p.agentMeta) : null,
+          p.transcriptPath, Date.now(),
+        ],
+      );
+
+      if (p.kind === 'agent') {
+        // Reconcile: any rows this session already has (from an earlier
+        // hot-classified ingest) go cold, and their vectors are removed.
+        // The four-state UPDATE trigger drops them from the FTS index.
+        d.run(
+          `UPDATE messages SET retrieval_class = 'agent'
+           WHERE session_id = ? AND retrieval_class != 'agent'`,
+          [p.sessionId],
+        );
+        d.run(
+          `DELETE FROM message_vectors WHERE message_id IN
+           (SELECT message_id FROM messages WHERE session_id = ?)`,
+          [p.sessionId],
+        );
+      }
+    }
+
+    for (const a of opts?.aliases ?? []) {
+      d.run(
+        `INSERT OR REPLACE INTO session_aliases (alias_id, session_id, source, created_at)
+         VALUES (?, ?, ?, ?)`,
+        [a.aliasId, a.sessionId, a.source, Date.now()],
+      );
+    }
+
     d.exec('COMMIT');
   } catch (e) {
     d.exec('ROLLBACK');
@@ -189,6 +270,9 @@ export function searchMessagesFts(
     params.push(limit);
 
     const MAX_PREVIEW = 400;
+    // retrieval_class filter is defense-in-depth: the FTS index is already
+    // hot-only (filtered external-content view), but stale or partially
+    // migrated index state must never leak agent rows into results.
     const rows = db().all(
       `SELECT m.message_id, m.session_id, m.message_seq,
               m.project_id, m.created_at, m.message_role, f.rank,
@@ -197,6 +281,7 @@ export function searchMessagesFts(
        FROM messages_fts f
        CROSS JOIN messages m ON m.rowid = f.rowid
        WHERE messages_fts MATCH ?
+         AND m.retrieval_class = 'hot'
          ${extraClauses}
        ORDER BY f.rank
        LIMIT ?`,
@@ -258,6 +343,7 @@ export function searchMessagesFtsMeta(
        FROM messages_fts f
        CROSS JOIN messages m ON m.rowid = f.rowid
        WHERE messages_fts MATCH ?
+         AND m.retrieval_class = 'hot'
          ${extraClauses}
        GROUP BY m.session_id`,
       params,
@@ -369,9 +455,12 @@ export function grepMessages(
       re = new RegExp(pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
     }
 
-    // Fetch candidate messages — session-scoped is fast, cross-session uses a limit
+    // Fetch candidate messages — session-scoped is fast, cross-session uses a limit.
+    // Unscoped/default grep is HOT-only (agent leaves are excluded from default
+    // retrieval); an explicit session-scoped grep is direct inspection and
+    // includes all classes.
     const params: (string | number)[] = [];
-    let where = 'WHERE 1=1';
+    let where = sessionId ? 'WHERE 1=1' : `WHERE retrieval_class = 'hot'`;
     if (sessionId) {
       where += ' AND session_id = ?';
       params.push(sessionId);
@@ -523,6 +612,13 @@ export interface MessageVectorRecord {
 /**
  * Batch-insert message vectors into the message_vectors table.
  * Uses INSERT OR REPLACE so re-embedding overwrites previous vectors.
+ *
+ * HOT-GUARDED WRITE: the insert resolves the row's retrieval_class inside the
+ * same BEGIN IMMEDIATE as the write. Filtering only the SELECT side would
+ * leave a resurrection window — a background drain can select a row while it
+ * is still 'hot', spend minutes embedding it, and land the vector AFTER a
+ * migration reclassified the row to 'agent' and purged its vectors. This
+ * guard is always-on and does not depend on cross-process migration timing.
  */
 export function insertMessageVectors(records: MessageVectorRecord[]): void {
   if (records.length === 0) return;
@@ -540,15 +636,17 @@ export function insertMessageVectors(records: MessageVectorRecord[]): void {
     const stmt = d.prepare(
       `INSERT OR REPLACE INTO message_vectors
        (message_id, embedding_q8, norm, quant_scale, embed_version)
-       VALUES (?, ?, ?, ?, ?)`,
+       SELECT m.message_id, ?, ?, ?, ?
+       FROM messages m
+       WHERE m.message_id = ? AND m.retrieval_class = 'hot'`,
     );
     for (const r of records) {
       stmt.run([
-        r.messageId,
         Buffer.from(r.embeddingQ8.buffer, r.embeddingQ8.byteOffset, r.embeddingQ8.byteLength),
         r.norm,
         r.quantScale,
         EMBED_VERSION,
+        r.messageId,
       ]);
     }
     d.exec('COMMIT');
@@ -600,10 +698,15 @@ export function getEmbedVersionStats(): EmbedVersionStats {
   try {
     // SUM over zero rows returns NULL in SQLite → COALESCE (and the defensive ??)
     // keep `current` numeric so the arithmetic below never yields NaN.
+    // Hot-only denominator: this coverage drives tolerant semantic-search mode
+    // and the reported migration progress — a stray agent vector (stale or
+    // partially migrated state) must not distort either.
     const row = db().get(
       `SELECT COUNT(*) AS total,
-              COALESCE(SUM(CASE WHEN embed_version = ? THEN 1 ELSE 0 END), 0) AS current
-       FROM message_vectors`,
+              COALESCE(SUM(CASE WHEN mv.embed_version = ? THEN 1 ELSE 0 END), 0) AS current
+       FROM message_vectors mv
+       JOIN messages m ON m.message_id = mv.message_id
+       WHERE m.retrieval_class = 'hot'`,
       [EMBED_VERSION],
     ) as Record<string, unknown> | undefined;
     const total = row ? (row.total as number) : 0;
@@ -636,9 +739,11 @@ export function searchMessagesSemantic(
   try {
     const limit = opts?.limit ?? 20;
 
-    // Push project/session filters to SQL to avoid loading unnecessary vectors
+    // Push project/session filters to SQL to avoid loading unnecessary vectors.
+    // retrieval_class filter is defense-in-depth: agent rows never have
+    // vectors (write guard + migration purge), but a stale one must not score.
     const params: (string | number)[] = [];
-    let filterClauses = '';
+    let filterClauses = ` AND m.retrieval_class = 'hot'`;
     if (opts?.projectId) {
       filterClauses += ' AND m.project_id = ?';
       params.push(opts.projectId);
@@ -769,14 +874,17 @@ const MIN_EMBED_CHARS = 50;
  */
 export function getEmbeddingGapStats(): { totalMessages: number; gapCount: number } {
   try {
+    // HOT-only: agent rows are never embedded, so they must not count toward
+    // the gap (or the total the gap is judged against). The predecessor
+    // EXISTS is hot-scoped too — embed inputs are built from hot context only.
     const row = db().get(
       `SELECT
         COUNT(*) as total,
         SUM(CASE WHEN NOT EXISTS (SELECT 1 FROM message_vectors mv WHERE mv.message_id = m.message_id AND mv.embed_version = ?)
                        AND (LENGTH(m.message_text) >= ${MIN_EMBED_CHARS}
-                            OR EXISTS (SELECT 1 FROM messages p WHERE p.session_id = m.session_id AND p.message_seq < m.message_seq))
+                            OR EXISTS (SELECT 1 FROM messages p WHERE p.session_id = m.session_id AND p.message_seq < m.message_seq AND p.retrieval_class = 'hot'))
                        THEN 1 ELSE 0 END) as gap
-       FROM messages m WHERE m.message_text != ''`,
+       FROM messages m WHERE m.message_text != '' AND m.retrieval_class = 'hot'`,
       [EMBED_VERSION],
     ) as Record<string, unknown> | undefined;
     return {
@@ -797,8 +905,9 @@ export function getSessionsWithEmbeddingGap(): string[] {
     const rows = db().all(
       `SELECT DISTINCT m.session_id FROM messages m
        WHERE m.message_text != ''
+         AND m.retrieval_class = 'hot'
          AND (LENGTH(m.message_text) >= ${MIN_EMBED_CHARS}
-              OR EXISTS (SELECT 1 FROM messages p WHERE p.session_id = m.session_id AND p.message_seq < m.message_seq))
+              OR EXISTS (SELECT 1 FROM messages p WHERE p.session_id = m.session_id AND p.message_seq < m.message_seq AND p.retrieval_class = 'hot'))
          AND NOT EXISTS (SELECT 1 FROM message_vectors mv WHERE mv.message_id = m.message_id AND mv.embed_version = ?)
        ORDER BY m.created_at DESC`,
       [EMBED_VERSION],
@@ -832,12 +941,13 @@ export function getUnembeddedMessages(limit: number): UnembeddedMessage[] {
     const rows = db().all(
       `SELECT m.message_id, m.session_id, m.message_text,
          (SELECT p.message_text FROM messages p
-           WHERE p.session_id = m.session_id AND p.message_seq < m.message_seq
+           WHERE p.session_id = m.session_id AND p.message_seq < m.message_seq AND p.retrieval_class = 'hot'
            ORDER BY p.message_seq DESC LIMIT 1) AS prev_text
        FROM messages m
        WHERE m.message_text != ''
+         AND m.retrieval_class = 'hot'
          AND (LENGTH(m.message_text) >= ${MIN_EMBED_CHARS}
-              OR EXISTS (SELECT 1 FROM messages p2 WHERE p2.session_id = m.session_id AND p2.message_seq < m.message_seq))
+              OR EXISTS (SELECT 1 FROM messages p2 WHERE p2.session_id = m.session_id AND p2.message_seq < m.message_seq AND p2.retrieval_class = 'hot'))
          AND NOT EXISTS (SELECT 1 FROM message_vectors mv WHERE mv.message_id = m.message_id AND mv.embed_version = ?)
        ORDER BY m.created_at DESC
        LIMIT ?`,

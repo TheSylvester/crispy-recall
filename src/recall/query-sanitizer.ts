@@ -69,7 +69,12 @@ function getTotalMessages(): number {
   const now = Date.now();
   if (cachedTotal > 0 && now - cachedTotalTs < 60_000) return cachedTotal;
   try {
-    const row = getDb(dbPath()).get('SELECT COUNT(*) as total FROM messages');
+    // HOT-only denominator: the fts5vocab numerator is derived from the
+    // filtered (hot-only) messages_fts index, so counting agent rows here
+    // would deflate every document frequency and skew the IDF filter.
+    const row = getDb(dbPath()).get(
+      `SELECT COUNT(*) as total FROM messages WHERE retrieval_class = 'hot'`,
+    );
     cachedTotal = row ? (row as Record<string, unknown>).total as number : 1;
     cachedTotalTs = now;
     return cachedTotal;

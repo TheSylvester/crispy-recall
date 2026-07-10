@@ -1086,6 +1086,9 @@ async function maybeRunT1() {
     initDb();
     await mtimeScan();
   } catch (e) {
+    // A pending schema migration must fail the WHOLE command closed with the
+    // concise remediation, not degrade into a broken search/read.
+    if ((e as Error).name === 'MigrationPendingError') throw e;
     process.stderr.write(`[recall] mtime-scan failed (continuing): ${(e as Error).message}\n`);
   }
   const dt = Date.now() - t0;
@@ -1302,6 +1305,13 @@ function runRead(sessionRef: string, messageRef?: string): void {
 main()
   .catch((e) => {
     if (e instanceof ExitSignal) return; // intentional termination; exitCode already set
+    if ((e as Error)?.name === 'MigrationPendingError') {
+      // Fail closed, concisely: the DB predates the retrieval-class schema and
+      // only the attended `recall install` migration may rewrite it.
+      console.error((e as Error).message);
+      process.exitCode = 1;
+      return;
+    }
     console.error(e);
     process.exitCode = 1;
   })

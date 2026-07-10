@@ -65,7 +65,9 @@ export function listSessions(
 ): ListResult[] {
   const db = getDb(dbPath);
   const params: (string | number)[] = [];
-  const conditions: string[] = [];
+  // Normal list is HOT-only: agent leaves stay durable and explicitly
+  // readable, but never appear in the default session list.
+  const conditions: string[] = [`m.retrieval_class = 'hot'`];
 
   if (since) {
     // messages.created_at is INTEGER (epoch ms) — convert ISO string to epoch ms
