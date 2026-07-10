@@ -28,10 +28,15 @@ import { getDb, isBindingLoadError } from '../db.js';
 import { getEmbedVersionStats, getEmbeddingGapStats } from '../recall/message-store.js';
 import {
   runPreflight, preflightPassed, acquireInstallLock, releaseInstallLock,
+  startInstallLockHeartbeat,
   claudeRecallSkillPath, claudeSettingsPath, claudeMdPath,
   codexAgentsPath, codexHooksPath, codexRecallSkillPath,
   type PreflightReport,
 } from './preflight.js';
+import {
+  retrievalMigrationPending, runRetrievalClassMigration, RetrievalMigrationAbort,
+  type RetrievalMigrationResult,
+} from './retrieval-class-migration.js';
 import { buildManifest, renderManifest } from './manifest.js';
 import { runGpuPhase, type GpuPhaseResult, type GpuProbeArgs, type OffloadProbeResult } from './gpu.js';
 import { mergeStopHook, removeStopHook, backupFile, mergeStatusLine, removeStatusLine } from './settings-merge.js';
@@ -79,6 +84,8 @@ export interface MigrationInfo {
   snapshotPath?: string;
   /** Post-flip integrity result (upgrade only). */
   integrity?: IntegrityStatus;
+  /** Retrieval-class migration outcome (when one ran or was attempted). */
+  retrieval?: RetrievalMigrationResult;
 }
 
 export interface InstallResult {
@@ -370,32 +377,60 @@ export async function runInstall(opts: InstallOptions = {}): Promise<InstallResu
     if (interactive) note(msg, 'Aborting'); else log({ source: 'installer/install', level: 'error', summary: msg });
     return { aborted: true, report, selected: [...selected], gpu: { mode: 'cpu', libDir: null, ngl: 0, cudaAvailable: 'none' }, filesWritten: [] };
   }
+  // Heartbeat keeps the lock's ts fresh for the whole (possibly long) install,
+  // so observers can distinguish a live installer from a crashed one.
+  const stopLockHeartbeat = startInstallLockHeartbeat();
 
   // Classify the existing DB BEFORE staging rewrites the ABI marker, so the
   // marker read reflects the PRIOR install (wasm-era = absent). Drives the
   // quiesce/snapshot/integrity/drain-gating an in-place upgrade needs.
   const migration = classifyUpgrade();
+  // Retrieval-class schema migration pending? (read-only probe; the actual
+  // rewrite runs attended in phase 6.7 below.)
+  const retrievalPending = retrievalMigrationPending();
 
   const filesWritten: string[] = [];
   let gpu: GpuPhaseResult = { mode: 'cpu', libDir: null, ngl: 0, cudaAvailable: 'none' };
   let backfillPid: number | undefined;
   let snapshotPath: string | undefined;
   let integrity: IntegrityStatus | undefined;
+  let retrieval: RetrievalMigrationResult | undefined;
   let drainLaunched = false;
 
+  // Hook-restore guard: capture the EXACT prior hook-file contents before any
+  // quiesce, so every abort path can put the user's Stop hooks back — a failed
+  // migration must never leave recall silently disabled.
+  const hookFileBackups = new Map<string, string | null>();
+  const captureHookFile = (p: string) => {
+    if (hookFileBackups.has(p)) return;
+    try { hookFileBackups.set(p, readFileSync(p, 'utf-8')); } catch { hookFileBackups.set(p, null); }
+  };
+  const restoreQuiescedHooks = () => {
+    for (const [p, contents] of hookFileBackups) {
+      try {
+        if (contents !== null) writeFileSync(p, contents);
+      } catch (e) {
+        log({ source: 'installer/install', level: 'warn', summary: `could not restore hook file ${p}: ${(e as Error).message}` });
+      }
+    }
+  };
+
   try {
-    // ---- Upgrade quiesce (needs-migration only) ----
-    // Remove the stale (wasm-era) Stop hook BEFORE staging the native bundles or
-    // opening the DB, so no old writer fires during the exclusive WAL flip. The
-    // "hooks wired LAST" invariant guards *adding* hooks at not-yet-staged
-    // scripts; *removing* the stale hook early is strictly safer. Phase 7 re-adds
-    // the recall hook pointing at the freshly staged stop-hook.js.
-    if (migration.state === 'needs-migration') {
+    // ---- Upgrade quiesce ----
+    // Remove the stale Stop hook BEFORE staging the native bundles or opening
+    // the DB, so no old writer fires during the exclusive WAL flip or the
+    // retrieval-class rewrite. The "hooks wired LAST" invariant guards
+    // *adding* hooks at not-yet-staged scripts; *removing* the stale hook
+    // early is strictly safer. Phase 7 re-adds the recall hook pointing at
+    // the freshly staged stop-hook.js; abort paths restore the exact prior
+    // configuration via restoreQuiescedHooks().
+    if (migration.state === 'needs-migration' || retrievalPending) {
       for (const p of [claudeSettingsPath(), codexHooksPath()]) {
+        captureHookFile(p);
         const r = removeStopHook(p);
         if (r.changed) filesWritten.push(p);
       }
-      say('upgrade: quiesced stale Stop hook before migration');
+      say('upgrade: quiesced Stop hooks before migration');
     }
 
     // ---- 2/3. Resolve paths + scaffold ~/.recall/ ----
@@ -404,6 +439,7 @@ export async function runInstall(opts: InstallOptions = {}): Promise<InstallResu
     if (!staged.ok) {
       // The staged SQLite binding cannot load under this Node — abort NOW, before
       // the marker vouches for it and before getDb loops on "re-run recall install".
+      restoreQuiescedHooks();
       if (interactive) note(staged.remediation, 'Install aborted');
       else log({ source: 'installer/install', level: 'error', summary: `install aborted: ${staged.remediation}` });
       return {
@@ -422,6 +458,7 @@ export async function runInstall(opts: InstallOptions = {}): Promise<InstallResu
           `--offline but runtime not pre-staged (binary=${haveBin}, model=${haveModel}). ` +
           'Pre-stage ~/.recall/bin + model (or drop --offline), then re-run `recall install`' +
           (migration.state === 'needs-migration' ? ' (which restores the recall Stop hook).' : '.');
+        restoreQuiescedHooks();
         log({ source: 'installer/install', level: 'error', summary: msg });
         return {
           aborted: true, abortReason: msg, report, selected: [...selected], gpu, filesWritten,
@@ -458,8 +495,10 @@ export async function runInstall(opts: InstallOptions = {}): Promise<InstallResu
     // session still holding the delete-mode DB) the exclusive flip fails and
     // getDb throws. Catch it → clean aborted result with remediation, never a
     // half-migrated brick or a stack trace. The snapshot is preserved.
+    // allowPendingMigration: ONLY the installer may open a pre-retrieval-class
+    // DB (normal commands fail closed); phase 6.7 below performs the rewrite.
     try {
-      getDb(dbPath());
+      getDb(dbPath(), { allowPendingMigration: true });
     } catch (e) {
       // Every branch is self-healing: re-running `recall install` re-quiesces,
       // retries the flip, and re-wires the recall Stop hook removed above.
@@ -479,6 +518,7 @@ export async function runInstall(opts: InstallOptions = {}): Promise<InstallResu
       } else {
         remediation = `Could not open the database (${emsg}). Run \`recall doctor --integrity\`; if unrecoverable, rebuild from JSONL with \`recall repair --full\`.${rerun}`;
       }
+      restoreQuiescedHooks();
       if (interactive) note(remediation, 'Migration aborted');
       else log({ source: 'installer/install', level: 'error', summary: `migration aborted: ${remediation}` });
       return {
@@ -500,6 +540,7 @@ export async function runInstall(opts: InstallOptions = {}): Promise<InstallResu
           `Database integrity check failed (${res.detail ?? 'unknown'}) and could not be auto-repaired. ` +
           `Your pre-upgrade snapshot is preserved at ${snapshotPath ?? '(snapshot unavailable)'}. ` +
           'Rebuild the index from JSONL with `recall repair --full`, then re-run `recall install` to restore the recall Stop hook.';
+        restoreQuiescedHooks();
         if (interactive) note(remediation, 'Migration aborted');
         else log({ source: 'installer/install', level: 'error', summary: `migration aborted: ${remediation}` });
         return {
@@ -511,6 +552,41 @@ export async function runInstall(opts: InstallOptions = {}): Promise<InstallResu
         };
       }
       say(res.status === 'repaired-stem' ? 'upgrade: repaired corrupt _stem index' : 'upgrade: integrity check passed');
+    }
+
+    // ---- 6.7 Retrieval-class migration (attended, marker-gated) ----
+    // Quiesces the background drain, takes a WAL-safe backup-API snapshot
+    // (failure aborts), and rewrites classification + filtered FTS + vector
+    // purge + durable marker in ONE transaction. Idempotent on re-run.
+    if (retrievalPending) {
+      try {
+        retrieval = await runRetrievalClassMigration();
+        if (retrieval.performed) {
+          say(
+            `retrieval-class migration: ${retrieval.agentSessions} agent sessions reclassified ` +
+            `(${retrieval.agentMessages} messages, ${retrieval.purgedVectors} vectors purged)` +
+            (retrieval.unresolvedCodexSessions > 0
+              ? ` — ${retrieval.unresolvedCodexSessions} codex-shaped sessions had no surviving transcript and were LEFT searchable (never guessed cold)`
+              : ''),
+          );
+        }
+      } catch (e) {
+        const remediation = e instanceof RetrievalMigrationAbort
+          ? e.message
+          : `Retrieval-class migration failed (${(e as Error).message}). The transaction rolled back — ` +
+            'your data is unchanged. Re-run `recall install` to retry; `recall doctor --integrity` to inspect.';
+        restoreQuiescedHooks();
+        if (interactive) note(remediation, 'Migration aborted');
+        else log({ source: 'installer/install', level: 'error', summary: `migration aborted: ${remediation}` });
+        return {
+          aborted: true, abortReason: remediation, report, selected: [...selected], gpu, filesWritten,
+          migration: {
+            state: migration.state, coverage: migration.coverage, drainLaunched: false,
+            ...(snapshotPath ? { snapshotPath } : {}),
+            ...(retrieval ? { retrieval } : {}),
+          },
+        };
+      }
     }
 
     // ---- 7. Claude / Codex filesystem edits (LAST) ----
@@ -627,6 +703,7 @@ export async function runInstall(opts: InstallOptions = {}): Promise<InstallResu
       say(backfillPid ? `backfill running in background (PID ${backfillPid})` : 'backfill could not be launched');
     }
   } finally {
+    stopLockHeartbeat();
     releaseInstallLock();
   }
 
@@ -638,6 +715,7 @@ export async function runInstall(opts: InstallOptions = {}): Promise<InstallResu
     drainLaunched,
     ...(snapshotPath ? { snapshotPath } : {}),
     ...(integrity ? { integrity } : {}),
+    ...(retrieval ? { retrieval } : {}),
   };
   const migLine = migrationReportLine(finalCoverage);
 

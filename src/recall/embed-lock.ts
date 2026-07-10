@@ -16,7 +16,14 @@ import { writeFileSync, readFileSync, unlinkSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { runDir } from '../paths.js';
 
-export const LOCK_PATH = join(runDir(), 'embed.lock');
+/** Lock path, resolved LAZILY — a module-level const froze the path at import
+ *  time, before a test's `_setTestRoot`/`RECALL_HOME` sandbox took effect, so
+ *  in-process callers (catchup backfill tests, the installer's drain quiesce)
+ *  read and even WROTE the live ~/.recall/run/embed.lock. */
+export function embedLockPath(): string {
+  return join(runDir(), 'embed.lock');
+}
+
 export const STALE_MS = 30 * 60 * 1000; // 30 min
 
 function isAlive(pid: number): boolean {
@@ -34,21 +41,21 @@ export function tryAcquireEmbedLock(): boolean {
   // transient extra server, self-healed on the next sweep, never corruption.
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      writeFileSync(LOCK_PATH, String(process.pid), { flag: 'wx' });
+      writeFileSync(embedLockPath(), String(process.pid), { flag: 'wx' });
       return true;
     } catch {
       // Lock exists — check liveness + age.
       let heldPid: number;
       let ageMs: number;
       try {
-        heldPid = parseInt(readFileSync(LOCK_PATH, 'utf8'), 10);
-        ageMs = Date.now() - statSync(LOCK_PATH).mtimeMs;
+        heldPid = parseInt(readFileSync(embedLockPath(), 'utf8'), 10);
+        ageMs = Date.now() - statSync(embedLockPath()).mtimeMs;
       } catch {
         continue; // lock vanished mid-check — retry the create
       }
       if (isAlive(heldPid) && ageMs < STALE_MS) return false; // legitimate owner
       // Stale — drop it so the next iteration's exclusive create decides one winner.
-      try { unlinkSync(LOCK_PATH); } catch { /* another racer already took over */ }
+      try { unlinkSync(embedLockPath()); } catch { /* another racer already took over */ }
     }
   }
   return false;
@@ -57,7 +64,7 @@ export function tryAcquireEmbedLock(): boolean {
 /** Release the embed lock if it still belongs to this process. */
 export function releaseEmbedLock(): void {
   try {
-    const held = parseInt(readFileSync(LOCK_PATH, 'utf8'), 10);
-    if (held === process.pid) unlinkSync(LOCK_PATH);
+    const held = parseInt(readFileSync(embedLockPath(), 'utf8'), 10);
+    if (held === process.pid) unlinkSync(embedLockPath());
   } catch { /* ignore */ }
 }

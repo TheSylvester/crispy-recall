@@ -162,7 +162,10 @@ export interface IntegrityOutcome {
  *  vtable makes integrity_check itself throw ("vtable constructor failed"). */
 function integrityStatus(): { ok: boolean; detail: string } {
   try {
-    const d = getDb(dbPath());
+    // allowPendingMigration: this runs from the installer, possibly BEFORE the
+    // retrieval-class migration (phase 6.5 precedes 6.7) — the fail-closed
+    // gate must not block the integrity check that gates the migration itself.
+    const d = getDb(dbPath(), { allowPendingMigration: true });
     const row = d.get('PRAGMA integrity_check') as Record<string, unknown> | undefined;
     const detail = row ? String(Object.values(row)[0] ?? '') : 'unknown';
     return { ok: detail === 'ok', detail };
@@ -181,15 +184,17 @@ function integrityStatus(): { ok: boolean; detail: string } {
  */
 function repairStemTables(): boolean {
   try {
-    const d = getDb(dbPath());
+    const d = getDb(dbPath(), { allowPendingMigration: true });
     d.exec('DROP TABLE IF EXISTS _stem_vocab');
     d.exec('DROP TABLE IF EXISTS _stem');
-    // Reopen so ensureSchema recreates _stem / _stem_vocab from scratch. Kept
-    // inside the try: some corruptions let the DROP succeed but leave orphan
-    // shadow tables so the CREATE (on reopen) throws — that must surface as an
+    // Reopen so ensureSchema recreates _stem / _stem_vocab from scratch (a
+    // pending-migration DB skips ensureSchema; its _stem is rebuilt by the
+    // retrieval migration's shared DDL / next normal open). Kept inside the
+    // try: some corruptions let the DROP succeed but leave orphan shadow
+    // tables so the CREATE (on reopen) throws — that must surface as an
     // 'unrecoverable' (false), never an uncaught throw out of handleIntegrity.
     _resetDb();
-    getDb(dbPath());
+    getDb(dbPath(), { allowPendingMigration: true });
     return integrityStatus().ok;
   } catch {
     return false;

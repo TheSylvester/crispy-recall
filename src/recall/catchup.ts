@@ -33,7 +33,7 @@ import {
 } from './message-store.js';
 import { ingestSessionMessages, embedMessageBatch } from './message-ingest.js';
 import { ensureModel, ensureBinary, disposeEmbedder } from './embedder.js';
-import { tryAcquireEmbedLock, releaseEmbedLock, LOCK_PATH } from './embed-lock.js';
+import { tryAcquireEmbedLock, releaseEmbedLock, embedLockPath } from './embed-lock.js';
 import { log } from '../log.js';
 
 // ============================================================================
@@ -193,7 +193,7 @@ export async function runEmbeddingBackfill(): Promise<void> {
     return;
   }
 
-  const heartbeat = startLockHeartbeat(LOCK_PATH);
+  const heartbeat = startLockHeartbeat(embedLockPath());
 
   try {
     // Download binary + model if needed

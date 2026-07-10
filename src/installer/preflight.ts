@@ -14,8 +14,9 @@
 
 import {
   existsSync, readFileSync, writeFileSync, accessSync, unlinkSync,
-  constants as fsConstants, statfsSync, mkdirSync,
+  constants as fsConstants, statfsSync, mkdirSync, statSync,
 } from 'node:fs';
+import { randomBytes } from 'node:crypto';
 import { homedir, platform as osPlatform, arch as osArch } from 'node:os';
 import { join } from 'node:path';
 import { request } from 'node:https';
@@ -86,11 +87,11 @@ export function codexRecallSkillPath(): string { return join(codexDir(), 'skills
 // Install lock (concurrent-install detection)
 // ---------------------------------------------------------------------------
 
-const STALE_LOCK_MS = 60 * 60 * 1000; // 1 hour
+const STALE_LOCK_MS = 60 * 60 * 1000; // 1 hour — applies ONLY to unreadable/dead locks
 
 function installLockPath(): string { return join(runDir(), 'install.lock'); }
 
-interface LockBody { pid: number; ts: number }
+interface LockBody { pid: number; ts: number; token?: string }
 
 function readLockBody(): LockBody | null {
   try {
@@ -104,34 +105,78 @@ function pidAlive(pid: number): boolean {
   try { process.kill(pid, 0); return true; } catch { return false; }
 }
 
+/** Random ownership token for THIS process's lock tenure. Release and
+ *  heartbeat verify it, so a same-PID successor (PID reuse) or a racing
+ *  installer can never be mistaken for us. */
+let ownLockToken: string | null = null;
+
+function newLockBody(): string {
+  ownLockToken = randomBytes(8).toString('hex');
+  return JSON.stringify({ pid: process.pid, ts: Date.now(), token: ownLockToken } satisfies LockBody);
+}
+
 export interface LockAcquisition {
   ok: boolean;
   tookOver: boolean;
   existingPid?: number;
 }
 
-/** Atomically acquire the install lock. Live owner → ok:false. Stale → take over. */
+/**
+ * Atomically acquire the install lock.
+ *
+ * A VERIFIABLY LIVE owner is never stolen — regardless of age. (The old
+ * behavior overwrote any lock after one hour, which could steal from a live
+ * installer mid-migration; with an in-place data rewrite in the pipeline
+ * that is no longer tolerable.) Takeover happens only when the recorded PID
+ * is dead, or the lock is unreadable AND older than STALE_LOCK_MS.
+ */
 export function acquireInstallLock(): LockAcquisition {
   mkdirSync(runDir(), { recursive: true });
-  const body = JSON.stringify({ pid: process.pid, ts: Date.now() });
+  const body = newLockBody();
   try {
     writeFileSync(installLockPath(), body, { flag: 'wx' });
     return { ok: true, tookOver: false };
   } catch {
     const existing = readLockBody();
-    if (existing && pidAlive(existing.pid) && Date.now() - existing.ts < STALE_LOCK_MS) {
+    if (existing && pidAlive(existing.pid)) {
+      // Live owner (heartbeat keeps ts fresh, but liveness is authoritative).
       return { ok: false, tookOver: false, existingPid: existing.pid };
     }
-    // Stale or unreadable — take it over.
+    if (!existing) {
+      // Unreadable lock: only age can justify takeover.
+      try {
+        const ageMs = Date.now() - statSync(installLockPath()).mtimeMs;
+        if (ageMs < STALE_LOCK_MS) return { ok: false, tookOver: false };
+      } catch { /* vanished mid-check — fall through to claim */ }
+    }
     writeFileSync(installLockPath(), body);
     return { ok: true, tookOver: true, ...(existing ? { existingPid: existing.pid } : {}) };
   }
 }
 
+/** Refresh the lock's ts every minute so observers can see the owner is live
+ *  even without PID visibility. Only rewrites a lock we still own. Returns a
+ *  stop function; unref'd so it never keeps the installer alive. */
+export function startInstallLockHeartbeat(): () => void {
+  const t = setInterval(() => {
+    try {
+      const existing = readLockBody();
+      if (existing && existing.pid === process.pid && existing.token === ownLockToken) {
+        writeFileSync(installLockPath(), JSON.stringify({
+          pid: process.pid, ts: Date.now(), token: ownLockToken,
+        } satisfies LockBody));
+      }
+    } catch { /* best-effort */ }
+  }, 60_000);
+  t.unref();
+  return () => clearInterval(t);
+}
+
 export function releaseInstallLock(): void {
   try {
     const existing = readLockBody();
-    if (existing && existing.pid === process.pid) {
+    // PID + token must BOTH match — never unlink a successor's lock.
+    if (existing && existing.pid === process.pid && existing.token === ownLockToken) {
       unlinkSync(installLockPath());
     }
   } catch { /* ignore */ }
@@ -427,8 +472,9 @@ export async function runPreflight(opts: PreflightOptions = {}): Promise<Preflig
   });
 
   // Concurrent-install detection (read-only — install.ts acquires the lock).
+  // Liveness is authoritative: a live owner blocks regardless of age.
   const existing = readLockBody();
-  if (existing && pidAlive(existing.pid) && Date.now() - existing.ts < STALE_LOCK_MS) {
+  if (existing && pidAlive(existing.pid)) {
     report.failures.push({ check: 'install.lock', severity: 'FAIL', message: `Another install is running (PID ${existing.pid}).` });
   } else if (existing) {
     report.warnings.push({ check: 'install.lock', severity: 'WARN', message: 'Stale install lock found — will take over.' });
