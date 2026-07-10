@@ -24,7 +24,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
 import { binDir, modelsDir, runDir, logsDir, recallRoot, dbPath } from '../paths.js';
-import { getDb, isBindingLoadError } from '../db.js';
+import { getDb, isBindingLoadError, isRetrievalMigrationPending } from '../db.js';
 import { getEmbedVersionStats, getEmbeddingGapStats } from '../recall/message-store.js';
 import {
   runPreflight, preflightPassed, acquireInstallLock, releaseInstallLock,
@@ -384,12 +384,24 @@ export async function runInstall(opts: InstallOptions = {}): Promise<InstallResu
   const migration = classifyUpgrade();
   // Retrieval-class schema migration pending? (read-only probe; the actual
   // rewrite runs attended in phase 6.7 below.)
-  // Keep the migration module out of fresh-install subprocesses. Its broad
-  // native/module graph can destabilize rapid better-sqlite3 fork teardown.
-  const retrievalMigration = existsSync(dbPath())
+  // Avoid a short-lived second native handle on steady-state re-installs: that
+  // can destabilize better-sqlite3 during rapid fork teardown. A wasm-era DB
+  // is necessarily pending; a native/WAL DB can be checked on the cached
+  // installer connection without loading the broad migration module graph.
+  let retrievalPending = migration.state === 'needs-migration';
+  if (migration.state === 'already-migrated') {
+    try {
+      retrievalPending = isRetrievalMigrationPending(
+        getDb(dbPath(), { allowPendingMigration: true }),
+      );
+    } catch {
+      // Fail closed; the attended phase below will surface actionable detail.
+      retrievalPending = true;
+    }
+  }
+  const retrievalMigration = retrievalPending
     ? await import('./retrieval-class-migration.js')
     : undefined;
-  const retrievalPending = retrievalMigration?.retrievalMigrationPending() ?? false;
 
   const filesWritten: string[] = [];
   let gpu: GpuPhaseResult = { mode: 'cpu', libDir: null, ngl: 0, cudaAvailable: 'none' };
