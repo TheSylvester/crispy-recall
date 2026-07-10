@@ -205,7 +205,9 @@ Migration works from `recall.db`, not the source transcripts, so indexed history
 |---|---|
 | `recall "<query>"` | Hybrid text + semantic search in the current project. |
 | `recall "<query>" --all` | Search every indexed project. |
-| `recall <session-uuid> [<message-uuid>]` | Read a UUID-backed session, optionally centered on a UUID-backed match. |
+| `recall <session-id> [<message-id>]` | Read a session, optionally centered on a match. IDs are opaque — full stored IDs or literal prefixes (UUIDs, `agent-<hex>` leaves, `codex-jsonl-*` messages) all resolve. |
+| `recall read <session-ref> [<message-ref>]` | Explicit read for any stored ID shape; a failed read exits nonzero and never falls back to search. |
+| `recall search <terms…>` | Force a search when a term would otherwise look like a session/message ID. |
 | `recall --commit <hash>` | Find Claude Code sessions that produced a commit. |
 | `recall --blame <path>[:line[-line]]` | Trace current code back to its producing Claude Code conversations. |
 | `recall install` | Install or upgrade the hooks, skills, local assets, and history index. |
@@ -250,7 +252,7 @@ The index deliberately outlives source-transcript cleanup. recall doesn't encryp
 - It doesn't claim recalled context is still correct.
 - It doesn't preserve tool output or hidden thinking in the searchable conversation.
 - It doesn't yet offer per-session deletion; forgetting is database-level today.
-- Centered CLI reads currently require UUID-style session and message IDs. Opaque `agent-*` sessions and Codex `codex-jsonl-*` message IDs remain searchable, but aren't yet accepted by the direct-read dispatcher.
+- Subagent transcripts (Claude Task leaves, Codex child rollouts) are stored durable and readable by explicit ID, but are excluded from default search, lists, and semantic vectors — the parent thread's narration is the canonical memory. There is no search mode that includes them yet.
 
 ## Project status
 

@@ -31,9 +31,9 @@ import {
   chmodSync, truncateSync, closeSync, openSync,
 } from 'node:fs';
 import { join } from 'node:path';
-import { tmpdir, platform } from 'node:os';
+import { tmpdir, platform, homedir } from 'node:os';
 import { randomUUID } from 'node:crypto';
-import { spawn, type ChildProcess } from 'node:child_process';
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { _setTestRoot, dbPath, binDir, modelsDir, runDir } from '../../src/paths.js';
 import { _resetDb, getDb } from '../../src/db.js';
 import { insertMessages, insertMessageVectors } from '../../src/recall/message-store.js';
@@ -260,6 +260,78 @@ afterEach(() => {
   _resetDb();
   rmSync(recallHome, { recursive: true, force: true });
 });
+
+/**
+ * MANUAL, HARDWARE-GATED acceptance (WSL2 + NVIDIA RTX 2060 / CUDA). Runs ONLY
+ * when explicitly requested with RECALL_GPU_ACCEPTANCE=1 — never in CI or a
+ * normal `npm test` — and requires the real llama binaries + model at
+ * ~/.recall/{bin,models} (read-only symlinks; the DB/run dirs stay sandboxed).
+ *
+ * How to run (quiet machine, nothing else on the GPU):
+ *   npm run build
+ *   RECALL_GPU_ACCEPTANCE=1 npx vitest run test/integration/query-coordinator.test.ts
+ *
+ * What it proves (spec §8.5 hardware leg):
+ *   - 8 simultaneous real searches coalesce into ≤2 llama-embedding loads
+ *     (never 8), max ONE concurrent, and never a llama-server;
+ *   - CUDA is engaged via -ngl 999 (config.json embedder.mode=gpu);
+ *   - all CLIs exit 0 and the coordinator runtime dir is empty afterwards.
+ * Observe `nvidia-smi` during the run to confirm transient VRAM near ONE
+ * model instance (~1.3 GiB) instead of 8×.
+ */
+const gpuAcceptance = process.env['RECALL_GPU_ACCEPTANCE'] === '1';
+const realBin = join(homedir(), '.recall', 'bin', 'llama-embedding');
+const realModel = join(homedir(), '.recall', 'models', 'nomic-embed-text-v1.5.Q8_0.gguf');
+
+describe.skipIf(!gpuAcceptance || !existsSync(realBin) || !existsSync(realModel))(
+  'MANUAL GPU acceptance — 8 real simultaneous searches, one model load (RECALL_GPU_ACCEPTANCE=1)',
+  () => {
+    it('coalesces 8 real CUDA searches into at most 2 loads, max 1 concurrent, no server, full cleanup', async () => {
+      const { symlinkSync, writeFileSync: wf } = await import('node:fs');
+      // Real binaries/model READ-ONLY via symlink; DB + run stay sandboxed.
+      rmSync(binDir(), { recursive: true, force: true });
+      rmSync(modelsDir(), { recursive: true, force: true });
+      symlinkSync(join(homedir(), '.recall', 'bin'), binDir());
+      symlinkSync(join(homedir(), '.recall', 'models'), modelsDir());
+      wf(join(recallHome, 'config.json'), JSON.stringify({ embedder: { mode: 'gpu', ngl: 999, libDir: null } }));
+
+      const queries = Array.from({ length: 8 }, (_, i) => `real gpu acceptance probe number ${i}`);
+      seedDb([]); // empty index is fine — the query embed is the load under test
+
+      // Sample llama processes during the run: distinct PIDs = load count,
+      // instantaneous count >1 = concurrency violation.
+      const seenPids = new Set<string>();
+      let maxConcurrent = 0;
+      let serverSeen = false;
+      const sampler = setInterval(() => {
+        const out = spawnSyncSafe('ps', ['-eo', 'pid,cmd']);
+        const lines = out.split('\n').filter((l) => l.includes(recallHome));
+        const embeds = lines.filter((l) => l.includes('llama-embedding'));
+        if (lines.some((l) => l.includes('llama-server'))) serverSeen = true;
+        maxConcurrent = Math.max(maxConcurrent, embeds.length);
+        for (const l of embeds) seenPids.add(l.trim().split(/\s+/)[0]!);
+      }, 100);
+
+      const runs = queries.map((q) => runCli(q, { RECALL_QE_COALESCE_MS: '3000' }));
+      const results = await Promise.all(runs.map((r) => r.done));
+      clearInterval(sampler);
+
+      for (const r of results) expect(r.code, r.stderr).toBe(0);
+      expect(serverSeen, 'llama-server must never run for queries').toBe(false);
+      expect(maxConcurrent, 'at most one concurrent query model process').toBeLessThanOrEqual(1);
+      expect(seenPids.size, 'one load for the burst (2 tolerated for a straggler batch)').toBeLessThanOrEqual(2);
+      expect(qeArtifacts()).toEqual([]);
+
+      function spawnSyncSafe(cmd: string, args: string[]): string {
+        try {
+          return spawnSync(cmd, args, { encoding: 'utf-8', timeout: 5000 }).stdout ?? '';
+        } catch {
+          return '';
+        }
+      }
+    }, 300_000);
+  },
+);
 
 describe.skipIf(platform() === 'win32')('query coordinator — subprocess fleets (fake backend)', () => {
   it('a synchronized burst of 7 CLIs (6 distinct + 1 duplicate query) coalesces into ONE one-shot invocation, never llama-server', async () => {

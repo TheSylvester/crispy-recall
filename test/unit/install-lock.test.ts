@@ -4,7 +4,7 @@
  * must verify ownership (PID + token) so a successor's lock is never unlinked.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
+import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, utimesSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
@@ -67,7 +67,6 @@ describe('install lock ownership', () => {
     writeFileSync(lockPath(), '{corrupt');
     const fresh = acquireInstallLock();
     expect(fresh.ok).toBe(false); // fresh unreadable lock → do not steal
-    const { utimesSync } = require('node:fs') as typeof import('node:fs');
     const old = new Date(Date.now() - 2 * 60 * 60 * 1000);
     utimesSync(lockPath(), old, old);
     const aged = acquireInstallLock();
