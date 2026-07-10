@@ -493,6 +493,39 @@ describe.skipIf(platform() === 'win32')('retrieval-class migration (§8.3)', () 
     rmSync(join(recallHome, 'run', 'embed.lock'), { force: true });
   }, 60_000);
 
+  it('an unexpected install exception restores the EXACT prior Stop-hook configuration', async () => {
+    const { runInstall } = await import('../../src/installer/install.js');
+    mkdirSync(claudeRoot, { recursive: true });
+    const settingsPath = join(claudeRoot, 'settings.json');
+    const priorSettings = JSON.stringify({
+      hooks: {
+        Stop: [
+          { matcher: '', hooks: [{ type: 'command', command: '/usr/bin/users-own-hook.sh' }] },
+          { matcher: '', hooks: [{ type: 'command', command: `"node" "${join(recallHome, 'bin', 'stop-hook.js')}"` }] },
+        ],
+      },
+    }, null, 2);
+    writeFileSync(settingsPath, priorSettings);
+
+    const distDir = join(recallHome, 'stub-dist');
+    mkdirSync(distDir, { recursive: true });
+    for (const f of ['recall.js', 'stop-hook.js', 'embed-pending.js', 'statusline.js']) {
+      writeFileSync(join(distDir, f), 'process.exit(0);\n');
+    }
+    const { getBinaryPath, getModelPath } = await import('../../src/recall/embedder.js');
+    mkdirSync(join(recallHome, 'bin'), { recursive: true });
+    mkdirSync(join(recallHome, 'models'), { recursive: true });
+    writeFileSync(getBinaryPath(), 'stub');
+    writeFileSync(getModelPath(), 'stub');
+
+    const failure = new Error('injected GPU detection failure');
+    await expect(runInstall({
+      yes: true, offline: true, distDir,
+      gpuDetect: async () => { throw failure; },
+    })).rejects.toBe(failure);
+    expect(readFileSync(settingsPath, 'utf-8')).toBe(priorSettings);
+  }, 60_000);
+
   it('repair --fts and --vectors + T1 rescans do not resurrect cold content', async () => {
     await runRetrievalClassMigration();
 

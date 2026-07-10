@@ -704,6 +704,12 @@ export async function runInstall(opts: InstallOptions = {}): Promise<InstallResu
       drainLaunched = backfillPid !== undefined;
       say(backfillPid ? `backfill running in background (PID ${backfillPid})` : 'backfill could not be launched');
     }
+  } catch (e) {
+    // Unexpected failures must obey the same hook-restoration invariant as
+    // explicit aborts. Without this guard, an exception after quiescing could
+    // leave recall silently disabled until the next successful install.
+    restoreQuiescedHooks();
+    throw e;
   } finally {
     stopLockHeartbeat();
     releaseInstallLock();

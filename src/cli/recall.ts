@@ -953,7 +953,7 @@ function printCommitAttribution(query: string, matches: SessionMatch[]) {
     if (m.parent_session_id) {
       console.log(
         ' '.repeat(2) +
-        `(subagent of ${m.parent_session_id.slice(0, 8)}${m.agent_type ? `, type=${m.agent_type}` : ''})`,
+        `(subagent of ${m.parent_session_id}${m.agent_type ? `, type=${m.agent_type}` : ''})`,
       );
     }
   });

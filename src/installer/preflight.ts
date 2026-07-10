@@ -102,7 +102,13 @@ function readLockBody(): LockBody | null {
 }
 
 function pidAlive(pid: number): boolean {
-  try { process.kill(pid, 0); return true; } catch { return false; }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    // EPERM means the process exists but this user cannot signal it.
+    return (err as NodeJS.ErrnoException).code === 'EPERM';
+  }
 }
 
 /** Random ownership token for THIS process's lock tenure. Release and
