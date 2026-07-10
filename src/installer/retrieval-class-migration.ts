@@ -34,7 +34,7 @@
  * @module installer/retrieval-class-migration
  */
 
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, unlinkSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import Database from 'better-sqlite3';
 import {
@@ -129,19 +129,28 @@ async function quiesceDrain(waitMs: number): Promise<void> {
   }
   const deadline = Date.now() + waitMs;
   for (;;) {
-    let holder: number | null = null;
+    let raw: string | null = null;
     try {
-      holder = parseInt(readFileSync(embedLockPath(), 'utf8'), 10);
+      raw = readFileSync(embedLockPath(), 'utf8');
     } catch {
       return; // no lock — quiesced
     }
-    if (!pidAlive(holder)) return; // dead holder; the migration owns the DB now
-    if (Date.now() >= deadline) {
-      throw new RetrievalMigrationAbort(
-        `A background embedding drain is running (PID ${holder}, ${embedLockPath()}). ` +
-          'Wait for it to finish (or stop it), then re-run `recall install` to complete the migration.',
-      );
+    const holder = parseInt(raw, 10);
+    if (Number.isInteger(holder) && holder > 0) {
+      if (!pidAlive(holder)) return; // dead holder; the migration owns the DB now
+      if (Date.now() >= deadline) {
+        throw new RetrievalMigrationAbort(
+          `A background embedding drain is running (PID ${holder}, ${embedLockPath()}). ` +
+            'Wait for it to finish (or stop it), then re-run `recall install` to complete the migration.',
+        );
+      }
+    } else if (Date.now() >= deadline) {
+      // Unparseable for the whole wait window → a corrupt remnant, not a live
+      // drain mid-create (that write settles in microseconds). Proceed — the
+      // always-on hot-guard on insertMessageVectors is the backstop.
+      return;
     }
+    // Unparseable (a `wx` create-then-write window) or live holder: retry.
     await new Promise((r) => setTimeout(r, 250));
   }
 }
@@ -168,6 +177,7 @@ export async function snapshotDbWalSafe(): Promise<string> {
   try {
     await raw.backup(dest);
   } catch (e) {
+    try { unlinkSync(dest); } catch { /* partial snapshot from THIS attempt only */ }
     throw new RetrievalMigrationAbort(
       `Pre-migration snapshot failed (${(e as Error).message}) — aborting (nothing was modified). ` +
         'Free disk space or fix permissions, then re-run `recall install`.',

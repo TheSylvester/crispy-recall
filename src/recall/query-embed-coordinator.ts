@@ -96,13 +96,28 @@ const POLL_MS = () => envInt('RECALL_QE_POLL_MS', 15);
 const RESPONSE_TIMEOUT_MS = () => envInt('RECALL_QE_RESPONSE_TIMEOUT_MS', 180_000);
 /** Compute deadline for one one-shot embed child (model load included). */
 const EMBED_TIMEOUT_MS = () => envInt('RECALL_QE_EMBED_TIMEOUT_MS', 300_000);
-/** A leader lock older than this is reapable even if its PID looks alive —
- *  PIDs are recycled, so age is the backstop for a reused-PID false positive.
- *  Generous (far above any legitimate model load). */
-const LOCK_MAX_AGE_MS = () => envInt('RECALL_QE_LOCK_MAX_AGE_MS', 10 * 60_000);
+/** Max wall-clock a leadership tenure may keep STARTING new rounds. One
+ *  in-flight embed may still run up to EMBED_TIMEOUT_MS beyond this, so the
+ *  hard tenure ceiling is MAX_TENURE_MS + EMBED_TIMEOUT_MS. */
+const MAX_TENURE_MS = () => envInt('RECALL_QE_MAX_TENURE_MS', 120_000);
+/**
+ * A leader lock older than this is reapable even if its PID looks alive —
+ * PIDs are recycled, so age is the backstop for a reused-PID false positive.
+ * INVARIANT: this must exceed the hard tenure ceiling (MAX_TENURE_MS +
+ * EMBED_TIMEOUT_MS) with margin, or a legitimate live leader could be reaped
+ * mid-embed and a second model load spawned — the floor below enforces that
+ * relationship even under env overrides.
+ */
+const LOCK_MAX_AGE_MS = () =>
+  Math.max(
+    envInt('RECALL_QE_LOCK_MAX_AGE_MS', 10 * 60_000),
+    MAX_TENURE_MS() + EMBED_TIMEOUT_MS() + 60_000,
+  );
 /** Artifacts (req/res/tmp/reap) older than this are swept on entry. */
 const STALE_ARTIFACT_MS = 10 * 60_000;
-/** Max texts per one-shot invocation; a bigger batch forms bounded extra rounds. */
+/** Max texts per ROUND (one one-shot invocation per round) — bounds a single
+ *  round's runtime to one EMBED_TIMEOUT_MS; leftovers roll to the next round,
+ *  where the tenure check runs. */
 const MAX_BATCH_TEXTS = 64;
 /** Max drain rounds one leadership tenure may run before abdicating. */
 const MAX_DRAIN_ROUNDS = 20;
@@ -356,9 +371,16 @@ function writeResponse(dir: string, token: string, res: Omit<ResponseFile, 'v' |
 }
 
 /**
- * Lead: coalesce → embed (one one-shot invocation per ≤MAX_BATCH_TEXTS chunk)
- * → respond → drain late arrivals, bounded. Returns our own vector once our
- * request has been served, or null if we abdicated before serving it.
+ * Lead: coalesce → embed (ONE one-shot invocation per round, ≤MAX_BATCH_TEXTS
+ * texts) → respond → drain late arrivals, bounded by rounds AND tenure.
+ * Returns our own vector once our request has been served, or null if we
+ * abdicated before serving it.
+ *
+ * Tenure bound: no new round starts after MAX_TENURE_MS, so a live tenure can
+ * never approach LOCK_MAX_AGE_MS (hard ceiling = MAX_TENURE_MS + one
+ * EMBED_TIMEOUT_MS, enforced < LOCK_MAX_AGE_MS by the floor above). Without
+ * this, a long-lived legitimate leader could look "over-age" to a follower's
+ * reaper mid-embed and a second concurrent model load would spawn.
  */
 async function leadBatches(
   dir: string,
@@ -366,9 +388,18 @@ async function leadBatches(
   identity: string,
 ): Promise<Float32Array | null> {
   let ownVector: Float32Array | null = null;
+  const tenureDeadline = Date.now() + MAX_TENURE_MS();
   await sleep(COALESCE_MS());
 
   for (let round = 0; round < MAX_DRAIN_ROUNDS; round++) {
+    if (Date.now() >= tenureDeadline) {
+      log({
+        source: 'recall:query-embed',
+        level: 'warn',
+        summary: 'query-embed leader hit its tenure bound — abdicating (remaining requesters re-elect)',
+      });
+      return ownVector;
+    }
     const pending = collectPending(dir, identity);
     if (pending.length === 0) return ownVector;
 
@@ -377,14 +408,12 @@ async function leadBatches(
     // most one query model process exists at any moment.
     if (!stillLeader(dir, myToken)) return ownVector;
 
-    const texts = [...new Set(pending.map((p) => p.req.text))];
+    // One invocation per round; overflow rolls to the next round (where the
+    // tenure/ownership checks run again).
+    const texts = [...new Set(pending.map((p) => p.req.text))].slice(0, MAX_BATCH_TEXTS);
     let vectors: Float32Array[];
     try {
-      vectors = [];
-      for (let i = 0; i < texts.length; i += MAX_BATCH_TEXTS) {
-        const chunk = texts.slice(i, i + MAX_BATCH_TEXTS);
-        vectors.push(...await embedBatchOneShot(chunk, { timeoutMs: EMBED_TIMEOUT_MS() }));
-      }
+      vectors = await embedBatchOneShot(texts, { timeoutMs: EMBED_TIMEOUT_MS() });
       for (const v of vectors) {
         if (v.length !== EXPECTED_DIMS) {
           throw new Error(`query embed returned ${v.length} dims (expected ${EXPECTED_DIMS})`);
@@ -407,7 +436,8 @@ async function leadBatches(
     texts.forEach((t, i) => byText.set(t, vectors[i]!));
 
     for (const p of pending) {
-      const v = byText.get(p.req.text)!;
+      const v = byText.get(p.req.text);
+      if (!v) continue; // overflow text — served in a later round
       if (p.req.token === myToken) {
         ownVector = v;
       } else {
