@@ -10,8 +10,12 @@ vi.mock('../../src/recall/message-store.js', () => ({
   getEmbedVersionStats: vi.fn(() => ({ total: 0, current: 0, stale: 0, coverage: 1 })),
 }));
 
-vi.mock('../../src/recall/embedder.js', () => ({
-  embed: vi.fn(async () => new Float32Array(768)),
+// dualPathSearch now embeds queries through the cross-process coordinator
+// (query-embed-coordinator.ts) instead of calling embed() directly — mock the
+// new seam. Behavior under test is unchanged: a resolved vector enables the
+// semantic path, a rejection degrades to FTS-only.
+vi.mock('../../src/recall/query-embed-coordinator.js', () => ({
+  coordinatedQueryEmbed: vi.fn(async () => new Float32Array(768)),
 }));
 
 vi.mock('../../src/recall/quantize.js', async () => {
@@ -20,12 +24,12 @@ vi.mock('../../src/recall/quantize.js', async () => {
 });
 
 import { searchMessagesFts, searchMessagesSemantic } from '../../src/recall/message-store.js';
-import { embed } from '../../src/recall/embedder.js';
+import { coordinatedQueryEmbed } from '../../src/recall/query-embed-coordinator.js';
 import { dualPathSearch, recencyMultiplier } from '../../src/recall/vector-search.js';
 
 const mockSearchFts = vi.mocked(searchMessagesFts);
 const mockSearchSemantic = vi.mocked(searchMessagesSemantic);
-const mockEmbed = vi.mocked(embed);
+const mockEmbed = vi.mocked(coordinatedQueryEmbed);
 
 // ---------------------------------------------------------------------------
 // Helpers

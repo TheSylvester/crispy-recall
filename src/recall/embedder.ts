@@ -1126,8 +1126,17 @@ async function embedViaHttp(socketPath: string, texts: string[]): Promise<Float3
 /**
  * Embed texts by spawning a fresh llama-embedding process.
  * Extracted from original embedBatch() internals — identical behavior.
+ *
+ * `opts.timeoutMs` bounds the child's total runtime (model load + compute).
+ * The default embedBatch path passes none (backfill batches are legitimately
+ * slow); the query coordinator passes a generous compute deadline so a wedged
+ * one-shot child can never hold cross-process leadership forever.
  */
-async function embedViaProcess(texts: string[], modelPath: string): Promise<Float32Array[]> {
+async function embedViaProcess(
+  texts: string[],
+  modelPath: string,
+  opts?: { timeoutMs?: number },
+): Promise<Float32Array[]> {
   if (!binaryPath) throw new Error('llama-embedding binary not available');
 
   const sanitized = texts.map(t => t.replaceAll(BATCH_SEPARATOR, ' '));
@@ -1183,6 +1192,7 @@ async function embedViaProcess(texts: string[], modelPath: string): Promise<Floa
     const { stdout, stderr } = await execFileAsync(binaryPath, args, {
       maxBuffer: 2 * 1024 * 1024,
       env,
+      ...(opts?.timeoutMs ? { timeout: opts.timeoutMs, killSignal: 'SIGKILL' as const } : {}),
     });
 
     if (stderr) {
@@ -1247,6 +1257,35 @@ export async function embedBatch(texts: string[]): Promise<Float32Array[]> {
   // Serialize embedding calls to prevent CPU contention when multiple
   // recall queries fire concurrently (e.g., 6 parallel search_transcript calls).
   return withEmbedMutex(() => embedBatchInner(texts));
+}
+
+/**
+ * Embed texts via the one-shot `llama-embedding` path ONLY — never the
+ * persistent `llama-server`, regardless of batch size or a server already
+ * running. This is the crux of the query coordinator's "no daemon" guarantee:
+ * `embedBatch` silently switches to llama-server above SERVER_THRESHOLD, and
+ * that server's idle-shutdown timer lives in the calling JS process — a
+ * SIGKILLed caller would orphan a ~1.5 GB model process. The one-shot child
+ * self-terminates after printing its vectors, so nothing can outlive the
+ * invocation.
+ *
+ * Serialized under the same in-process mutex as embedBatch. `opts.timeoutMs`
+ * bounds the child (generous compute deadline; a GPU/CPU model load must not
+ * be killed merely for taking longer than a coalescing window).
+ */
+export async function embedBatchOneShot(
+  texts: string[],
+  opts?: { timeoutMs?: number },
+): Promise<Float32Array[]> {
+  if (texts.length === 0) return [];
+  return withEmbedMutex(async () => {
+    if (!binaryPath) {
+      await ensureBinary();
+    }
+    if (!binaryPath) throw new Error('llama-embedding binary not available');
+    const modelPath = await ensureModel();
+    return embedViaProcess(texts, modelPath, opts);
+  });
 }
 
 async function embedBatchInner(texts: string[]): Promise<Float32Array[]> {
