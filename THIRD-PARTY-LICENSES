@@ -3,162 +3,60 @@ THIRD-PARTY LICENSES — crispy-recall
 
 crispy-recall is MIT-licensed (see LICENSE). It bundles or downloads the
 third-party components below. All production npm dependencies are permissive
-(MIT / ISC / BSD / BlueOak-1.0.0).
+(MIT / ISC / BSD / Apache-2.0, or dual-licensed permissive equivalents).
 
 Bundled-via-download artifacts (not npm packages):
   - llama-embedding (from the llama.cpp project) ............ MIT
   - Nomic Embed Text v1.5 (model weights, Nomic AI) ......... Apache-2.0
-  - node-sqlite3-wasm ...................................... MIT
-  - SQLite (compiled into node-sqlite3-wasm) ............... Public Domain
   - libggml-cuda.so (built from llama.cpp @ b5300, GPU only)  MIT
 
-Regenerate after a production-dependency change with:
+Native SQLite binding:
+  recall's SQLite access is provided by the better-sqlite3 npm package (MIT,
+  listed below). Its native addon, better_sqlite3.node, is fetched for your
+  platform at install time via prebuild-install and embeds SQLite itself
+  (Public Domain). The prebuilt addon is downloaded at install, not shipped
+  inside this package's npm tarball.
+
+Regenerate the npm list after a production-dependency change with:
   npx license-checker-rseidelsohn --production --out THIRD-PARTY-LICENSES
+  (that captures npm packages only — re-add the sections above by hand.)
 
 npm production dependencies (transitive closure):
-  @anthropic-ai/claude-agent-sdk-linux-x64-musl@0.2.114  —  Custom: LICENSE.md
-  @anthropic-ai/claude-agent-sdk-linux-x64@0.2.114  —  Custom: LICENSE.md
-  @anthropic-ai/claude-agent-sdk@0.2.114  —  Custom: README.md
-  @anthropic-ai/sdk@0.81.0  —  MIT
-  @babel/runtime@7.29.2  —  MIT
-  @clack/core@0.3.5  —  MIT
-  @clack/prompts@0.7.0  —  MIT
-  @hono/node-server@1.19.14  —  MIT
-  @isaacs/cliui@8.0.2  —  ISC
-  @modelcontextprotocol/sdk@1.29.0  —  MIT
-  @pkgjs/parseargs@0.11.0  —  MIT
-  @types/node@20.19.41  —  MIT
-  @types/yauzl@2.10.3  —  MIT
-  accepts@2.0.0  —  MIT
-  ajv-formats@3.0.1  —  MIT
-  ajv@8.20.0  —  MIT
-  ansi-regex@5.0.1  —  MIT
-  ansi-regex@6.2.2  —  MIT
-  ansi-styles@4.3.0  —  MIT
-  ansi-styles@6.2.3  —  MIT
-  balanced-match@1.0.2  —  MIT
-  body-parser@2.2.2  —  MIT
-  brace-expansion@2.1.0  —  MIT
-  buffer-crc32@0.2.13  —  MIT
-  bytes@3.1.2  —  MIT
-  call-bind-apply-helpers@1.0.2  —  MIT
-  call-bound@1.0.4  —  MIT
-  color-convert@2.0.1  —  MIT
-  color-name@1.1.4  —  MIT
-  content-disposition@1.1.0  —  MIT
-  content-type@1.0.5  —  MIT
-  content-type@2.0.0  —  MIT
-  cookie-signature@1.2.2  —  MIT
-  cookie@0.7.2  —  MIT
-  cors@2.8.6  —  MIT
-  crispy-recall@0.1.0  —  MIT
-  cross-spawn@7.0.6  —  MIT
-  debug@4.4.3  —  MIT
-  depd@2.0.0  —  MIT
-  dunder-proto@1.0.1  —  MIT
-  eastasianwidth@0.2.0  —  MIT
-  ee-first@1.1.1  —  MIT
-  emoji-regex@8.0.0  —  MIT
-  emoji-regex@9.2.2  —  MIT
-  encodeurl@2.0.0  —  MIT
+  base64-js@1.5.1  —  MIT
+  better-sqlite3@12.11.1  —  MIT
+  bindings@1.5.0  —  MIT
+  bl@4.1.0  —  MIT
+  buffer@5.7.1  —  MIT
+  chownr@1.1.4  —  ISC
+  decompress-response@6.0.0  —  MIT
+  deep-extend@0.6.0  —  MIT
+  detect-libc@2.1.2  —  Apache-2.0
   end-of-stream@1.4.5  —  MIT
-  es-define-property@1.0.1  —  MIT
-  es-errors@1.3.0  —  MIT
-  es-object-atoms@1.1.1  —  MIT
-  escape-html@1.0.3  —  MIT
-  etag@1.8.1  —  MIT
-  eventsource-parser@3.0.8  —  MIT
-  eventsource@3.0.7  —  MIT
-  express-rate-limit@8.5.2  —  MIT
-  express@5.2.1  —  MIT
-  extract-zip@2.0.1  —  BSD-2-Clause
-  fast-deep-equal@3.1.3  —  MIT
-  fast-uri@3.1.2  —  BSD-3-Clause
-  fd-slicer@1.1.0  —  MIT
-  finalhandler@2.1.1  —  MIT
-  foreground-child@3.3.1  —  ISC
-  forwarded@0.2.0  —  MIT
-  fresh@2.0.0  —  MIT
-  function-bind@1.1.2  —  MIT
-  get-intrinsic@1.3.0  —  MIT
-  get-proto@1.0.1  —  MIT
-  get-stream@5.2.0  —  MIT
-  glob@10.5.0  —  ISC
-  gopd@1.2.0  —  MIT
-  has-symbols@1.1.0  —  MIT
-  hasown@2.0.3  —  MIT
-  hono@4.12.19  —  MIT
-  http-errors@2.0.1  —  MIT
-  iconv-lite@0.7.2  —  MIT
+  expand-template@2.0.3  —  (MIT OR WTFPL)
+  file-uri-to-path@1.0.0  —  MIT
+  fs-constants@1.0.0  —  MIT
+  github-from-package@0.0.0  —  MIT
+  ieee754@1.2.1  —  BSD-3-Clause
   inherits@2.0.4  —  ISC
-  ip-address@10.2.0  —  MIT
-  ipaddr.js@1.9.1  —  MIT
-  is-fullwidth-code-point@3.0.0  —  MIT
-  is-promise@4.0.0  —  MIT
-  is-unicode-supported@1.3.0  —  MIT
-  isexe@2.0.0  —  ISC
-  jackspeak@3.4.3  —  BlueOak-1.0.0
-  jose@6.2.3  —  MIT
-  json-schema-to-ts@3.1.1  —  MIT
-  json-schema-traverse@1.0.0  —  MIT
-  json-schema-typed@8.0.2  —  BSD-2-Clause
-  lru-cache@10.4.3  —  ISC
-  math-intrinsics@1.1.0  —  MIT
-  media-typer@1.1.0  —  MIT
-  merge-descriptors@2.0.0  —  MIT
-  mime-db@1.54.0  —  MIT
-  mime-types@3.0.2  —  MIT
-  minimatch@9.0.9  —  ISC
-  minipass@7.1.3  —  BlueOak-1.0.0
-  ms@2.1.3  —  MIT
-  negotiator@1.0.0  —  MIT
-  node-sqlite3-wasm@0.8.57  —  MIT
-  object-assign@4.1.1  —  MIT
-  object-inspect@1.13.4  —  MIT
-  on-finished@2.4.1  —  MIT
+  ini@1.3.8  —  ISC
+  mimic-response@3.1.0  —  MIT
+  minimist@1.2.8  —  MIT
+  mkdirp-classic@0.5.3  —  MIT
+  napi-build-utils@2.0.0  —  MIT
+  node-abi@3.94.0  —  MIT
   once@1.4.0  —  ISC
-  package-json-from-dist@1.0.1  —  BlueOak-1.0.0
-  parseurl@1.3.3  —  MIT
-  path-key@3.1.1  —  MIT
-  path-scurry@1.11.1  —  BlueOak-1.0.0
-  path-to-regexp@8.4.2  —  MIT
-  pend@1.2.0  —  MIT
-  picocolors@1.1.1  —  ISC
-  pkce-challenge@5.0.1  —  MIT
-  proxy-addr@2.0.7  —  MIT
+  prebuild-install@7.1.3  —  MIT
   pump@3.0.4  —  MIT
-  qs@6.15.2  —  BSD-3-Clause
-  range-parser@1.2.1  —  MIT
-  raw-body@3.0.2  —  MIT
-  require-from-string@2.0.2  —  MIT
-  router@2.2.0  —  MIT
-  safer-buffer@2.1.2  —  MIT
-  send@1.2.1  —  MIT
-  serve-static@2.2.1  —  MIT
-  setprototypeof@1.2.0  —  ISC
-  shebang-command@2.0.0  —  MIT
-  shebang-regex@3.0.0  —  MIT
-  side-channel-list@1.0.1  —  MIT
-  side-channel-map@1.0.1  —  MIT
-  side-channel-weakmap@1.0.2  —  MIT
-  side-channel@1.1.0  —  MIT
-  signal-exit@4.1.0  —  ISC
-  sisteransi@1.0.5  —  MIT
-  statuses@2.0.2  —  MIT
-  string-width@4.2.3  —  MIT
-  string-width@5.1.2  —  MIT
-  strip-ansi@6.0.1  —  MIT
-  strip-ansi@7.2.0  —  MIT
-  toidentifier@1.0.1  —  MIT
-  ts-algebra@2.0.0  —  MIT
-  type-is@2.1.0  —  MIT
-  undici-types@6.21.0  —  MIT
-  unpipe@1.0.0  —  MIT
-  vary@1.1.2  —  MIT
-  which@2.0.2  —  ISC
-  wrap-ansi@7.0.0  —  MIT
-  wrap-ansi@8.1.0  —  MIT
+  rc@1.2.8  —  (BSD-2-Clause OR MIT OR Apache-2.0)
+  readable-stream@3.6.2  —  MIT
+  safe-buffer@5.2.1  —  MIT
+  semver@7.8.5  —  ISC
+  simple-concat@1.0.1  —  MIT
+  simple-get@4.0.1  —  MIT
+  string_decoder@1.3.0  —  MIT
+  strip-json-comments@2.0.1  —  MIT
+  tar-fs@2.1.5  —  MIT
+  tar-stream@2.2.0  —  MIT
+  tunnel-agent@0.6.0  —  Apache-2.0
+  util-deprecate@1.0.2  —  MIT
   wrappy@1.0.2  —  ISC
-  yauzl@2.10.0  —  MIT
-  zod-to-json-schema@3.25.2  —  ISC
-  zod@4.4.3  —  MIT
