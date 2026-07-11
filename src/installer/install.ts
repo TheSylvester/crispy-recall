@@ -17,8 +17,8 @@ import {
   intro, outro, note, log as clog, spinner, confirm, isCancel,
 } from '@clack/prompts';
 import {
-  existsSync, readFileSync, writeFileSync, copyFileSync, mkdirSync, openSync,
-  realpathSync, readdirSync, statSync, unlinkSync,
+  chmodSync, existsSync, readFileSync, writeFileSync, mkdirSync, openSync,
+  realpathSync, readdirSync, renameSync, statSync, unlinkSync,
 } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
@@ -162,8 +162,76 @@ function writeSkill(targetPath: string, templatePath: string, runnable: string):
 /** Result of staging: ok, or a hard abort with the user-facing remediation. */
 type StageResult = { ok: true } | { ok: false; remediation: string };
 
+/**
+ * Stage `src` at `dest` without ever truncating `dest` in place.
+ *
+ * An in-place copyFileSync O_TRUNCs the destination. If any live process has
+ * that file mmapped — this very installer maps the staged better_sqlite3.node
+ * during classifyUpgrade()'s read-only probe — the truncate discards the
+ * mapping's relocated (dirty COW) pages (Linux truncate semantics zap private
+ * COW pages too), and they re-fault as raw unrelocated file bytes: the next GC
+ * weak-callback then jumps through a pristine GOT slot and SIGSEGVs. Writing a
+ * sibling temp file and rename()ing it into place swaps only the directory
+ * entry — live mappings keep the old inode, the path serves the new bytes.
+ *
+ * Byte-identical destinations are left untouched (re-install fast path: no
+ * truncate, no inode churn).
+ */
+export function stageFileAtomic(src: string, dest: string): void {
+  const bytes = readFileSync(src);
+  try {
+    if (existsSync(dest) && bytes.equals(readFileSync(dest))) return;
+  } catch { /* unreadable dest → restage it */ }
+  const tmp = `${dest}.staging-${process.pid}`;
+  const mode = statSync(src).mode;
+  writeFileSync(tmp, bytes, { mode });
+  chmodSync(tmp, mode); // writeFileSync's mode is umask-masked; chmod is not
+  try {
+    renameSync(tmp, dest);
+  } catch (e) {
+    // Windows can refuse to replace a file another process holds mapped/open.
+    // Renaming the OPEN file itself is allowed there, so move the old one
+    // aside and land the new one; sweepStaleStagingFiles reaps the orphan
+    // once its holder exits.
+    const setAside = `${dest}.old-${process.pid}-${Date.now()}`;
+    let movedAside = false;
+    try {
+      renameSync(dest, setAside);
+      movedAside = true;
+      renameSync(tmp, dest);
+    } catch {
+      // If the blocked file was TMP (AV scanning the fresh write), both tmp
+      // renames fail while the set-aside succeeded — put the previous file
+      // back so dest is never left missing.
+      if (movedAside) {
+        try { renameSync(setAside, dest); } catch { /* dest lost — re-running install restages it */ }
+      }
+      try { unlinkSync(tmp); } catch { /* best-effort */ }
+      throw e;
+    }
+  }
+}
+
+/** Reap leftovers from prior atomic stages: orphaned `.staging-*` temp files
+ *  (a crashed installer) and `.old-*` set-asides (Windows kept them alive
+ *  until their holder exited). Failures are fine — next install retries. */
+function sweepStaleStagingFiles(): void {
+  let entries: string[];
+  try {
+    entries = readdirSync(binDir());
+  } catch {
+    return;
+  }
+  for (const f of entries) {
+    if (/\.(staging|old)-\d+/.test(f)) {
+      try { unlinkSync(join(binDir(), f)); } catch { /* still held — next time */ }
+    }
+  }
+}
+
 function stageBundles(distDir: string, written: string[]): StageResult {
   mkdirSync(binDir(), { recursive: true });
+  sweepStaleStagingFiles();
   for (const name of STAGED_BUNDLES) {
     const src = join(distDir, name);
     if (!existsSync(src)) {
@@ -171,7 +239,7 @@ function stageBundles(distDir: string, written: string[]): StageResult {
       continue;
     }
     const dest = join(binDir(), name);
-    copyFileSync(src, dest);
+    stageFileAtomic(src, dest);
     written.push(dest);
   }
   return stageNativeBinding(written);
@@ -207,7 +275,11 @@ function stageNativeBinding(written: string[]): StageResult {
   }
 
   const dest = join(binDir(), 'better_sqlite3.node');
-  copyFileSync(binding, dest);
+  // NEVER copyFileSync in place: classifyUpgrade() has already mapped this
+  // exact file into the running installer (openReadonly's staged-binding-first
+  // resolution) — see stageFileAtomic for the truncate→lost-relocations→GC
+  // SIGSEGV this prevents.
+  stageFileAtomic(binding, dest);
   written.push(dest);
 
   // Verify the freshly-staged addon actually dlopens under THIS Node BEFORE
