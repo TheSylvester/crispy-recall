@@ -163,7 +163,7 @@ Install-time backfill indexes the Claude Code and Codex sessions still present o
 - Claude Code (required); Codex session indexing and search are also configured when Codex is detected
 - Linux x64/arm64, macOS x64/arm64, or Windows x64
 - macOS 14+ on Apple Silicon or macOS 13.7+ on Intel
-- 500 MB free recommended for installation; an upgrade from 0.1.x also needs free space roughly equal to the existing database for its rollback snapshot
+- 500 MB free recommended for installation; upgrading also needs free space for retained rollback snapshots — roughly the database size when upgrading from 0.2.x, and roughly twice that from 0.1.x (which keeps two snapshots)
 
 Node 23 is unsupported because no prebuilt SQLite binding is available for it.
 
@@ -186,18 +186,23 @@ The installer:
 
 Use `recall doctor` if setup reports a problem. Use `recall install --offline` with pre-staged assets for an offline install.
 
-### Upgrading from 0.1.x
+### Upgrading
 
-Close active Claude Code and Codex sessions, then make `recall install` the first recall command you run after upgrading:
+Close active Claude Code and Codex sessions, then make `recall install` the first recall command you run after upgrading — it applies any pending one-time database migrations attended, before your agent reopens the database:
 
 ```bash
 npm install -g crispy-recall
 recall install
 ```
 
-The installer snapshots the database, migrates it to native SQLite/WAL, checks integrity, and re-embeds in the background. Search remains available during migration; use `recall status` to watch progress. If a live session holds the database, the installer aborts cleanly so you can exit the session and rerun it. Don't downgrade to `<=0.1.6` after converting the database.
+- **From 0.1.x**, the installer migrates the wasm database to native SQLite/WAL (writing a `~/.recall/recall.db.pre-upgrade-<stamp>` snapshot) and checks integrity, then runs the retrieval-class migration below.
+- **From 0.2.x**, the installer runs the retrieval-class migration: it reclassifies any subagent (agent-leaf) messages as durable-but-excluded-from-default-search, rebuilds the FTS index, and re-embeds affected rows in the background.
 
-Migration works from `recall.db`, not the source transcripts, so indexed history is preserved even when the original JSONL has already been cleaned up. Before changing the database, the installer writes `~/.recall/recall.db.pre-upgrade-<stamp>`; keep free disk roughly equal to the current database size and delete the snapshot only after you're satisfied. The background re-embed resumes after interruption or reboot. Your database is the store of record; if old transcripts are gone, `recall repair --full` cannot recreate them.
+Before it changes anything, the retrieval-class migration writes a `~/.recall/recall.db.pre-retrieval-<stamp>` snapshot; a 0.1.x upgrade therefore keeps two retained snapshots (pre-upgrade and pre-retrieval). Keep free disk roughly equal to the current database size — twice that when upgrading from 0.1.x — and delete the snapshots only after you're satisfied.
+
+If a live session or a running backfill holds the database, the installer aborts cleanly so you can exit it and rerun `recall install`. Search remains available during migration; use `recall status` to watch progress, and the background re-embed resumes after interruption or reboot.
+
+Migration works from `recall.db`, not the source transcripts, so indexed history is preserved even when the original JSONL has already been cleaned up. Your database is the store of record; if old transcripts are gone, `recall repair --full` cannot recreate them. Don't downgrade to `<=0.1.6` after converting the database.
 
 ## Command reference
 
@@ -236,6 +241,7 @@ The installed statusline never opens the database. Its only I/O is one guarded `
 
 - Your index lives in `~/.recall/recall.db`.
 - Search and indexing stay on your machine.
+- While a query is being embedded, its text is written to a transient file under `~/.recall/run/query-embed/` (mode 0600) and deleted as soon as the embedding completes.
 - There is no telemetry.
 - The database is plain SQLite and inspectable with ordinary SQLite tools.
 - Network access is limited to downloading the embedding runtime and model when missing, plus host reachability probes during install and doctor checks.
