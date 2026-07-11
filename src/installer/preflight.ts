@@ -58,6 +58,8 @@ export interface PreflightOptions {
   /** Injectable macOS product-version reader (tests). Returns e.g. "13.5", or
    *  null when unavailable. Defaults to spawning `sw_vers -productVersion`. */
   macosProductVersion?: () => Promise<string | null>;
+  /** Injectable running Node version (tests), e.g. "v22.16.0". Defaults to `process.version`. */
+  nodeVersion?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -393,11 +395,27 @@ function checkDisk(): { disk: string; issue?: PreflightIssue } {
   }
 }
 
-function checkNode(): { node: string; issue?: PreflightIssue } {
-  const node = process.version;
-  const major = parseInt(node.replace(/^v/, '').split('.')[0] ?? '0', 10);
-  if (major < 20) {
-    return { node, issue: { check: 'runtime.node', severity: 'FAIL', message: `Node ${node} < 20 is unsupported (package.json engines requires Node ≥20).`, remediation: 'Upgrade to Node ≥20.' } };
+/**
+ * Node runtime gate. Mirrors package.json `engines` (">=22.16.0 <23 || >=24.0.0")
+ * and the README: recall ships prebuilt better-sqlite3 bindings only for Node 22
+ * LTS (>=22.16) and Node >=24. Node 23 has no prebuilt binding, and anything below
+ * 22.16 predates the ABI the bundled binding targets — both fail fast here with an
+ * actionable message instead of a cryptic native-load error mid-install.
+ */
+function checkNode(nodeVersion: string = process.version): { node: string; issue?: PreflightIssue } {
+  const node = nodeVersion;
+  const [major = 0, minor = 0] = node.replace(/^v/, '').split('.').map((n) => parseInt(n, 10) || 0);
+  const supported = (major === 22 && minor >= 16) || major >= 24;
+  if (!supported) {
+    return {
+      node,
+      issue: {
+        check: 'runtime.node',
+        severity: 'FAIL',
+        message: `Node ${node} is unsupported — recall requires Node 22 LTS (>=22.16) or Node >=24 (package.json engines: ">=22.16.0 <23 || >=24.0.0").${major === 23 ? ' Node 23 has no prebuilt SQLite binding.' : ''}`,
+        remediation: 'Install Node 22 LTS (>=22.16) or Node >=24, then re-run `recall install`.',
+      },
+    };
   }
   return { node };
 }
@@ -456,7 +474,7 @@ export async function runPreflight(opts: PreflightOptions = {}): Promise<Preflig
   checkClaude(report);
   checkCodex(report);
 
-  const node = checkNode();
+  const node = checkNode(opts.nodeVersion);
   report.runtime.node = node.node;
   if (node.issue) (node.issue.severity === 'FAIL' ? report.failures : report.warnings).push(node.issue);
 
