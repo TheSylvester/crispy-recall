@@ -10,244 +10,34 @@ when_to_use: >-
   Trigger for phrases like "remind me about", "pick up where we left off",
   "continue from last time", or when starting complex work in an area with
   obvious prior sessions. Skip for simple lookups and trivial questions.
-allowed-tools: Bash, Agent, Read
 ---
 
 # Recall
 
-Unified tool for session transcript memory — search, read, and browse.
+Search + read past Claude Code / Codex session transcripts. Command: `recall`
+(fallback: `$RECALL_BIN`).
 
-## The two-step pattern
+**Pattern: search → read the match.** `recall "query"` returns rows with session ID +
+matched message ID; then `recall <session-id> <message-id>` reads centered on that match
+(footer shows `--offset` to continue). Don't re-read sessions from the top.
 
-**Step 1: Search.** Every search result includes a matched message ID.
+- Dates go in flags, never query text: `--since`/`--until YYYY-MM-DD`; `--recent` for "lately".
+- Search is scoped to this repo; thin or off-target results → retry with `--all`
+  (or `--project PATH`). Semantic fill returns plausible rows for ANY query — judge
+  relevance yourself.
+- A read's header says `Session:`. If it says `Query:`, the ref fell back to search
+  and the rows are noise — fix the ID; `recall read <ref>` exits nonzero instead of
+  falling back.
+- Transcripts record what was believed, not what is — verify claimed state against
+  git/disk before repeating it.
+- `recall --commit <hash>` / `recall --blame path:line` → the sessions that produced a
+  commit / the code at HEAD (structural match, includes rationale + rejected approaches).
+- `recall --list --since D --until D` browses a day. IDs are opaque; paste back exactly.
+- Just-finished sessions index a few seconds after the turn ends.
+- `recall --help` for everything else.
 
-```bash
-$RECALL_BIN "your query here"
-```
-
-**Step 2: Read the matched message.** Do NOT read the session from the top.
-
-```bash
-$RECALL_BIN <session-id> <message-id>
-```
-
-This auto-centers on the match with ~30% context before and ~70% after,
-filling up to the output budget. The footer tells you the exact `--offset`
-to continue reading forward.
-
-**NEVER start a session read from the top after searching.** The search
-already found the relevant message — go directly to it. Only use
-`$RECALL_BIN <id>` (no message-id) when you genuinely need to start
-from the beginning of a session.
-
-## Confidence tags
-
-Search results are tagged by how they were found:
-- `[FTS5+SEMANTIC]` — Both keyword and meaning matched. High confidence.
-- `[SEMANTIC-ONLY]` — Found by meaning, not exact words. Vocabulary mismatch discovery.
-- `[FTS5-ONLY]` — Exact keyword match only. May be coincidental.
-
-## Sub-agent pattern (recommended for deep research)
-
-For questions requiring multiple searches or reading session content, launch a sub-agent.
-The agent prompt **must** include full CLI instructions — sub-agents don't see this skill file.
-
-```
-Agent(prompt: "You have a recall CLI for searching and reading past session transcripts.
-Use ONLY `$RECALL_BIN` for all transcript access — do NOT read .jsonl files directly,
-do NOT use Grep/Glob/find to locate transcripts.
-
-CLI usage:
-  $RECALL_BIN \"query\"                    Search (returns session IDs + matched message IDs)
-  $RECALL_BIN <session-id> <message-id>   Read centered on matched message (use this after search)
-  $RECALL_BIN <session-id>                Read from beginning (only when you need full arc)
-  $RECALL_BIN <session-id> --offset N     Continue reading from offset N (shown in output footer)
-  $RECALL_BIN read <session-ref> [<message-ref>]  Explicit read for any stored ID (opaque; exits
-                                          nonzero on failure — never falls back to search)
-  $RECALL_BIN search <terms...>           Force a search when a term looks like an ID
-  $RECALL_BIN --list --since YYYY-MM-DD   List recent sessions
-  $RECALL_BIN --help                      Full flag reference
-
-Session/message IDs are OPAQUE strings (UUIDs, agent-<hex> subagent leaves,
-codex-jsonl-* message ids). Paste them back exactly as displayed — full ID or
-a literal prefix both resolve.
-
-DATE HANDLING: Any date the user mentions MUST become a flag — never search text:
-  --since YYYY-MM-DD   Only sessions on or after this date
-  --until YYYY-MM-DD   Only sessions on or before this date (inclusive)
-  --recent             Boost recent sessions (use when user says 'recently', 'latest')
-  Example: \"what happened April 10\" → $RECALL_BIN --list --since 2026-04-10 --until 2026-04-10
-
-PROJECT SCOPING: search and list default to the CURRENT directory's project.
-  --all                Search across ALL projects (use when the answer may live
-                       in another repo, or when a scoped search returns little)
-  --project PATH       Scope to a specific project path instead of the CWD
-  If results look thin or empty, retry with --all before concluding nothing exists.
-
-CRITICAL READING RULE: After searching, ALWAYS read the matched message:
-  $RECALL_BIN <session-id> <message-id>
-This auto-centers on the match and shows surrounding turns. The output
-footer shows the --offset to continue reading forward. NEVER read sessions
-from the beginning after a search — the match is already found for you.
-
-Task: [describe what to find]. Run these searches: [list queries].
-Search EXHAUSTIVELY — do not stop after the first promising result. Run all
-listed queries, read into multiple results, and only report findings after
-you have checked every search path. Cross-reference results and summarize.",
-mode: "auto")
-```
-
-## Other reading modes
-
-| Mode | Command | When to use |
-|------|---------|-------------|
-| **Matched message** | `$RECALL_BIN <id> <msg-id>` | **Always use this after search** — auto-centers on match |
-| Full session | `$RECALL_BIN <id>` | Only when you need the overall arc, not a specific answer |
-| Continue | `$RECALL_BIN <id> --offset N` | Continue from where the last read left off |
-| Newest first | `$RECALL_BIN <id> --reverse` | Looking for recent content in a long session |
-
-## Commit attribution (`--commit` / `--blame`)
-
-Find the session(s) that produced a given commit, or the session(s)
-responsible for specific code in a file. Matches by structurally comparing
-session Edit/Write/MultiEdit tool calls against the commit's diff (tri-gram
-intersection), not by clock proximity. Results include both top-level
-sessions and Task-tool subagent leaves (`agent-<hash>`) with
-`parent_session_id` set.
-
-```bash
-# Sessions that produced one commit
-$RECALL_BIN --commit 864f569
-$RECALL_BIN --commit 864f569 --raw                     # full JSON
-
-# Sessions responsible for a file (HEAD-relative blame)
-$RECALL_BIN --blame src/webview/components/FlexAppLayout.tsx
-
-# Sessions responsible for one line — narrowest, most precise lookup
-$RECALL_BIN --blame src/foo.ts:42
-
-# Sessions responsible for a line range
-$RECALL_BIN --blame src/foo.ts:42-100
-
-# Multiple specs in one query (unioned)
-$RECALL_BIN --blame src/foo.ts:42 src/bar.ts:10-20 --limit 20
-```
-
-`--blame` is HEAD-relative: it runs `git blame` to find the commits
-responsible for the current state of the file (or line range) and
-attributes each. Sessions whose work was overwritten by a later commit
-won't appear — for the full historical iteration set, use `git log` and
-pass each commit to `--commit` separately.
-
-### When to use
-
-- **"Who produced this commit?"** — `--commit <hash>`. Returns the session(s)
-  that typed the edits. Multiple matches mean nested/sequential work.
-- **"Why is this line / block of code here?"** — `--blame <path>:<line>`
-  or `--blame <path>:<L1>-<L2>`. The narrowest, most precise lookup —
-  go straight to the session that authored the line you're staring at.
-- **"What sessions are responsible for this file's current state?"** —
-  `--blame <path>` (no line). Returns one row per (commit, session) for
-  every commit whose lines still live in HEAD.
-- **"Why is this code shaped this way?"** — When refactoring, debugging a
-  regression, or reviewing a legacy pattern, look up the originating session
-  before reasoning from the code alone. The session usually has rejected
-  approaches and constraints that the final code does not.
-
-### Reading the results
-
-Sessions are listed chronologically (oldest first). **The most recent is
-usually the load-bearing one for current code; earlier sessions show
-evolution.** Each row exposes:
-
-- `session` — top-level UUID or `agent-<hash>` subagent leaf
-- `parent_session_id` — set when the match is a subagent; follow this to
-  reach the parent's rationale conversation
-- `content_hits` — tri-gram intersections with the commit's added lines
-- `surviving_in_commit` / `surviving_ratio` — how much of the session's
-  work made it into the commit's final state (low ratio = iterated heavily
-  or was partly overwritten by a later session)
-- `matched_files` — commit-touched files this session edited in window
-- `last_edit_at` — ISO timestamp used for chronological sort
-
-Once you have a session ID, pass it back into recall to read the conversation:
-
-```bash
-$RECALL_BIN <session-id>                        # full session, oldest first
-$RECALL_BIN <session-id> --reverse              # newest first (faster for recent context)
-$RECALL_BIN "rationale keyword" --since DATE    # search within window
-```
-
-**For in-progress sessions**, the Stop hook that indexes a session hasn't
-fired yet — wait a few seconds after the turn finishes, then search again.
-
-## Date handling
-
-**Any date or time indication from the user MUST be translated into date flags.**
-Do NOT put dates into the search query text — dates in FTS5 produce false matches.
-
-```bash
-# Single day — use --since and --until together
-$RECALL_BIN --list --since 2026-04-10 --until 2026-04-10
-$RECALL_BIN "scroll bug" --since 2026-04-10 --until 2026-04-10
-
-# Open range — just one flag
-$RECALL_BIN "recall improvements" --since 2026-04-01
-$RECALL_BIN "old bug" --until 2026-03-15
-```
-
-- `--since DATE` — only sessions on or after this date
-- `--until DATE` — only sessions on or before this date (inclusive of the day)
-- Both accept ISO-8601 dates (YYYY-MM-DD)
-- Both work in search and list modes
-
-**Example:** "What did we work on April 10?" →
-`$RECALL_BIN --list --since 2026-04-10 --until 2026-04-10` to find all sessions,
-then search with topic keywords + date flags if needed.
-
-## Project scope
-
-**Search and list default to the current working directory's project.** Recall
-filters results to the project whose path is your CWD — so from inside one repo
-you only see that repo's sessions. This keeps everyday recall focused, but it
-silently hides history when the answer lives elsewhere.
-
-```bash
-# Default — scoped to the CWD's project
-$RECALL_BIN "auth refactor"
-
-# Search every project (cross-repo questions, or when a scoped search is thin)
-$RECALL_BIN "auth refactor" --all
-
-# Scope to a specific project regardless of CWD
-$RECALL_BIN "auth refactor" --project /home/me/dev/other-repo
-```
-
-- `--all` — disable scoping; search across all indexed projects
-- `--project PATH` — scope to an explicit project path instead of the CWD
-- Both work in search and list modes
-
-**When to reach for `--all`:** the user asks about work that may span repos, the
-question isn't tied to the current repo, or a default (scoped) search returns
-few/zero results. A thin scoped result is often just the scope — retry with
-`--all` before concluding the history doesn't exist.
-
-## Recency boost
-
-When the user says "recently", "latest", "last few days", or otherwise indicates
-they want recent results, add `--recent` to strongly boost newer sessions:
-
-```bash
-$RECALL_BIN "scroll bug fix" --recent
-```
-
-This increases the recency decay from ~50% penalty at 50 days to ~50% at 10 days,
-pushing recent sessions to the top of results. Combine with `--since` for best results.
-
-## Tips
-
-- **Search is cheap, reading is expensive.** Run 3-5 varied queries before committing to reading sessions.
-- **Message IDs are stable.** You can reference them across searches.
-- **Use `--since` / `--until` to scope.** Both search and list modes accept date flags.
-- **Search is scoped to the CWD's project by default.** Add `--all` for cross-repo questions or when a scoped search comes back thin.
-- **Raw JSON output** (`--raw`) is available for programmatic processing.
+**Deep research → sub-agent.** For multi-search timelines, delegate. The sub-agent can't
+see this file, so its prompt must say: use only the `recall` CLI (never Grep/Read .jsonl
+transcripts); run `recall --help` first; search then read matched messages
+(`recall <session-id> <message-id>`); dates as `--since`/`--until` flags; `--all` if
+results are thin; search exhaustively and cross-reference before reporting.
