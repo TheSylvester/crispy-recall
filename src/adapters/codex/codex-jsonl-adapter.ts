@@ -26,6 +26,7 @@ import type {
   ToolResultBlock,
 } from '../../transcript.js';
 import type { CodexJsonlEnvelope } from './codex-jsonl-reader.js';
+import { isSystemContextContent } from '../system-context.js';
 
 // ============================================================================
 // Public API
@@ -191,15 +192,21 @@ function emitMessage(
   if (role === 'developer') return [];
 
   if (role === 'user') {
+    const message = {
+      role: 'user' as const,
+      content: adaptContentItems(contentItems),
+    };
+    // Codex writes AGENTS.md preambles, <INSTRUCTIONS>, and
+    // <environment_context> as plain user messages with no explicit flag —
+    // detect them by content so downstream consumers see isMeta parity
+    // with the Claude adapter.
     return [
       {
         type: 'user',
         uuid: generateId(base.sessionId, counter),
         ...base,
-        message: {
-          role: 'user',
-          content: adaptContentItems(contentItems),
-        },
+        message,
+        ...(isSystemContextContent(message) && { isMeta: true }),
       },
     ];
   }

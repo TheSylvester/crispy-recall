@@ -28,7 +28,7 @@
  * @module recall/message-ingest
  */
 
-import { stripToolContent } from './transcript-utils.js';
+import { stripToolContent, shouldDropAsMeta } from './transcript-utils.js';
 import {
   insertMessages,
   insertMessageVectors,
@@ -208,9 +208,11 @@ export async function ingestSessionMessages(
   const rawProjectId = options?.projectId ?? entriesCwd(rawEntries);
   const projectId = rawProjectId ? normalizePath(rawProjectId) : null;
 
-  // 4. Strip tool content, filter sub-agent entries
+  // 4. Strip tool content, filter sub-agent entries and meta boilerplate.
+  //    shouldDropAsMeta whitelists task notifications and cross-session
+  //    messages — those carry real signal despite the isMeta flag.
   const filtered = stripToolContent(rawEntries);
-  const topLevel = filtered.filter(e => !e.parentToolUseID);
+  const topLevel = filtered.filter(e => !e.parentToolUseID && !shouldDropAsMeta(e));
 
   // 5. Extract text per entry, build MessageRecords
   const records: MessageRecord[] = [];

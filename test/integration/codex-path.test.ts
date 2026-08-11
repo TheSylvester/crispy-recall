@@ -31,6 +31,9 @@ function codexEnvelopes(): Array<Record<string, unknown>> {
   return [
     { timestamp: '2026-02-07T20:34:15.000Z', type: 'session_meta', payload: { id: SID, cwd: '/home/u/proj', cli_version: '0.92.0' } },
     { timestamp: '2026-02-07T20:34:16.000Z', type: 'turn_context', payload: { cwd: '/home/u/proj', model: 'gpt-5-codex' } },
+    // Codex preamble: AGENTS.md body injected as a plain user message — must
+    // be flagged isMeta by the adapter and dropped at ingest.
+    { timestamp: '2026-02-07T20:34:16.500Z', type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: '# AGENTS.md instructions for /home/u/proj\n\nAlways run the linter.' }] } },
     { timestamp: '2026-02-07T20:34:17.000Z', type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Please fix the failing test in utils.ts' }] } },
     { timestamp: '2026-02-07T20:34:18.000Z', type: 'response_item', payload: { type: 'reasoning', summary: [{ type: 'summary_text', text: 'The test fails due to an off-by-one error.' }] } },
     { timestamp: '2026-02-07T20:34:19.000Z', type: 'response_item', payload: { type: 'function_call', call_id: 'call_1', name: 'exec_command', arguments: JSON.stringify({ cmd: 'npm test' }) } },
@@ -51,9 +54,14 @@ describe('codex JSONL adapter', () => {
   it('maps user/assistant/reasoning/function_call and skips developer', () => {
     const entries = adaptCodexJsonlRecords(codexEnvelopes() as any, SID) as any[];
 
-    const user = entries.find((e) => e.type === 'user');
+    const user = entries.find((e) => e.type === 'user' && textOf(e).includes('Please fix the failing test'));
     expect(user).toBeDefined();
-    expect(textOf(user)).toContain('Please fix the failing test');
+    expect(user.isMeta).toBeUndefined(); // real prompt — never flagged
+
+    // AGENTS.md preamble user message carries isMeta (Claude-adapter parity)
+    const preamble = entries.find((e) => textOf(e).startsWith('# AGENTS.md instructions for'));
+    expect(preamble).toBeDefined();
+    expect(preamble.isMeta).toBe(true);
 
     const assistantText = entries.find((e) => e.type === 'assistant' && textOf(e).includes('Fixed the off-by-one'));
     expect(assistantText).toBeDefined();
@@ -210,12 +218,14 @@ describe('codex ingest (reader → adapter → store)', () => {
       [SID],
     ) as Array<{ message_text: string; message_role: string }>;
 
-    // Exactly the two text turns — tool call/result + developer + reasoning stripped.
+    // Exactly the two text turns — tool call/result + developer + reasoning
+    // + AGENTS.md preamble (isMeta) stripped.
     expect(rows).toHaveLength(2);
     const texts = rows.map((r) => r.message_text).join('\n');
     expect(texts).toContain('Please fix the failing test');
     expect(texts).toContain('Fixed the off-by-one');
     expect(texts).not.toContain('internal system reminder');
+    expect(texts).not.toContain('AGENTS.md instructions'); // meta preamble dropped
     expect(texts).not.toContain('npm test'); // tool content stripped
     expect(rows.map((r) => r.message_role).sort()).toEqual(['assistant', 'user']);
   });
