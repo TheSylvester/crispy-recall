@@ -98,6 +98,24 @@ export function extractEntryText(entry: TranscriptEntry): string {
 }
 
 /**
+ * Load a transcript file into adapted TranscriptEntry[] via the vendor reader.
+ *
+ * For codex, the CANONICAL session id must be supplied — the adapter
+ * synthesizes message_ids from it, and those ids must match the stored rows.
+ */
+export function loadTranscriptEntries(
+  transcriptPath: string,
+  vendor: 'claude' | 'codex',
+  canonicalSessionId: string,
+): TranscriptEntry[] {
+  if (vendor === 'claude') {
+    const raw = parseJsonlFile(transcriptPath);
+    return adaptClaudeEntries(raw as unknown as Record<string, unknown>[]);
+  }
+  return adaptCodexJsonlRecords(parseCodexJsonlFile(transcriptPath), canonicalSessionId);
+}
+
+/**
  * Find the working directory recorded on a session's transcript entries.
  *
  * Claude and Codex both stamp `cwd` on their entries; it's constant for a
@@ -172,13 +190,7 @@ export async function ingestSessionMessages(
   // 2. Load entries via vendor-dispatched reader on the given transcript path
   let rawEntries: TranscriptEntry[];
   try {
-    if (vendor === 'claude') {
-      const raw = parseJsonlFile(transcriptPath);
-      rawEntries = adaptClaudeEntries(raw as unknown as Record<string, unknown>[]);
-    } else {
-      const envelopes = parseCodexJsonlFile(transcriptPath);
-      rawEntries = adaptCodexJsonlRecords(envelopes, canonicalId);
-    }
+    rawEntries = loadTranscriptEntries(transcriptPath, vendor, canonicalId);
   } catch (err) {
     return {
       sessionId: canonicalId,

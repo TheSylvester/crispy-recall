@@ -18,6 +18,7 @@ import { detectStatusline } from './statusline-suggest.js';
 import { isBindingLoadError } from '../db.js';
 import { binDir, dbPath, statuslineScript } from '../paths.js';
 import { EMBED_VERSION } from '../recall/embed-config.js';
+import { META_RESIDUE_SQL } from '../recall/purge-meta.js';
 
 export interface DoctorOptions {
   json?: boolean;
@@ -41,6 +42,10 @@ export interface BindingHealth {
    *  `< 1` surfaces an in-progress embed_version re-embed — read on the SAME
    *  readonly connection as journalMode, so doctor never flips the live DB. */
   embedCoverage: number | null;
+  /** Residual meta-boilerplate rows still indexed (null if DB absent /
+   *  pre-migration schema). Non-zero → warn to run `recall backfill
+   *  --purge-meta`; whitelisted rows (task notifications) are not counted. */
+  metaResidue: number | null;
   problems: string[];
 }
 
@@ -126,7 +131,7 @@ function checkBindingHealth(): BindingHealth {
   if (!installed) {
     return {
       installed: false, markerPresent: false, abiOk: null, pinnedNodeOk: null,
-      bindingLoads: false, journalMode: null, embedCoverage: null,
+      bindingLoads: false, journalMode: null, embedCoverage: null, metaResidue: null,
       problems: ['recall is not installed — run `recall install`'],
     };
   }
@@ -163,6 +168,7 @@ function checkBindingHealth(): BindingHealth {
   let bindingLoads = false;
   let journalMode: string | null = null;
   let embedCoverage: number | null = null;
+  let metaResidue: number | null = null;
   const localBinding = stagedBindingPath();
   const dbFile = dbPath();
   if (existsSync(dbFile)) {
@@ -190,6 +196,14 @@ function checkBindingHealth(): BindingHealth {
         embedCoverage = total === 0 ? null : current / total;
       } catch {
         embedCoverage = null; // no vectors table / pre-migration schema
+      }
+      // Residual meta boilerplate on the SAME readonly connection. Prefix-
+      // anchored LIKEs only — a full table scan is seconds on ~350K rows.
+      try {
+        const row = raw.prepare(META_RESIDUE_SQL).get() as { n: number } | undefined;
+        metaResidue = row ? Number(row.n) : null;
+      } catch {
+        metaResidue = null; // pre-migration schema without messages table
       }
       // Pending retrieval-class migration (read-only detection): a messages
       // table without the schema_meta 'complete' marker means normal commands
@@ -244,7 +258,7 @@ function checkBindingHealth(): BindingHealth {
     }
   }
 
-  return { installed, markerPresent, abiOk, pinnedNodeOk, bindingLoads, journalMode, embedCoverage, problems };
+  return { installed, markerPresent, abiOk, pinnedNodeOk, bindingLoads, journalMode, embedCoverage, metaResidue, problems };
 }
 
 function printBinding(b: BindingHealth): void {
@@ -261,6 +275,13 @@ function printBinding(b: BindingHealth): void {
   console.log(`journal_mode:   ${b.journalMode ?? 'no DB yet'}${b.journalMode && b.journalMode !== 'wal' ? '  [DRIFT]' : ''}`);
   if (b.embedCoverage !== null && b.embedCoverage < 1) {
     console.log(`Embed migration: re-embedding to v${EMBED_VERSION} (${Math.round(b.embedCoverage * 100)}%) — semantic search stays available`);
+  }
+  if (b.metaResidue !== null) {
+    console.log(
+      b.metaResidue === 0
+        ? 'Meta residue:   none'
+        : `Meta residue:   ⚠ ${b.metaResidue} boilerplate rows indexed — run: recall backfill --purge-meta`,
+    );
   }
   if (b.problems.length) {
     console.log('  Issues:');

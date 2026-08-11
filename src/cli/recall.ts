@@ -139,7 +139,7 @@ const FLAG_WITH_VALUE = new Set(['--limit', '--offset', '--since', '--until', '-
 const FLAG_BOOLEAN = new Set([
   '--raw', '--raw-messages', '--no-idf',
   '--help', '-h', '--version', '-v', '--list', '--all', '--reverse', '--recent', '--blame',
-  '--no-catchup', '--auto-embed', '--detach',
+  '--no-catchup', '--auto-embed', '--detach', '--purge-meta', '--dry-run',
   // installer subcommand flags
   '--yes', '--offline', '--json', '--purge', '--integrity',
   '--fts', '--vectors', '--full', '--no-claudemd', '--no-backfill', '--auto-backfill',
@@ -245,6 +245,12 @@ BACKFILL FLAGS (with 'recall backfill')
   --auto-embed     Skip the interactive prompt for large embedding gaps
   --vendor V       Restrict to one vendor: claude | codex (omit for both)
   --detach         Spawn a detached child and return immediately
+  --purge-meta     Delete already-indexed machine boilerplate rows, recomputed
+                   from the source transcripts with the ingest meta filter.
+                   Targeted row deletes only — kept rows never re-embed.
+                   Dedicated mode: not combinable with --auto-embed/--detach
+  --dry-run        With --purge-meta: open the database read-only and report
+                   what a real run would delete, without a write
 
 WORKFLOW
   1. Search:  recall "your query"
@@ -1022,6 +1028,25 @@ function parseVendors(): ('claude' | 'codex')[] | undefined {
 }
 
 async function runBackfill() {
+  // --purge-meta is a dedicated mode, dispatched BEFORE initDb(): a dry-run
+  // must open the database read-only and never touch it through the singleton
+  // (whose schema pass takes a write transaction even when it no-ops).
+  if (hasFlag('--purge-meta')) {
+    if (hasFlag('--auto-embed') || hasFlag('--detach')) {
+      console.error('--purge-meta is a dedicated cleanup mode — run it without --auto-embed/--detach.');
+      exit(1);
+    }
+    const { runPurgeMeta, formatPurgeMetaSummary } = await import('../recall/purge-meta.js');
+    const summary = await runPurgeMeta({ dryRun: hasFlag('--dry-run') });
+    if (raw) console.log(JSON.stringify(summary, null, 2));
+    else console.log(formatPurgeMetaSummary(summary));
+    return;
+  }
+  if (hasFlag('--dry-run')) {
+    console.error('--dry-run only applies to backfill --purge-meta.');
+    exit(1);
+  }
+
   initDb();
 
   // SIGINT handler — sets cancel flag so the per-batch transaction can finish.
