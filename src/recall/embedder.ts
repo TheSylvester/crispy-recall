@@ -1192,6 +1192,13 @@ async function embedViaProcess(
     const { stdout, stderr } = await execFileAsync(binaryPath, args, {
       maxBuffer: 2 * 1024 * 1024,
       env,
+      // llama-embedding.exe is a console program. The Stop hook spawns
+      // embed-pending detached (DETACHED_PROCESS), so that parent holds no
+      // console for this child to inherit — without CREATE_NO_WINDOW, Windows
+      // allocates a fresh console and a terminal window flashes on screen once
+      // per batch, at the end of every turn. Server mode is off on Windows, so
+      // this one-shot path runs for every embed there.
+      windowsHide: true,
       ...(opts?.timeoutMs ? { timeout: opts.timeoutMs, killSignal: 'SIGKILL' as const } : {}),
     });
 
