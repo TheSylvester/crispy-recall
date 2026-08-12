@@ -12,10 +12,33 @@
  */
 
 import type { TranscriptEntry } from '../transcript.js';
+import { firstTextContent } from '../adapters/system-context.js';
 
 // ============================================================================
 // Public API
 // ============================================================================
+
+/** Meta entries whose first text starts with one of these prefixes are KEPT (real signal). */
+export const META_KEEP_PREFIXES = [
+  '<task-notification>',
+  '[SYSTEM NOTIFICATION',
+  'Another Claude session sent a message',
+] as const;
+
+/**
+ * True when an adapted entry is machine boilerplate that must not be indexed.
+ * Semantics: entry.isMeta === true AND the entry's first text content (string
+ * content, or the first text block of array content) does not start with any
+ * META_KEEP_PREFIXES entry. Entries without isMeta are never dropped.
+ */
+export function shouldDropAsMeta(entry: TranscriptEntry): boolean {
+  if (entry.isMeta !== true) return false;
+  const text = firstTextContent(entry.message);
+  if (text && META_KEEP_PREFIXES.some((prefix) => text.startsWith(prefix))) {
+    return false;
+  }
+  return true;
+}
 
 /**
  * Strip tool_use, tool_result, and thinking blocks from transcript entries.

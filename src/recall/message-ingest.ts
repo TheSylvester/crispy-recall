@@ -28,7 +28,7 @@
  * @module recall/message-ingest
  */
 
-import { stripToolContent } from './transcript-utils.js';
+import { stripToolContent, shouldDropAsMeta } from './transcript-utils.js';
 import {
   insertMessages,
   insertMessageVectors,
@@ -95,6 +95,24 @@ export function extractEntryText(entry: TranscriptEntry): string {
       .join('\n\n');
   }
   return '';
+}
+
+/**
+ * Load a transcript file into adapted TranscriptEntry[] via the vendor reader.
+ *
+ * For codex, the CANONICAL session id must be supplied — the adapter
+ * synthesizes message_ids from it, and those ids must match the stored rows.
+ */
+export function loadTranscriptEntries(
+  transcriptPath: string,
+  vendor: 'claude' | 'codex',
+  canonicalSessionId: string,
+): TranscriptEntry[] {
+  if (vendor === 'claude') {
+    const raw = parseJsonlFile(transcriptPath);
+    return adaptClaudeEntries(raw as unknown as Record<string, unknown>[]);
+  }
+  return adaptCodexJsonlRecords(parseCodexJsonlFile(transcriptPath), canonicalSessionId);
 }
 
 /**
@@ -172,13 +190,7 @@ export async function ingestSessionMessages(
   // 2. Load entries via vendor-dispatched reader on the given transcript path
   let rawEntries: TranscriptEntry[];
   try {
-    if (vendor === 'claude') {
-      const raw = parseJsonlFile(transcriptPath);
-      rawEntries = adaptClaudeEntries(raw as unknown as Record<string, unknown>[]);
-    } else {
-      const envelopes = parseCodexJsonlFile(transcriptPath);
-      rawEntries = adaptCodexJsonlRecords(envelopes, canonicalId);
-    }
+    rawEntries = loadTranscriptEntries(transcriptPath, vendor, canonicalId);
   } catch (err) {
     return {
       sessionId: canonicalId,
@@ -208,9 +220,11 @@ export async function ingestSessionMessages(
   const rawProjectId = options?.projectId ?? entriesCwd(rawEntries);
   const projectId = rawProjectId ? normalizePath(rawProjectId) : null;
 
-  // 4. Strip tool content, filter sub-agent entries
+  // 4. Strip tool content, filter sub-agent entries and meta boilerplate.
+  //    shouldDropAsMeta whitelists task notifications and cross-session
+  //    messages — those carry real signal despite the isMeta flag.
   const filtered = stripToolContent(rawEntries);
-  const topLevel = filtered.filter(e => !e.parentToolUseID);
+  const topLevel = filtered.filter(e => !e.parentToolUseID && !shouldDropAsMeta(e));
 
   // 5. Extract text per entry, build MessageRecords
   const records: MessageRecord[] = [];

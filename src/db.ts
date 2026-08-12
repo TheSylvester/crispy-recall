@@ -224,6 +224,29 @@ export function isRetrievalMigrationPending(d: RecallDb): boolean {
 }
 
 /**
+ * Open a STANDALONE read-only connection to an existing database.
+ *
+ * Bypasses the singleton entirely: no WAL flip, no schema DDL, no marker
+ * write — the file cannot be mutated through this handle. For read-only
+ * passes that must provably never write (purge-meta --dry-run). The caller
+ * owns the returned connection and must close() it.
+ */
+export function openReadonlyDb(dbPath: string): RecallDb {
+  const nativeBinding = resolveNativeBinding();
+  let raw: RawDatabase;
+  try {
+    raw = nativeBinding
+      ? new Database(dbPath, { readonly: true, fileMustExist: true, nativeBinding })
+      : new Database(dbPath, { readonly: true, fileMustExist: true });
+  } catch (e) {
+    if (isBindingLoadError(e)) throw new BindingLoadError(dbPath, e as Error);
+    throw e;
+  }
+  raw.pragma('busy_timeout = 5000');
+  return createAdapter(raw);
+}
+
+/**
  * Close the database connection and release the singleton.
  */
 export function closeDb(): void {

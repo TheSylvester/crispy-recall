@@ -217,6 +217,7 @@ Migration works from `recall.db`, not the source transcripts, so indexed history
 | `recall --blame <path>[:line[-line]]` | Trace current code back to its producing Claude Code conversations. |
 | `recall install` | Install or upgrade the hooks, skills, local assets, and history index. |
 | `recall backfill [--auto-embed] [--vendor <v>] [--detach]` | Index session transcripts currently on disk, optionally for one vendor or as a detached job. |
+| `recall backfill --purge-meta [--dry-run]` | Delete machine boilerplate rows indexed before the ingest filter existed; `--dry-run` opens the database read-only and only reports. |
 | `recall status` | Show database size, message counts, embedding gap/migration progress, and active backfill state. |
 | `recall doctor [--integrity]` | Run read-only install and database checks. |
 | `recall repair --fts \| --vectors \| --full` | Rebuild FTS5, clear vectors for re-embedding, or fully reingest on-disk transcripts. |
