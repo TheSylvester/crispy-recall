@@ -82,7 +82,7 @@ That distinction matters when you need the exact constraint, command, promise, r
 
 Auto-memory saves what you knew to keep. recall finds what you didn't know you'd need. They complement each other: one keeps selected facts close; the other searches the verbatim conversation record on demand.
 
-Tool calls, tool output, and hidden thinking are intentionally excluded from the searchable conversation. Tool output is re-runnable; the conversation that interpreted it isn't.
+Tool calls, tool output, hidden thinking, and images are intentionally excluded from the searchable conversation. Tool output is re-runnable; the conversation that interpreted it isn't.
 
 ### Continue without replaying the session
 
@@ -257,7 +257,7 @@ The index deliberately outlives source-transcript cleanup. recall doesn't encryp
 - It isn't automatic fact injection into every prompt. Retrieval is pull-based.
 - It isn't a replacement for documentation, tests, or git.
 - It doesn't claim recalled context is still correct.
-- It doesn't preserve tool output or hidden thinking in the searchable conversation.
+- It doesn't preserve tool output, hidden thinking, or images in the searchable conversation.
 - It doesn't yet offer per-session deletion; forgetting is database-level today.
 - Subagent transcripts (Claude Task leaves, Codex child rollouts) are stored durable and readable by explicit ID, but are excluded from default search, lists, and semantic vectors — the parent thread's narration is the canonical memory. There is no search mode that includes them yet.
 
