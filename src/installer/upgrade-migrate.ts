@@ -45,8 +45,8 @@ export interface UpgradeClassification {
 /**
  * Open the live DB read-only without flipping its journal mode. A readonly
  * connection can never write, so it never converts a delete-mode DB — the same
- * discipline `recall doctor` uses. Mirrors the staged-binding-first resolution
- * (bundled runtime has no node_modules) and degrades to null on any failure so
+ * discipline `recall doctor` uses. Loads the SAME binding getDb loaded
+ * (`db.ts resolveNativeBindingPath`) and degrades to null on any failure so
  * the caller can safely assume `needs-migration`.
  */
 function openReadonly(dbFile: string): Database.Database | null {
@@ -60,7 +60,7 @@ function openReadonly(dbFile: string): Database.Database | null {
       ? new Database(dbFile, { readonly: true, fileMustExist: true, nativeBinding: binding })
       : new Database(dbFile, { readonly: true, fileMustExist: true });
   } catch {
-    // Staged binding may be ABI-stale/absent — try default resolution once (dev/test).
+    // The resolved binding may be ABI-stale/absent — try default resolution once.
     try {
       return new Database(dbFile, { readonly: true, fileMustExist: true });
     } catch {

@@ -80,8 +80,8 @@ export function retrievalMigrationPending(): boolean {
   }
 }
 
-/** Open a raw better-sqlite3 handle, staged-binding first (bundled runtime
- *  has no node_modules) — mirrors upgrade-migrate.ts openReadonly. */
+/** Open a raw better-sqlite3 handle through the SAME binding getDb loaded
+ *  (`db.ts resolveNativeBindingPath`) — mirrors upgrade-migrate.ts openReadonly. */
 function openRaw(dbFile: string, opts: { readonly: boolean }): Database.Database | null {
   // The SAME binding getDb loaded: a second copy of the addon would be a
   // second SQLite instance, and closing this handle would then drop the
@@ -94,6 +94,7 @@ function openRaw(dbFile: string, opts: { readonly: boolean }): Database.Database
       ? new Database(dbFile, { ...options, nativeBinding: binding })
       : new Database(dbFile, options);
   } catch {
+    // The resolved binding may be ABI-stale/absent — try default resolution once.
     try {
       return new Database(dbFile, options);
     } catch {

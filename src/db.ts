@@ -447,20 +447,6 @@ function openDatabase(dbPath: string): RawDatabase {
 }
 
 /**
- * Resolve the better-sqlite3 native addon through an ordered candidate chain,
- * returning an absolute path or null if none resolves:
- *
- *   1. sibling of the running bundle — `join(__dirname, 'better_sqlite3.node')`.
- *      Covers the local dev build (build.mjs stages `dist/better_sqlite3.node`)
- *      and the installed bundles staged in `~/.recall/bin` (their __dirname).
- *   2. the installer's own `node_modules/better-sqlite3`, via Node's real module
- *      resolution — covers the npm-global layout, where the published tarball
- *      ships NO sibling `.node` but the addon is a resolvable dependency. This
- *      is the case the stripped-tarball publish blocker turned on.
- *   3. `join(binDir(), 'better_sqlite3.node')` — the staged addon in
- *      `~/.recall/bin`, for a bundle whose own __dirname has no sibling.
- */
-/**
  * The ONE native binding path this process may load.
  *
  * Every opener must use it. Two different `.node` files in one process are two
@@ -475,6 +461,20 @@ export function resolveNativeBindingPath(): string | null {
   return resolveNativeBinding();
 }
 
+/**
+ * Resolve the better-sqlite3 native addon through an ordered candidate chain,
+ * returning an absolute path or null if none resolves:
+ *
+ *   1. sibling of the running bundle — `join(__dirname, 'better_sqlite3.node')`.
+ *      Covers the local dev build (build.mjs stages `dist/better_sqlite3.node`)
+ *      and the installed bundles staged in `~/.recall/bin` (their __dirname).
+ *   2. the installer's own `node_modules/better-sqlite3`, via Node's real module
+ *      resolution — covers the npm-global layout, where the published tarball
+ *      ships NO sibling `.node` but the addon is a resolvable dependency. This
+ *      is the case the stripped-tarball publish blocker turned on.
+ *   3. `join(binDir(), 'better_sqlite3.node')` — the staged addon in
+ *      `~/.recall/bin`, for a bundle whose own __dirname has no sibling.
+ */
 function resolveNativeBinding(): string | null {
   const sibling = join(__dirname, 'better_sqlite3.node');
   if (existsSync(sibling)) return sibling;
