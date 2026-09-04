@@ -19,8 +19,14 @@
 # VACUUM INTO ran add rows too. The gate is what §9.5.2 actually claims: repair
 # re-ingests the frozen files and does NOT RE-KEY them. So the SET of
 # project_keys must be identical before and after (none lost, none added), every
-# key's count must be non-decreasing, and no key may be a mirror-path key. The
-# watermark gate asserts PRESENCE — one row per frozen path — never last_size.
+# key's count must be non-decreasing, and no key may APPEAR with a mirror-path
+# prefix. That last refusal is about RE-KEYING: a git-keyed session rewritten
+# from its mirror path or sidecar cwd shows up as a git: key that DISAPPEARED and
+# a path: key that APPEARED. A path: key already present before the repair is
+# correct — the laptop derives it itself for a non-git cwd such as
+# /home/sylvester/dev, and its sidecar carries it — so it is carried and reported,
+# never failed on. The watermark gate asserts PRESENCE — one row per frozen path
+# — never last_size.
 source "$(dirname "$0")/lib.sh"
 set -u
 NAME=60-hub-repair-full-snapshot
@@ -75,8 +81,15 @@ B=$(snap_sql "$WORK/hist.sql") || fail "$NAME" "the histogram query failed"
 printf '%s\n' "$B" | sed 's/^/    before: /'
 [ -n "$B" ] || fail "$NAME" "the snapshot holds no laptop-mirror rows for the frozen set — run 41/43 first"
 
-step "repair --full on the snapshot (re-ingest + re-embed ~280K messages, up to 60 min)"
-timeout 3600 env RECALL_HOME="$S" RECALL_REMOTE_ROOT="$HOME/.recall/remote" \
+# The re-embed dominates: this box measured ~28 messages/s on the GPU, so a
+# snapshot holding 213K hot messages needs hours, not the 3600 s default. The
+# seat sets the cap per run from the measured rate.
+REPAIR_TIMEOUT=${RECALL_E2E_REPAIR_TIMEOUT:-3600}
+case "$REPAIR_TIMEOUT" in
+  ''|*[!0-9]*|0) fail "$NAME" "RECALL_E2E_REPAIR_TIMEOUT must be a positive integer number of seconds (got '$REPAIR_TIMEOUT')";;
+esac
+step "repair --full on the snapshot (re-ingest + re-embed ~280K messages, up to ${REPAIR_TIMEOUT} s)"
+timeout "$REPAIR_TIMEOUT" env RECALL_HOME="$S" RECALL_REMOTE_ROOT="$HOME/.recall/remote" \
   CLAUDE_CONFIG_DIR="$HOME/.claude" CODEX_HOME="$HOME/.codex" \
   "$NODE" "$HOME/.recall/bin/recall.js" repair --full --yes > "$E2E_LOG_DIR/60-repair.log" 2>&1 \
   || fail "$NAME" "repair --full exited nonzero or timed out (see $E2E_LOG_DIR/60-repair.log)"
@@ -86,7 +99,7 @@ snap_sql "$WORK/hist.sql" > "$WORK/hist2" || fail "$NAME" "the histogram query f
 sed 's/^/    after:  /' "$WORK/hist2"
 printf '%s\n' "$B" > "$WORK/hist1"
 python3 - "$WORK/hist1" "$WORK/hist2" <<'PY' || fail "$NAME" "the laptop-mirror project_key histogram did not hold across repair --full"
-import sys
+import re,sys
 def load(f):
     d={}
     for l in open(f):
@@ -95,23 +108,33 @@ def load(f):
         k,_,c=l.rpartition("|")
         d[k or '<NULL project_key>']=int(c)  # a NULL key prints as an empty field
     return d
+MIRRORKEY=re.compile(r'^(path:/home/sylvester|path:c:/)')
 a=load(sys.argv[1]); b=load(sys.argv[2])
 bad=[]
 for k in sorted(set(a) | set(b)):
     before, after = a.get(k), b.get(k)
-    if before is None: bad.append("key %s APPEARED (%d rows)" % (k, after))
+    if before is None:
+        # An APPEARED key is a violation on its own; a mirror-path prefix names
+        # the cause. A path: key that was already there is the satellite's own
+        # derivation for a non-git cwd and is carried below, not failed on.
+        if MIRRORKEY.match(k):
+            bad.append("key %s APPEARED — re-keyed from the mirror path (%d rows)" % (k, after))
+        else:
+            bad.append("key %s APPEARED (%d rows)" % (k, after))
     elif after is None: bad.append("key %s DISAPPEARED (%d rows)" % (k, before))
     else:
         print("    delta %s: %d -> %d (%+d)" % (k, before, after, after - before))
         if after < before: bad.append("key %s lost rows: %d -> %d" % (k, before, after))
+carried=[k for k in a if MIRRORKEY.match(k)]
+if carried:
+    print("    %d row(s) under %d path: key(s) before the repair (satellite-derived, non-git cwd — carried, not failed on): %s"
+          % (sum(a[k] for k in carried), len(carried), ", ".join(sorted(carried))))
 for l in bad[:10]: print("    %s" % l)
 print("    %d key(s) before, %d after, %d violation(s)" % (len(a), len(b), len(bad)))
 sys.exit(1 if bad else 0)
 PY
 step "the project_key SET is unchanged and no key lost rows (counts may grow: repair re-ingests the live mirror)"
-grep -qE '^path:/home/sylvester|^path:c:/' "$WORK/hist2" \
-  && fail "$NAME" "a laptop-mirror row was re-keyed from the mirror path"
-step "no laptop-mirror row carries a path: key (the Windows host's path:c:/ rows are by design and are not in this query)"
+step "no laptop-mirror key APPEARED with a mirror-path prefix (path: keys present before the repair are carried — DEVIATION §9.5.2)"
 
 WMPAIR=$(snap_sql "$WORK/wm.sql") || fail "$NAME" "the watermark query failed"
 WM=${WMPAIR%%|*}
