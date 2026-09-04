@@ -16,9 +16,12 @@ import { readConfig } from './config.js';
 import { integrityCheck } from './repair.js';
 import { detectStatusline } from './statusline-suggest.js';
 import { isBindingLoadError, CODEX_REKEY_MIGRATION_KEY, LEGACY_CODEX_ID_SQL } from '../db.js';
-import { binDir, dbPath, statuslineScript } from '../paths.js';
+import { binDir, dbPath, remoteRoot, statuslineScript } from '../paths.js';
 import { EMBED_VERSION } from '../recall/embed-config.js';
 import { META_RESIDUE_SQL } from '../recall/purge-meta.js';
+import { mirrorHostSummary, mirrorHosts } from '../hub/mirror.js';
+import { hubDaemonAlive, readHostRecords } from '../hub/runtime.js';
+import { classifyBind } from '../hub/server.js';
 
 export interface DoctorOptions {
   json?: boolean;
@@ -73,13 +76,15 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<number> {
   const embedder = readConfig()?.embedder ?? null;
   const binding = checkBindingHealth();
   const statusline = checkStatuslineHealth();
+  const hub = checkHubHealth();
 
   if (opts.json) {
-    console.log(JSON.stringify({ ...report, embedder, binding, statusline }, null, 2));
+    console.log(JSON.stringify({ ...report, embedder, binding, statusline, hub }, null, 2));
   } else {
     printTable(report, embedder?.mode ?? 'cpu', embedder?.fallbackReason);
     printBinding(binding);
     printStatusline(statusline);
+    printHub(hub);
   }
   const bindingFailed = binding.installed && binding.problems.length > 0;
   // Statusline coverage is WARN-only — it never affects the exit code.
@@ -134,6 +139,100 @@ function printStatusline(h: StatuslineHealth): void {
   } else {
     for (const w of h.warnings) console.log(`  ⚠ ${w}`);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Hub (spec §2.5) — WARN only, never exit-1
+// ---------------------------------------------------------------------------
+
+export interface HubHostHealth {
+  host: string;
+  files: number;
+  lastPush: string | null;
+  sidecarless: number;
+}
+
+export interface HubHealth {
+  /** Configured bind (null = no hub record in config.json). */
+  bind: string | null;
+  bindIsAny: boolean;
+  daemonAlive: boolean;
+  daemonPid: number | null;
+  hosts: HubHostHealth[];
+  /** `agent` sessions whose provenance names more than one transcript path. */
+  collisions: Array<{ sessionId: string; paths: string[] }>;
+  warnings: string[];
+}
+
+/**
+ * Hub-side findings: a mirror with no live daemon, an all-interfaces bind,
+ * per-host mirror facts, and the cross-host session-id collision check. All
+ * WARN — none of it enters `problems` or moves the exit code.
+ */
+export function checkHubHealth(): HubHealth {
+  const warnings: string[] = [];
+  const hubConfig = readConfig()?.hub ?? null;
+  const bind = hubConfig ? (hubConfig.bind ?? null) : null;
+  // An absent `bind` key on an existing hub record is ANY (§2.2).
+  const bindIsAny = !!hubConfig && classifyBind(hubConfig.bind) === 'any';
+  if (bindIsAny) {
+    warnings.push(`hub bind is ${bind === null || bind === '' ? 'absent/empty' : bind} (every interface) — set config.json hub.bind to 127.0.0.1 or your Tailscale address`);
+  }
+
+  const { alive, record } = hubDaemonAlive();
+  const records = readHostRecords();
+  const hosts: HubHostHealth[] = mirrorHosts().map((host) => {
+    const s = mirrorHostSummary(host);
+    return { host, files: s.files, lastPush: records[host]?.lastPushAt ?? null, sidecarless: s.sidecarless };
+  });
+  if (hosts.length > 0 && !alive) {
+    warnings.push(`${remoteRoot()} holds ${hosts.length} satellite host(s) but no hub daemon is running — run \`recall hub serve\` (or \`recall hub install-service\`)`);
+  }
+  for (const h of hosts) {
+    if (h.sidecarless > 0) warnings.push(`host ${h.host}: ${h.sidecarless} mirror file(s) without a sidecar (project key will be NULL for them)`);
+  }
+
+  const collisions: Array<{ sessionId: string; paths: string[] }> = [];
+  const dbFile = dbPath();
+  if (existsSync(dbFile)) {
+    try {
+      const localBinding = stagedBindingPath();
+      const raw = existsSync(localBinding)
+        ? new Database(dbFile, { readonly: true, fileMustExist: true, nativeBinding: localBinding })
+        : new Database(dbFile, { readonly: true, fileMustExist: true });
+      try {
+        const rows = raw.prepare(
+          `SELECT session_id, COUNT(DISTINCT transcript_path) c FROM session_provenance
+           WHERE kind='agent' GROUP BY session_id HAVING c > 1`,
+        ).all() as Array<{ session_id: string; c: number }>;
+        for (const r of rows) {
+          const paths = (raw.prepare(
+            `SELECT DISTINCT transcript_path p FROM session_provenance WHERE session_id = ?`,
+          ).all(r.session_id) as Array<{ p: string | null }>).map((x) => x.p ?? '(null)');
+          collisions.push({ sessionId: r.session_id, paths });
+        }
+      } finally {
+        raw.close();
+      }
+    } catch { /* pre-migration schema or unreadable DB — the binding section reports that */ }
+  }
+  for (const c of collisions) {
+    warnings.push(`session-id collision: ${c.sessionId} → ${c.paths.join(' | ')}`);
+  }
+
+  return { bind, bindIsAny, daemonAlive: alive, daemonPid: record?.pid ?? null, hosts, collisions, warnings };
+}
+
+function printHub(h: HubHealth): void {
+  if (h.bind === null && h.hosts.length === 0 && !h.daemonAlive && h.collisions.length === 0) return;
+  console.log('\nHub (satellite mode)');
+  console.log('--------------------');
+  console.log(`Bind:           ${h.bind === null ? 'not configured' : (h.bind === '' ? "'' (ANY)" : h.bind)}${h.bindIsAny ? '  [ANY]' : ''}`);
+  console.log(`Daemon:         ${h.daemonAlive ? `alive (pid ${h.daemonPid})` : 'not running'}`);
+  for (const host of h.hosts) {
+    console.log(`Host ${host.host}: files ${host.files}, last push ${host.lastPush ?? 'never'}, sidecar-less ${host.sidecarless}, daemon alive ${h.daemonAlive ? 'yes' : 'no'}`);
+  }
+  for (const w of h.warnings) console.log(`  ⚠ ${w}`);
 }
 
 /** Path to the staged addon (beside the bundles). */

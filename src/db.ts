@@ -205,9 +205,31 @@ export function getDb(dbPath: string, opts?: GetDbOptions): RecallDb {
   currentDbPath = dbPath;
 
   ensureSchema(db);
+  ensureStemScratch(db);
   log({ source: 'db', level: 'info', summary: `DB: initialized at ${dbPath}` });
 
   return db;
+}
+
+/**
+ * Per-connection porter-stem scratch tables in the `temp.` schema (spec S14).
+ *
+ * `fts5Stem` (query-sanitizer.ts) runs three autocommit statements on a
+ * scratch FTS5 table; on the SHARED persistent `_stem` two processes
+ * interleave (reproduced: 14/6,000 wrong stems). A `temp.` table is private
+ * to this connection, so no other process can ever see it. The persistent
+ * `_stem`/`_stem_vocab` stay in ensureSchema for older binaries but are no
+ * longer read. Verified on better-sqlite3 12 / SQLite 3.53: `fts5vocab(temp,
+ * _stem, 'row')` resolves the temp-schema source table.
+ */
+function ensureStemScratch(db: RecallDb): void {
+  db.exec(`
+    CREATE VIRTUAL TABLE IF NOT EXISTS temp._stem USING fts5(
+      t, tokenize='porter unicode61'
+    );
+    CREATE VIRTUAL TABLE IF NOT EXISTS temp._stem_vocab
+      USING fts5vocab(temp, _stem, 'row');
+  `);
 }
 
 /** The durable marker row that says the retrieval-class schema is in place. */
