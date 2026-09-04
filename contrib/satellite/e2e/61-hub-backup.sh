@@ -19,7 +19,7 @@ mkdir -p "$SNAP"
 step "original kept at $SNAP/wsl-backup.orig"
 
 python3 - "$BK" <<'PY' || fail "$NAME" "could not insert .recall/remote into the per-path list"
-import sys
+import os,sys
 p=sys.argv[1]; lines=open(p).read().split('\n')
 if any('.recall/remote' in l for l in lines):
     print('    .recall/remote already present — no edit needed'); sys.exit(0)
@@ -29,7 +29,12 @@ for i,l in enumerate(lines):
         print('    line %d now: %s' % (i+1, lines[i].strip())); break
 else:
     print('    could not find the .recall/config.json entry'); sys.exit(1)
-open(p,'w').write('\n'.join(lines))
+# Atomic: write a sibling, carry the original mode, then rename over the script.
+tmp=p+'.e2e-tmp'
+mode=os.stat(p).st_mode
+open(tmp,'w').write('\n'.join(lines))
+os.chmod(tmp,mode)
+os.replace(tmp,p)
 PY
 
 bash -n "$BK" || fail "$NAME" "the edited $BK does not parse"

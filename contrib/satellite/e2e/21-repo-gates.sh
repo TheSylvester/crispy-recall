@@ -30,9 +30,13 @@ if [ "$TEST_RC" != 0 ]; then
   # R-kan3kw: test/integration/stop-hook.test.ts:181 flakes with "database is
   # locked" in 25-37 % of runs. Re-run that ONE file once; any other failing
   # file is a real failure.
-  OTHER=$(grep -E '^ *FAIL ' "$E2E_LOG_DIR/21-test.log" | grep -v 'test/integration/stop-hook.test.ts' | head -5)
-  step "npm test rc=$TEST_RC; other failing files: ${OTHER:-none}"
-  [ -z "$OTHER" ] || fail "$NAME" "npm test failed outside stop-hook.test.ts"
+  # The carve-out applies ONLY when the flake is the WHOLE failing set: a run
+  # whose file list cannot be parsed, or that names any other file, is a real
+  # failure.
+  FAILED=$(grep -oE '^ *FAIL +[^ ]+' "$E2E_LOG_DIR/21-test.log" | awk '{print $2}' | sort -u)
+  step "npm test rc=$TEST_RC; failing files: ${FAILED:-<none parsed>}"
+  [ "$FAILED" = 'test/integration/stop-hook.test.ts' ] \
+    || fail "$NAME" "npm test rc=$TEST_RC; failing files: ${FAILED:-<none parsed — see $E2E_LOG_DIR/21-test.log>}"
   step "re-running test/integration/stop-hook.test.ts once (R-kan3kw)"
   npx vitest run test/integration/stop-hook.test.ts > "$E2E_LOG_DIR/21-stop-hook-rerun.log" 2>&1 \
     || fail "$NAME" "stop-hook.test.ts failed on the re-run too"

@@ -11,6 +11,7 @@
 #
 # Run this BEFORE 50-win-install.sh: it re-issues the silverera2 token.
 source "$(dirname "$0")/lib.sh"
+set -u
 NAME=34-hub-protocol-probes
 exec > >(tee -a "$(log_file "$NAME")") 2>&1
 
@@ -81,7 +82,8 @@ step "superseded siblings: ${SUP:-<none>}"
 WINPATH=$(printf '%s\n' "$OUT" | grep '^winpath=' | cut -d= -f2)
 PID_BEFORE=$(systemctl --user show -p MainPID --value recall-hub)
 step "daemon MainPID before the revoke: $PID_BEFORE"
-"$RECALL_BIN" hub token --revoke "$WIN_HOST" | sed 's/^/    /' || fail "$NAME" "hub token --revoke $WIN_HOST failed"
+REV=$("$RECALL_BIN" hub token --revoke "$WIN_HOST") || fail "$NAME" "hub token --revoke $WIN_HOST failed"
+printf '%s\n' "$REV" | sed 's/^/    /' 
 
 remote_after=$(cat <<REMOTE2
 read -r TW
@@ -112,6 +114,14 @@ rm -rf "$LAP_MIRROR/projects/-tmp-proto" "$WIN_MIRROR/projects/-tmp-proto"
 rmdir --ignore-fail-on-non-empty "$WIN_MIRROR/projects" "$WIN_MIRROR" "$HOME/.recall/remote/$WIN_HOST" 2>/dev/null || true
 step "probe mirrors removed; $WIN_HOST mirror root present: $([ -e "$HOME/.recall/remote/$WIN_HOST" ] && echo yes || echo no)"
 [ ! -e "$HOME/.recall/remote/$WIN_HOST" ] || fail "$NAME" "a $WIN_HOST mirror directory survived the cleanup"
-"$RECALL_BIN" hub status | grep -q "^Host $WIN_HOST:" && fail "$NAME" "hub status still prints a Host $WIN_HOST block"
-step "hub status prints no Host $WIN_HOST block"
+# DEVIATION: §9.2.5 — hub status lists a host from run/hub-hosts.json even after its mirror directory is removed (cli.ts:204); asserted mirror-root absence and 'files 0' instead of the absence of the Host block.
+BLOCK=$("$RECALL_BIN" hub status | grep -A1 "^Host $WIN_HOST:" || true)
+if [ -n "$BLOCK" ]; then
+  printf '%s\n' "$BLOCK" | sed 's/^/    /'
+  printf '%s\n' "$BLOCK" | grep -q 'files 0,' \
+    || fail "$NAME" "the $WIN_HOST mirror is not empty before script 50"
+  step "hub status keeps a Host $WIN_HOST block from run/hub-hosts.json; it reports files 0"
+else
+  step "hub status prints no Host $WIN_HOST block"
+fi
 pass "$NAME"

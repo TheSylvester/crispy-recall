@@ -46,10 +46,18 @@ TSTART=$(date +%s)
 lap 'cd ~/dev/crispy && claude -p "Reply with exactly this test phrase and nothing else: HUB-DOWN-'"$N"'" --model haiku' \
   || fail "$NAME" "claude -p failed on the laptop while the hub was down"
 step "the turn took $(( $(date +%s) - TSTART )) s with the hub down"
-wait_until 10 "lap \"tail -5 ~/.recall/logs/push.log\" | grep -q 'push-failed'" \
+# A bounded poll rather than `wait_until`: the helper redirects its command to
+# /dev/null, which would swallow a `fail` raised by `lap` on a tailnet check.
+TAIL=
+for i in $(seq 1 10); do
+  TAIL=$(lap "tail -5 ~/.recall/logs/push.log")
+  printf '%s\n' "$TAIL" | grep -q 'push-failed' && break
+  sleep 1
+done
+printf '%s\n' "$TAIL" | sed 's/^/    /'
+printf '%s\n' "$TAIL" | grep -q 'push-failed' \
   || fail "$NAME" "push.log gained no push-failed line within 10 s"
-lap "tail -3 ~/.recall/logs/push.log" | sed 's/^/    /'
-lap "tail -3 ~/.recall/logs/push.log" | grep -q 'err=unreachable' \
+printf '%s\n' "$TAIL" | grep -q 'err=unreachable' \
   || fail "$NAME" "the push-failed line does not report 'unreachable'"
 SH=$(lap "ls ~/.recall/logs/stop-hook.log 2>/dev/null | wc -l")
 step "satellite stop-hook.log files: $SH"
@@ -60,9 +68,17 @@ step "push.log $LOG0 → $LOG1 lines while the hub was down"
 step "starting recall-hub"
 systemctl --user start recall-hub || fail "$NAME" "could not start recall-hub"
 wait_until 15 'hub_health | grep -q ok' || fail "$NAME" "the hub did not come back within 15 s"
+DSID=$(hub_sql "SELECT session_id FROM messages WHERE message_text LIKE '%HUB-DOWN-$N%' LIMIT 1")
+step "session carrying HUB-DOWN-$N on the hub: ${DSID:-<none>}"
+[ -n "$DSID" ] || fail "$NAME" "the queued turn never reached the hub database"
 R=$(lap "cd ~/dev/crispy && $P"'recall "HUB-DOWN-'"$N"'"') || fail "$NAME" "the drain-proving query failed"
 printf '%s\n' "$R" | head -8 | sed 's/^/    /'
-printf '%s\n' "$R" | grep -q "HUB-DOWN-$N" || fail "$NAME" "one query after the restart does not find the queued turn"
+# `recall` echoes the query, so a nonce grep would pass unconditionally: match
+# the session id and the Results: line instead.
+NROWS=$(printf '%s\n' "$R" | rows)
+step "unique sessions returned: $NROWS"
+printf '%s\n' "$R" | grep -q "$DSID" || fail "$NAME" "one query after the restart does not return session $DSID"
+[ "$NROWS" -ge 1 ] || fail "$NAME" "the drain-proving query returned no sessions"
 
 # --- §9.3.6b full-sweep recovery -------------------------------------------
 REL=${MFILE#"$MDIR"/}

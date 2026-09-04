@@ -7,6 +7,7 @@ NAME=46-laptop-codex
 exec > >(tee -a "$(log_file "$NAME")") 2>&1
 
 require_hub_up
+lap 'test -f ~/.recall/satellite-token' || fail "$NAME" "the laptop is not installed in satellite mode — run 40-laptop-install.sh first"
 HELP=$(lap 'codex exec --help 2>&1 | head -30')
 printf '%s\n' "$HELP" | sed 's/^/    /'
 USAGE=$(printf '%s\n' "$HELP" | grep -iE '^ *(usage|Usage):' | head -1)

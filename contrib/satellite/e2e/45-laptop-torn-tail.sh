@@ -14,6 +14,7 @@ NAME=45-laptop-torn-tail
 exec > >(tee -a "$(log_file "$NAME")") 2>&1
 
 require_hub_up
+lap 'test -f ~/.recall/satellite-token' || fail "$NAME" "the laptop is not installed in satellite mode — run 40-laptop-install.sh first"
 P='export PATH="$HOME/.local/bin:$PATH"; '
 N=$(nonce)
 U=$(lap 'uuidgen') || fail "$NAME" "uuidgen failed on the laptop"

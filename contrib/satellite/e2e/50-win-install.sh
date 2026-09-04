@@ -25,7 +25,9 @@ step "tarball sha256 source=$A windows=$B"
 [ "$A" = "$B" ] || fail "$NAME" "the tarball copy does not match"
 
 ( umask 077; printf '%s\n' "$RECALL_E2E_TOKEN_WIN" > "$WIN_DIR/token.txt" )
-step "token.txt written (not shown), mode $(stat -c %a "$WIN_DIR/token.txt")"
+M=$(stat -c %a "$WIN_DIR/token.txt")
+[ "$M" = 600 ] || step "NOTE: token.txt is mode $M (DrvFs without metadata ignores umask) — exists only for this step, removed in the trap"
+step "token.txt written (not shown)"
 
 OUT=$(win_cmd 50-install <<CMD
 @echo off

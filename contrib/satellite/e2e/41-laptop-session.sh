@@ -10,6 +10,7 @@ NAME=41-laptop-session
 exec > >(tee -a "$(log_file "$NAME")") 2>&1
 
 require_hub_up
+lap 'test -f ~/.recall/satellite-token' || fail "$NAME" "the laptop is not installed in satellite mode — run 40-laptop-install.sh first"
 CRISPY_KEY=git:d30433f1268b413193c532421b123d58a63ba4b9
 N=$(nonce)
 step "nonce SAT-LAPTOP-$N"

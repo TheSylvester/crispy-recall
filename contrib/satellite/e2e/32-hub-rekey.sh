@@ -8,6 +8,8 @@ set -u
 NAME=32-hub-rekey
 exec > >(tee -a "$(log_file "$NAME")") 2>&1
 
+command -v "$RECALL_BIN" >/dev/null || fail "$NAME" "recall not on PATH — hub upgrade not done"
+
 GAP_SQL="SELECT COUNT(*) FROM messages m WHERE m.retrieval_class='hot' AND m.message_text!='' AND NOT EXISTS (SELECT 1 FROM message_vectors v WHERE v.message_id=m.message_id)"
 FLOOR_SQL="SELECT COUNT(*) FROM messages m WHERE m.retrieval_class='hot' AND m.message_text!='' AND LENGTH(m.message_text) < 50 AND NOT EXISTS (SELECT 1 FROM message_vectors v WHERE v.message_id=m.message_id)"
 
@@ -31,7 +33,8 @@ else
   step "no re-key happened (already complete or a no-op) — no drain needed"
 fi
 
-"$RECALL_BIN" repair --rekey-projects 2>&1 | sed 's/^/    /'
+RP=$("$RECALL_BIN" repair --rekey-projects 2>&1) || fail "$NAME" "repair --rekey-projects exited nonzero"
+printf '%s\n' "$RP" | sed 's/^/    /'
 NULLKEY=$(hub_sql "SELECT COUNT(*) FROM messages WHERE project_key IS NULL AND project_id IS NOT NULL")
 step "rows with project_id and no project_key: $NULLKEY"
 [ "$NULLKEY" = 0 ] || fail "$NAME" "$NULLKEY rows still carry a project_id with a NULL project_key"

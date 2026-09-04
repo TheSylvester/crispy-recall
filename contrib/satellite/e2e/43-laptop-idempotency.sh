@@ -7,6 +7,7 @@ NAME=43-laptop-idempotency
 exec > >(tee -a "$(log_file "$NAME")") 2>&1
 
 require_hub_up
+lap 'test -f ~/.recall/satellite-token' || fail "$NAME" "the laptop is not installed in satellite mode — run 40-laptop-install.sh first"
 # `recall push --full` has a 30-minute budget on the satellite.
 SSH_TIMEOUT=${RECALL_E2E_PUSH_TIMEOUT:-1900}
 P='export PATH="$HOME/.local/bin:$PATH"; '

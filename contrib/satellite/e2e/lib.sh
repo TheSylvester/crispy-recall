@@ -48,16 +48,16 @@ pass() { # $1 script name
 }
 
 # fail <script name> <reason...> — prints the ONE final line and stops the run.
-# Inside a command substitution stdout is captured, so the line goes to stderr
-# (the script tees both into its log) and the top-level shell is signalled.
+# The line always goes to stderr (a caller may have redirected stdout into a
+# command substitution, or into /dev/null inside `wait_until`) AND straight into
+# the script log, so a failure raised from a redirected sub-shell is never lost.
+# The top-level shell is signalled when `fail` runs in a sub-shell.
 fail() { # $1 script name, $2.. reason
   local n=$1; shift
-  if [ "${BASHPID:-$$}" != "$$" ]; then
-    printf 'FAIL %s — %s\n' "$n" "$*" >&2
-    kill -TERM $$ 2>/dev/null
-    exit 1
-  fi
-  printf 'FAIL %s — %s\n' "$n" "$*"
+  local msg="FAIL $n — $*"
+  printf '%s\n' "$msg" >> "$(log_file "$n")" 2>/dev/null
+  printf '%s\n' "$msg" >&2
+  [ "${BASHPID:-$$}" != "$$" ] && kill -TERM $$ 2>/dev/null
   exit 1
 }
 
@@ -96,6 +96,16 @@ load_tokens() {
 
 nonce() {
   openssl rand -hex 6
+}
+
+# rows — unique-session count of a `recall` search, read from stdin. runSearch
+# ALWAYS prints `Results: <n> messages, <m> unique sessions (showing …)`
+# (recall.ts:968), including for zero results, so this is the only safe row
+# count: the table itself holds opaque ids (UUID, agent-<7hex>, codex-jsonl-…).
+rows() {
+  local n
+  n=$(sed -nE 's/^Results: ([0-9]+) messages, ([0-9]+) unique sessions.*/\2/p' | head -1)
+  printf '%s' "${n:-0}"
 }
 
 # --- hub --------------------------------------------------------------------

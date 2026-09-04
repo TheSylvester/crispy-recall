@@ -31,6 +31,7 @@ const STATE_CHANGING = ['33-hub-hardening.sh', '44-laptop-failures.sh', '50-win-
 const HELPERS = [
   'pass', 'fail', 'step', 'load_tokens', 'nonce', 'hub_sql', 'lap', 'lap_put', 'lap_stdin',
   'win_cmd', 'wait_until', 'hub_health', 'require_hub_up', 'mirror_dir', 'log_file', 'write_token_file',
+  'rows',
 ];
 
 const text = (f: string) => readFileSync(join(DIR, f), 'utf8');
@@ -49,8 +50,16 @@ describe('contrib/satellite/e2e — script lint', () => {
     expect(() => execFileSync('bash', ['-n', join(DIR, f)], { stdio: 'pipe' })).not.toThrow();
   });
 
-  it.each(SCRIPTS)('%s sets -u', (f) => {
-    expect(text(f)).toMatch(/^set -u$/m);
+  // `set -u` must be in force before the first heredoc, and — for every script
+  // this unit owns — within the first 20 lines, so no body runs unguarded.
+  // 10-parity.sh is out of this unit's scope and carries a long file header.
+  it.each(SCRIPTS)('%s sets -u early', (f) => {
+    const l = lines(f);
+    const setU = l.findIndex((x) => /^set -u$/.test(x));
+    expect(setU).toBeGreaterThanOrEqual(0);
+    const firstHeredoc = l.findIndex((x) => /<<-?'?[A-Za-z_]+'?/.test(x));
+    if (firstHeredoc >= 0) expect(setU).toBeLessThan(firstHeredoc);
+    if (f !== '10-parity.sh') expect(setU).toBeLessThan(20);
   });
 
   it.each(NEEDS_LIB)('%s sources lib.sh', (f) => {
@@ -148,8 +157,9 @@ describe('contrib/satellite/e2e — script lint', () => {
     expect(lastRm).toBeGreaterThan(guard);
   });
 
+  // An INSTALLING trap: `trap - EXIT` (which clears one) must not satisfy this.
   it.each(STATE_CHANGING)('%s restores state from an EXIT trap', (f) => {
-    expect(text(f)).toMatch(/trap .* EXIT/);
+    expect(text(f)).toMatch(/trap\s+[^-\s][^\n]*\bEXIT\b/);
   });
 
   it.each(RUNNABLE)('%s calls only helpers that lib.sh defines', (f) => {

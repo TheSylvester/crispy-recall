@@ -26,12 +26,14 @@ systemctl --user daemon-reload || true
 step "hub: unit active state now: $(systemctl --user is-active recall-hub 2>/dev/null || echo inactive)"
 
 step "hub: revoking both tokens"
-"$RECALL_BIN" hub token --revoke "$LAPTOP_HOST" | sed 's/^/    /' || true
-"$RECALL_BIN" hub token --revoke "$WIN_HOST" | sed 's/^/    /' || true
+REV1=$("$RECALL_BIN" hub token --revoke "$LAPTOP_HOST" 2>&1) || true
+REV2=$("$RECALL_BIN" hub token --revoke "$WIN_HOST" 2>&1) || true
+printf '%s\n%s\n' "$REV1" "$REV2" | sed 's/^/    /' 
 
 step "laptop: uninstalling"
-lap 'export PATH="$HOME/.local/bin:$PATH"; recall uninstall --yes 2>&1 | tail -5; npm uninstall -g --prefix "$HOME/.local" crispy-recall 2>&1 | tail -3; [ -f ~/.claude/settings.json.pre-e2e ] && cp ~/.claude/settings.json.pre-e2e ~/.claude/settings.json && echo settings.json restored; rm -rf ~/.claude/projects/-tmp-recall-torn; rm -f /tmp/crispy-recall.tgz; echo laptop done' \
-  | sed 's/^/    /' || step "WARNING: the laptop teardown reported an error"
+LAPOUT=$(lap 'export PATH="$HOME/.local/bin:$PATH"; recall uninstall --yes 2>&1 | tail -5; npm uninstall -g --prefix "$HOME/.local" crispy-recall 2>&1 | tail -3; [ -f ~/.claude/settings.json.pre-e2e ] && cp ~/.claude/settings.json.pre-e2e ~/.claude/settings.json && echo settings.json restored; rm -rf ~/.claude/projects/-tmp-recall-torn; rm -f /tmp/crispy-recall.tgz; echo laptop done') \
+  || step "WARNING: the laptop teardown reported an error"
+printf '%s\n' "$LAPOUT" | sed 's/^/    /'
 
 step "windows: uninstalling"
 win_cmd 90-teardown <<CMD

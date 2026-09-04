@@ -24,16 +24,16 @@ printf '%s\n' "$R" | head -10 | sed 's/^/    /'
 printf '%s\n' "$R" | grep -q "$SID" || fail "$NAME" "the laptop session is not found from ~/dev/crispy without --all"
 
 H=$(lap "cd ~/dev/crispy && $P"'recall "'"$PHRASE"'"') || fail "$NAME" "the hub-only phrase query failed"
-HITS=$(printf '%s\n' "$H" | grep -cE '^ +[0-9]+ +[0-9a-f-]{36} ')
-step "hub-authored crispy rows visible from the laptop without --all: $HITS"
-[ "$HITS" -ge 1 ] || fail "$NAME" "the cross-host git key returned no hub rows for '$PHRASE'"
+HITS=$(printf '%s\n' "$H" | rows)
+step "hub-authored crispy sessions visible from the laptop without --all: $HITS"
+[ "$HITS" -ge 1 ] || fail "$NAME" "the cross-host git key returned no hub sessions for '$PHRASE'"
 
 R2=$(lap "cd ~ && $P"'recall "SAT-LAPTOP-'"$NONCE"'" --project ~/dev/crispy') || fail "$NAME" "--project query failed"
 printf '%s\n' "$R2" | grep -q "$SID" || fail "$NAME" "--project ~/dev/crispy does not find the session from ~"
 R3=$(lap "cd ~ && $P"'recall "SAT-LAPTOP-'"$NONCE"'" --project /tmp') || true
-N3=$(printf '%s\n' "$R3" | grep -cE '^ +[0-9]+ +[0-9a-f-]{36} ')
-step "--project /tmp rows: $N3"
-[ "$N3" = 0 ] || fail "$NAME" "--project /tmp returned $N3 rows"
+N3=$(printf '%s\n' "$R3" | rows)
+step "--project /tmp unique sessions: $N3"
+[ "$N3" = 0 ] || fail "$NAME" "--project /tmp returned $N3 sessions"
 
 MID=$(hub_sql "SELECT message_id FROM messages WHERE session_id='$SID' ORDER BY message_seq LIMIT 1")
 step "first message id of $SID: $MID"

@@ -34,6 +34,10 @@ sqlite3 -readonly "$HOME/.recall/recall.db" "VACUUM INTO '$S/recall.db'" \
 ln -s "$HOME/.recall/bin" "$S/bin"
 ln -s "$HOME/.recall/models" "$S/models"
 cp "$HOME/.recall/config.json" "$S/"
+# Sampled the instant the snapshot is taken: a push landing mid-run would add
+# mirror files the snapshot's watermark table can never hold.
+FILES_PRE=$(find "$HOME/.recall/remote" -name '*.jsonl' ! -name '*.superseded-*' | wc -l)
+step "mirror files at snapshot time: $FILES_PRE"
 step "snapshot at $S ($(du -m "$S/recall.db" | cut -f1) MiB), bin and models symlinked"
 
 Q="SELECT project_key, COUNT(*) FROM messages m JOIN session_provenance p USING(session_id) WHERE p.transcript_path LIKE '%/remote/sylvester-laptop/%' GROUP BY 1"
@@ -56,7 +60,8 @@ printf '%s\n' "$A" | grep -qE '^path:/home/sylvester|^path:c:/' \
 step "no laptop-mirror row carries a path: key (the Windows host's path:c:/ rows are by design and are not in this query)"
 
 WM=$(sqlite3 -readonly "$S/recall.db" "SELECT COUNT(*) FROM ingest_watermark WHERE transcript_path LIKE '%/remote/%'")
-FILES=$(find "$HOME/.recall/remote" -name '*.jsonl' ! -name '*.superseded-*' | wc -l)
-step "mirror watermarks in the snapshot: $WM   mirror files on disk: $FILES"
-[ "$WM" = "$FILES" ] || fail "$NAME" "watermark count $WM does not equal the mirror file count $FILES"
+FILES_POST=$(find "$HOME/.recall/remote" -name '*.jsonl' ! -name '*.superseded-*' | wc -l)
+step "mirror watermarks in the snapshot: $WM   mirror files: $FILES_PRE at snapshot time, $FILES_POST now"
+[ "$FILES_PRE" = "$FILES_POST" ] || step "NOTE: $(( FILES_POST - FILES_PRE )) mirror file(s) arrived during the run; the gate compares against the snapshot-time count"
+[ "$WM" = "$FILES_PRE" ] || fail "$NAME" "watermark count $WM does not equal the snapshot-time mirror file count $FILES_PRE"
 pass "$NAME"

@@ -12,10 +12,13 @@ NAME=52-win-queries
 exec > >(tee -a "$(log_file "$NAME")") 2>&1
 
 require_hub_up
+[ -e /mnt/c/Users/silve/.recall/config.json ] || fail "$NAME" "Windows satellite not installed — run 50-win-install.sh first"
 VARS=$E2E_LOG_DIR/51.vars
 [ -f "$VARS" ] || fail "$NAME" "no $VARS — run 51-win-sessions.sh first"
+WIN_SID_PATH=
 # shellcheck disable=SC1090
 . "$VARS"
+[ -n "$WIN_SID_PATH" ] || fail "$NAME" "$VARS names no WIN_SID_PATH — re-run 51-win-sessions.sh"
 
 OUT=$(win_cmd 52a <<CMD
 @echo off
@@ -25,8 +28,13 @@ exit /b %ERRORLEVEL%
 CMD
 ) || fail "$NAME" "the query from C:\\winDev\\starcon-research exited nonzero"
 printf '%s\n' "$OUT" | head -12 | sed 's/^/    /'
-printf '%s\n' "$OUT" | grep -q "SAT-WIN-$WIN_NONCE" \
-  || fail "$NAME" "the session is not found from its own directory without --all"
+# `recall` echoes the query first (recall.ts:967), so a nonce grep would pass
+# whatever came back: match the session id 51 recorded and the Results: count.
+N1=$(printf '%s\n' "$OUT" | rows)
+step "52a unique sessions: $N1"
+printf '%s\n' "$OUT" | grep -q "$WIN_SID_PATH" \
+  || fail "$NAME" "session $WIN_SID_PATH is not found from its own directory without --all"
+[ "$N1" -ge 1 ] || fail "$NAME" "52a returned no sessions"
 
 OUT2=$(win_cmd 52b <<CMD
 @echo off
@@ -36,8 +44,11 @@ exit /b %ERRORLEVEL%
 CMD
 ) || fail "$NAME" "the query from the differently-cased path exited nonzero"
 printf '%s\n' "$OUT2" | head -12 | sed 's/^/    /'
-printf '%s\n' "$OUT2" | grep -q "SAT-WIN-$WIN_NONCE" \
+N2=$(printf '%s\n' "$OUT2" | rows)
+step "52b unique sessions: $N2"
+printf '%s\n' "$OUT2" | grep -q "$WIN_SID_PATH" \
   || fail "$NAME" "the folded key half does not match from c:\\WINDEV\\starcon-research"
+[ "$N2" -ge 1 ] || fail "$NAME" "52b returned no sessions"
 
 count_conhost() {
   win_cmd "$1" <<'CMD'

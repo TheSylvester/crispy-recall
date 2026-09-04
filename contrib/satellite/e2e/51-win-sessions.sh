@@ -13,10 +13,13 @@ NAME=51-win-sessions
 exec > >(tee -a "$(log_file "$NAME")") 2>&1
 
 require_hub_up
+[ -e /mnt/c/Users/silve/.recall/config.json ] || fail "$NAME" "Windows satellite not installed — run 50-win-install.sh first"
 CRISPY_KEY=git:d30433f1268b413193c532421b123d58a63ba4b9
 PHRASE=${RECALL_E2E_HUB_ONLY_PHRASE:-VACUUM INTO snapshot of the recall database}
 N=$(nonce)
 MDIR=$(mirror_dir "$WIN_HOST" claude)
+label_a='non-git path key'
+label_b='cross-host git key' 
 
 vector_gate() { # $1 session id
   local gap vec
@@ -28,12 +31,14 @@ vector_gate() { # $1 session id
 }
 
 step "(a) non-git path key — nonce SAT-WIN-$N"
-win_cmd 51a <<CMD | sed 's/^/    /'
+OUT_51a=$(win_cmd 51a <<CMD
 @echo off
 cd /d C:\winDev\starcon-research
 call $WIN_CLAUDE_W -p Reply with exactly this test phrase and nothing else: SAT-WIN-$N --model haiku
 exit /b %ERRORLEVEL%
 CMD
+) || fail "$NAME" "the $label_a Windows turn exited nonzero"
+printf '%s\n' "$OUT_51a" | tail -15 | sed 's/^/    /'
 wait_until 60 "grep -rl 'SAT-WIN-$N' '$MDIR/projects' 2>/dev/null | head -1 | grep -q ." \
   || fail "$NAME" "no mirror file under $MDIR/projects carries SAT-WIN-$N within 60 s"
 FA=$(grep -rl "SAT-WIN-$N" "$MDIR/projects" | head -1)
@@ -50,12 +55,14 @@ step "sid=$SIDA project_id=$PIDA project_key=$KEYA"
 [ "$KEYA" = 'path:c:/windev/starcon-research' ] || fail "$NAME" "project_key is '$KEYA', expected path:c:/windev/starcon-research"
 
 step "(b) cross-host git key — nonce SAT-WIN-GIT-$N"
-win_cmd 51b <<CMD | sed 's/^/    /'
+OUT_51b=$(win_cmd 51b <<CMD
 @echo off
 cd /d C:\winDev\crispy
 call $WIN_CLAUDE_W -p Reply with exactly this test phrase and nothing else: SAT-WIN-GIT-$N --model haiku
 exit /b %ERRORLEVEL%
 CMD
+) || fail "$NAME" "the $label_b Windows turn exited nonzero"
+printf '%s\n' "$OUT_51b" | tail -15 | sed 's/^/    /'
 wait_until 60 "[ -n \"\$(sqlite3 -readonly '$HOME/.recall/recall.db' \"SELECT session_id FROM messages WHERE message_text LIKE '%SAT-WIN-GIT-$N%' LIMIT 1\")\" ]" \
   || fail "$NAME" "no hub row carries SAT-WIN-GIT-$N within 60 s"
 SIDB=$(hub_sql "SELECT session_id FROM messages WHERE message_text LIKE '%SAT-WIN-GIT-$N%' LIMIT 1")
@@ -72,9 +79,9 @@ exit /b %ERRORLEVEL%
 CMD
 ) || fail "$NAME" "the Windows forwarded query exited nonzero"
 printf '%s\n' "$OUTC" | head -12 | sed 's/^/    /'
-HITS=$(printf '%s\n' "$OUTC" | grep -cE '^ +[0-9]+ +[0-9a-f-]{36} ')
-step "hub-authored crispy rows visible from Windows without --all: $HITS"
-[ "$HITS" -ge 1 ] || fail "$NAME" "the cross-host git key returned no hub rows for '$PHRASE'"
+HITS=$(printf '%s\n' "$OUTC" | rows)
+step "hub-authored crispy sessions visible from Windows without --all: $HITS"
+[ "$HITS" -ge 1 ] || fail "$NAME" "the cross-host git key returned no hub sessions for '$PHRASE'"
 
 vector_gate "$SIDA"
 vector_gate "$SIDB"
