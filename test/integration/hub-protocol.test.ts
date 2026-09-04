@@ -65,7 +65,7 @@ describe('doctor hub section on a machine with no mirror', () => {
     expect(h.hosts).toEqual([]);
     expect(h.bind).toBeNull();
     expect(h.daemonAlive).toBe(false);
-    expect(h.collisions).toEqual({ refusedByHost: [], logLines: 0, recentSessionIds: [], crossCheck: [] });
+    expect(h.collisions).toEqual({ refusedByHost: [], logLines: 0, logLinesTruncated: false, recentSessionIds: [] });
     expect(hasCollisionEvidence(h.collisions)).toBe(false);
     expect(h.warnings).toEqual([]);
     const lines: string[] = [];

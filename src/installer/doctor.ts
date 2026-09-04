@@ -8,7 +8,7 @@
  * @module installer/doctor
  */
 
-import { existsSync, readFileSync } from 'node:fs';
+import { closeSync, existsSync, fstatSync, openSync, readFileSync, readSync } from 'node:fs';
 import { join, isAbsolute } from 'node:path';
 import Database from 'better-sqlite3';
 import { runPreflight, claudeSettingsPath, type PreflightReport } from './preflight.js';
@@ -163,21 +163,28 @@ export interface HubHostHealth {
  *
  * The evidence that DOES exist is what the daemon records when it refuses:
  * the per-host `refusedCollisions` counter in `run/hub-hosts.json` and the
- * `session-id collision …` lines in `logs/hub.log`. This report is built
- * from those, plus an optional DB cross-check for the case where the log
- * was rotated away.
+ * `session-id collision …` lines in `logs/hub.log`. This report is built from
+ * those two, and from nothing else.
+ *
+ * A DB cross-check was tried and REMOVED: joining session_provenance to
+ * ingest_watermark on a suffix match of the session id is unindexable (a
+ * leading wildcard with a non-constant right-hand side) and measured 54.5 s
+ * read-only on a 27,508 × 36,880-row live DB, inside a synchronous
+ * `recall doctor`. It was also WRONG: it reported 15 purely local
+ * duplicate-subagent-id pairs (one `agent-<hex>` transcript under two project
+ * directories, both under `~/.claude`, neither under `remoteRoot()`) as
+ * cross-host collisions on a healthy hub. Local duplicate subagent ids are
+ * tracked separately (spec §10, R-c2vs0c) and are not S11 collisions.
  */
 export interface HubCollisionReport {
   /** Hosts with a non-zero refusal counter. */
   refusedByHost: Array<{ host: string; count: number }>;
-  /** `session-id collision …` lines currently in hub.log. */
+  /** `session-id collision …` lines in the hub.log tail window. */
   logLines: number;
+  /** True when the log was longer than the window, so `logLines` is a floor. */
+  logLinesTruncated: boolean;
   /** The last 5 `sid=` values from those lines, oldest first. */
   recentSessionIds: string[];
-  /** A watermark path for a session whose stored provenance names a DIFFERENT
-   *  path — the residue a refused push leaves if it ever reached a watermark.
-   *  Only computed on a hub that has satellite hosts. */
-  crossCheck: Array<{ sessionId: string; provenancePath: string; watermarkPath: string }>;
 }
 
 export interface HubHealth {
@@ -194,32 +201,64 @@ export interface HubHealth {
 
 const COLLISION_LINE = /session-id collision host=(\S+) sid=(\S+)/;
 
+/** How much of hub.log the report reads. It is append-only and unrotated —
+ *  one line per request and per five-minute sweep — so it is read from the
+ *  END, never whole. */
+export const HUB_LOG_TAIL_BYTES = 256 * 1024;
+
 /** Read the refusal evidence the daemon persists. Never throws. */
-export function readCollisionEvidence(): Pick<HubCollisionReport, 'refusedByHost' | 'logLines' | 'recentSessionIds'> {
+export function readCollisionEvidence(): Omit<HubCollisionReport, never> {
   const refusedByHost = Object.entries(readHostRecords())
     .filter(([, r]) => (r.refusedCollisions ?? 0) > 0)
     .map(([host, r]) => ({ host, count: r.refusedCollisions }))
     .sort((a, b) => a.host.localeCompare(b.host));
+
   let lines: string[] = [];
+  let truncated = false;
+  let fd: number | undefined;
   try {
-    lines = readFileSync(join(logsDir(), 'hub.log'), 'utf-8').split('\n').filter((l) => COLLISION_LINE.test(l));
-  } catch { /* no log yet */ }
+    fd = openSync(join(logsDir(), 'hub.log'), 'r');
+    const size = fstatSync(fd).size;
+    const want = Math.min(size, HUB_LOG_TAIL_BYTES);
+    const start = size - want;
+    truncated = start > 0;
+    const buf = Buffer.allocUnsafe(want);
+    let read = 0;
+    while (read < want) {
+      const n = readSync(fd, buf, read, want - read, start + read);
+      if (n <= 0) break;
+      read += n;
+    }
+    const window = buf.subarray(0, read).toString('utf-8').split('\n');
+    // A positioned read can land mid-line; the first element is then a
+    // fragment, so drop it rather than half-parse it.
+    if (truncated) window.shift();
+    lines = window.filter((l) => COLLISION_LINE.test(l));
+  } catch { /* no log yet */ } finally {
+    if (fd !== undefined) { try { closeSync(fd); } catch { /* ignore */ } }
+  }
+
   const ids: string[] = [];
   for (const l of lines) {
     const m = COLLISION_LINE.exec(l);
     if (m?.[2] && !ids.includes(m[2])) ids.push(m[2]);
   }
-  return { refusedByHost, logLines: lines.length, recentSessionIds: ids.slice(-5) };
+  return { refusedByHost, logLines: lines.length, logLinesTruncated: truncated, recentSessionIds: ids.slice(-5) };
+}
+
+/** `12` or `≥12` — the count is a floor when the tail window was truncated. */
+function countLabel(c: HubCollisionReport): string {
+  return `${c.logLinesTruncated ? '≥' : ''}${c.logLines}`;
 }
 
 /** True when there is anything to report — printHub stays silent otherwise. */
 export function hasCollisionEvidence(c: HubCollisionReport): boolean {
-  return c.refusedByHost.length > 0 || c.logLines > 0 || c.crossCheck.length > 0;
+  return c.refusedByHost.length > 0 || c.logLines > 0;
 }
 
 /**
  * Hub-side findings: a mirror with no live daemon, an all-interfaces bind,
- * per-host mirror facts, and the cross-host session-id collision check. All
+ * per-host mirror facts, and the refusal-evidence collision report. All
  * WARN — none of it enters `problems` or moves the exit code.
  */
 export function checkHubHealth(): HubHealth {
@@ -245,50 +284,21 @@ export function checkHubHealth(): HubHealth {
     if (h.sidecarless > 0) warnings.push(`host ${h.host}: ${h.sidecarless} mirror file(s) without a sidecar (project key will be NULL for them)`);
   }
 
-  const evidence = readCollisionEvidence();
-  const crossCheck: HubCollisionReport['crossCheck'] = [];
-  const dbFile = dbPath();
-  // Gated on `hosts.length > 0`: the join is a scan, and a machine with no
-  // satellites can have no cross-host collision. This keeps `recall doctor`
-  // on a non-hub box exactly as cheap — and as quiet — as it was.
-  if (hosts.length > 0 && existsSync(dbFile)) {
-    try {
-      const localBinding = stagedBindingPath();
-      const raw = existsSync(localBinding)
-        ? new Database(dbFile, { readonly: true, fileMustExist: true, nativeBinding: localBinding })
-        : new Database(dbFile, { readonly: true, fileMustExist: true });
-      try {
-        const rows = raw.prepare(
-          `SELECT p.session_id AS sid, p.transcript_path AS ppath, w.transcript_path AS wpath
-           FROM session_provenance p
-           JOIN ingest_watermark w
-             ON w.transcript_path != p.transcript_path
-            AND w.transcript_path LIKE '%/' || p.session_id || '.jsonl'`,
-        ).all() as Array<{ sid: string; ppath: string | null; wpath: string }>;
-        for (const r of rows) {
-          crossCheck.push({ sessionId: r.sid, provenancePath: r.ppath ?? '(null)', watermarkPath: r.wpath });
-        }
-      } finally {
-        raw.close();
-      }
-    } catch { /* pre-migration schema or unreadable DB — the binding section reports that */ }
-  }
-  const collisions: HubCollisionReport = { ...evidence, crossCheck };
+  // The report reads two small files and touches the DATABASE not at all: it
+  // is the daemon's own refusal record, and `recall doctor` must stay fast on
+  // a 1 GB index.
+  const collisions = readCollisionEvidence();
+  const recent = collisions.recentSessionIds.length ? ` (recent ids: ${collisions.recentSessionIds.join(', ')})` : '';
 
   for (const r of collisions.refusedByHost) {
     warnings.push(
-      `host ${r.host}: ${r.count} push(es) refused as session-id collisions — those sessions are NOT indexed` +
-      (collisions.recentSessionIds.length ? ` (recent ids: ${collisions.recentSessionIds.join(', ')})` : ''),
+      `host ${r.host}: ${r.count} push(es) refused as session-id collisions — those sessions are NOT indexed${recent}`,
     );
   }
   if (collisions.refusedByHost.length === 0 && collisions.logLines > 0) {
     warnings.push(
-      `${collisions.logLines} session-id collision line(s) in hub.log — those pushes were refused and are NOT indexed` +
-      (collisions.recentSessionIds.length ? ` (recent ids: ${collisions.recentSessionIds.join(', ')})` : ''),
+      `${countLabel(collisions)} session-id collision line(s) in hub.log — those pushes were refused and are NOT indexed${recent}`,
     );
-  }
-  for (const c of collisions.crossCheck) {
-    warnings.push(`session-id collision: ${c.sessionId} indexed from ${c.provenancePath}, also mirrored at ${c.watermarkPath}`);
   }
 
   return { bind, bindIsAny, daemonAlive: alive, daemonPid: record?.pid ?? null, hosts, collisions, warnings };
@@ -304,7 +314,7 @@ export function printHub(h: HubHealth): void {
     console.log(`Host ${host.host}: files ${host.files}, last push ${host.lastPush ?? 'never'}, sidecar-less ${host.sidecarless}, daemon alive ${h.daemonAlive ? 'yes' : 'no'}`);
   }
   if (hasCollisionEvidence(h.collisions)) {
-    console.log(`Collisions:     ${h.collisions.logLines} logged, ${h.collisions.refusedByHost.reduce((n, r) => n + r.count, 0)} refused push(es)`);
+    console.log(`Collisions:     ${countLabel(h.collisions)} logged, ${h.collisions.refusedByHost.reduce((n, r) => n + r.count, 0)} refused push(es)`);
   }
   for (const w of h.warnings) console.log(`  ⚠ ${w}`);
 }

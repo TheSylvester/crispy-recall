@@ -14,7 +14,9 @@
  * `recallRoot()` to the live ~/.recall (paths.ts:35-40).
  */
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
+import {
+  appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync,
+} from 'node:fs';
 import { tmpdir, platform } from 'node:os';
 import { join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -29,7 +31,9 @@ import { runMirrorSweep } from '../../src/hub/sweep.js';
 import { startHubServer } from '../../src/hub/server.js';
 import { issueHubToken } from '../../src/hub/tokens.js';
 import { repairFull } from '../../src/installer/repair.js';
-import { checkHubHealth, hasCollisionEvidence, printHub } from '../../src/installer/doctor.js';
+import {
+  HUB_LOG_TAIL_BYTES, checkHubHealth, hasCollisionEvidence, printHub, readCollisionEvidence,
+} from '../../src/installer/doctor.js';
 import { writeHubConfig } from '../../src/installer/config.js';
 import { appendPath, authHeaders, claudeEntry, codexRollout, metaHeader, req } from './helpers/hub-harness.js';
 
@@ -368,6 +372,7 @@ describe.skipIf(win32)('doctor hub section', () => {
     expect(h.collisions.refusedByHost).toEqual([{ host: 'wirehost', count: 1 }]);
     expect(h.collisions.logLines).toBe(logIds.length);
     expect(h.collisions.recentSessionIds).toEqual(logIds.slice(-5));
+    expect(h.collisions.logLinesTruncated).toBe(false); // the fixture log is far under the tail window
     expect(hasCollisionEvidence(h.collisions)).toBe(true);
     const warning = h.warnings.find((w) => w.includes('refused as session-id collisions'));
     expect(warning).toBeDefined();
@@ -377,5 +382,65 @@ describe.skipIf(win32)('doctor hub section', () => {
     const printed = capture(() => printHub(h));
     expect(printed).toContain('Collisions:');
     expect(printed).toContain('wirehost');
+  });
+
+  it('a purely LOCAL duplicate session id is not reported as a collision', () => {
+    // Two transcripts of one `agent-<hex>` id under different project
+    // directories, BOTH under the Claude home and neither under remoteRoot():
+    // that is a local duplicate-subagent-id (spec §10, R-c2vs0c), not an S11
+    // cross-host collision. The removed DB cross-check reported 15 of these
+    // as collisions on a healthy hub; the refusal-evidence report must not.
+    const dupId = 'agent-dup0001';
+    const claudeHome = process.env['CLAUDE_CONFIG_DIR']!;
+    const one = `${claudeHome}/projects/proj-a/${dupId}.jsonl`.replace(/\\/g, '/');
+    const two = `${claudeHome}/projects/proj-b/${dupId}.jsonl`.replace(/\\/g, '/');
+    const db = getDb(dbPath());
+    db.run(
+      `INSERT OR REPLACE INTO session_provenance (session_id, vendor, kind, transcript_path, updated_at)
+       VALUES (?, 'claude', 'agent', ?, ?)`,
+      [dupId, one, Date.now()],
+    );
+    for (const p of [one, two]) {
+      db.run(
+        `INSERT OR REPLACE INTO ingest_watermark (transcript_path, last_mtime, last_size, vendor)
+         VALUES (?, 1, 1, 'claude')`,
+        [p],
+      );
+    }
+    _resetDb();
+
+    const before = readCollisionEvidence();
+    const h = checkHubHealth();
+    expect(h.hosts.length).toBeGreaterThan(0); // the gate the cross-check used to open on
+    // The report is unchanged by the local pair: same counts, same ids.
+    expect(h.collisions).toEqual(before);
+    expect(h.warnings.some((w) => w.includes(dupId))).toBe(false);
+    expect(capture(() => printHub(h))).not.toContain(dupId);
+  });
+
+  it('reads only the hub.log tail, drops the partial first line, and labels a truncated count with ≥', () => {
+    // hub.log is append-only and unrotated (a line per request and per sweep),
+    // so the report reads the last HUB_LOG_TAIL_BYTES only. Pad past the
+    // window, then append three collision lines: everything older — including
+    // this suite's earlier collision lines — falls outside it.
+    const logFile = join(recallRoot(), 'logs', 'hub.log');
+    const pad = `${new Date().toISOString()} append host=padhost path=projects/-pad/x.jsonl offset=0 bytes=1 size=1\n`;
+    appendFileSync(logFile, pad.repeat(Math.ceil((HUB_LOG_TAIL_BYTES * 1.5) / pad.length)));
+    const tailIds = ['tail-sid-1', 'tail-sid-2', 'tail-sid-3'];
+    for (const sid of tailIds) {
+      appendFileSync(logFile, `${new Date().toISOString()} session-id collision host=tailhost sid=${sid} existing=/elsewhere/x.jsonl source=scan\n`);
+    }
+    expect(statSync(logFile).size).toBeGreaterThan(HUB_LOG_TAIL_BYTES);
+
+    const c = readCollisionEvidence();
+    expect(c.logLinesTruncated).toBe(true);
+    expect(c.logLines).toBe(tailIds.length); // older collision lines are outside the window
+    expect(c.recentSessionIds).toEqual(tailIds);
+    // The dropped first element was a fragment, never a half-parsed line.
+    expect(c.recentSessionIds.every((id) => tailIds.includes(id))).toBe(true);
+
+    const h = checkHubHealth();
+    const printed = capture(() => printHub(h));
+    expect(printed).toContain(`Collisions:     ≥${tailIds.length} logged`);
   });
 });

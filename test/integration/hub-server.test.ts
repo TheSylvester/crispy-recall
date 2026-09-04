@@ -449,12 +449,15 @@ describe.skipIf(win32)('hub daemon — query concurrency limits (in-process seam
       return { handle, token: issueHubToken('busy') };
     }, async ({ url, token }) => {
       const fire = () => req(url, { method: 'POST', path: '/v1/query', headers: authHeaders(token), body: JSON.stringify({ argv: ['q'], cwd: '/p' }) });
-      // 1 runs, 2 waits (depth 1 filled), 3 has nowhere to wait.
+      // One runs, one waits (depth 1 filled), one has nowhere to wait. WHICH
+      // response carries the 503 is a scheduling detail — assert the set, and
+      // read the body off whichever one it is.
       const [a, b, c] = await Promise.all([fire(), sleep(80).then(fire), sleep(160).then(fire)]);
       const statuses = [a.status, b.status, c.status].sort();
       expect(statuses).toEqual([200, 200, 503]);
-      expect(c.status).toBe(503);
-      expect(c.json().error).toContain('queue full');
+      const refused = [a, b, c].find((r) => r.status === 503);
+      expect(refused).toBeDefined();
+      expect(refused!.json().error).toContain('queue full');
     });
   }, 30_000);
 
