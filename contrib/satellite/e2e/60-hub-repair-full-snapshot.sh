@@ -25,8 +25,13 @@
 # a path: key that APPEARED. A path: key already present before the repair is
 # correct — the laptop derives it itself for a non-git cwd such as
 # /home/sylvester/dev, and its sidecar carries it — so it is carried and reported,
-# never failed on. The watermark gate asserts PRESENCE — one row per frozen path
-# — never last_size.
+# never failed on. The NULL pseudo-key is exempt from the non-decreasing rule and
+# may vanish entirely: a sidecar can GAIN a key between the first ingest and the
+# repair (the satellite's derivation was transient at first push and a later push
+# rewrote it), and the repair honours the CURRENT sidecar, so those rows come back
+# under a real key. That migration is reported, not failed on; NULL GROWING is
+# still a violation, because it means a real key was lost. The watermark gate
+# asserts PRESENCE — one row per frozen path — never last_size.
 source "$(dirname "$0")/lib.sh"
 set -u
 NAME=60-hub-repair-full-snapshot
@@ -88,7 +93,7 @@ REPAIR_TIMEOUT=${RECALL_E2E_REPAIR_TIMEOUT:-3600}
 case "$REPAIR_TIMEOUT" in
   ''|*[!0-9]*|0) fail "$NAME" "RECALL_E2E_REPAIR_TIMEOUT must be a positive integer number of seconds (got '$REPAIR_TIMEOUT')";;
 esac
-step "repair --full on the snapshot (re-ingest + re-embed ~280K messages, up to ${REPAIR_TIMEOUT} s)"
+step "repair --full on the snapshot (re-ingest ~360K rows; re-embed only when the embed lock is free — on a root without run/ it yields, R-k73qa4; up to ${REPAIR_TIMEOUT} s)"
 timeout "$REPAIR_TIMEOUT" env RECALL_HOME="$S" RECALL_REMOTE_ROOT="$HOME/.recall/remote" \
   CLAUDE_CONFIG_DIR="$HOME/.claude" CODEX_HOME="$HOME/.codex" \
   "$NODE" "$HOME/.recall/bin/recall.js" repair --full --yes > "$E2E_LOG_DIR/60-repair.log" 2>&1 \
@@ -109,10 +114,31 @@ def load(f):
         d[k or '<NULL project_key>']=int(c)  # a NULL key prints as an empty field
     return d
 MIRRORKEY=re.compile(r'^(path:/home/sylvester|path:c:/)')
+NULLKEY='<NULL project_key>'
 a=load(sys.argv[1]); b=load(sys.argv[2])
-bad=[]
+bad=[]; left_null=0; real_growth=0
 for k in sorted(set(a) | set(b)):
     before, after = a.get(k), b.get(k)
+    if k == NULLKEY:
+        # Rows may LEAVE the NULL bucket: a sidecar that carried "key":null at
+        # the first ingest can be rewritten with a real key by a later push, and
+        # the repair re-ingests the whole file under the CURRENT sidecar. Rows
+        # ARRIVING in it would mean a real key was lost — that stays a violation.
+        if before is None:
+            bad.append("key %s APPEARED (%d rows): a real key was lost to NULL" % (k, after))
+        elif after is None:
+            print("    NULL key: %d row(s) before, none after — migrated to real keys" % before)
+            left_null += before
+        else:
+            print("    delta %s: %d -> %d (%+d)" % (k, before, after, after - before))
+            if after < before:
+                print("    NULL key: %d -> %d (%+d) — rows left NULL for a real key "
+                      "(a later push wrote a keyed sidecar; carried, not failed on)"
+                      % (before, after, after - before))
+                left_null += before - after
+            elif after > before:
+                bad.append("key %s grew %d -> %d: a real key was lost to NULL" % (k, before, after))
+        continue
     if before is None:
         # An APPEARED key is a violation on its own; a mirror-path prefix names
         # the cause. A path: key that was already there is the satellite's own
@@ -125,6 +151,14 @@ for k in sorted(set(a) | set(b)):
     else:
         print("    delta %s: %d -> %d (%+d)" % (k, before, after, after - before))
         if after < before: bad.append("key %s lost rows: %d -> %d" % (k, before, after))
+        else: real_growth += after - before
+# Rows that left NULL must be accounted for by growth on the real keys; the live
+# satellite's own appends can only make that growth larger, never smaller.
+if left_null:
+    print("    %d row(s) left the NULL key; real keys grew by %d in total" % (left_null, real_growth))
+    if left_null > real_growth:
+        bad.append("NULL rows vanished without landing on a real key (%d left NULL, real keys grew by %d)"
+                   % (left_null, real_growth))
 carried=[k for k in a if MIRRORKEY.match(k)]
 if carried:
     print("    %d row(s) under %d path: key(s) before the repair (satellite-derived, non-git cwd — carried, not failed on): %s"
@@ -133,7 +167,7 @@ for l in bad[:10]: print("    %s" % l)
 print("    %d key(s) before, %d after, %d violation(s)" % (len(a), len(b), len(bad)))
 sys.exit(1 if bad else 0)
 PY
-step "the project_key SET is unchanged and no key lost rows (counts may grow: repair re-ingests the live mirror)"
+step "the set of REAL project_keys is unchanged and no real key lost rows (counts may grow: repair re-ingests the live mirror; NULL rows may migrate to a real key — DEVIATION §9.5.2)"
 step "no laptop-mirror key APPEARED with a mirror-path prefix (path: keys present before the repair are carried — DEVIATION §9.5.2)"
 
 WMPAIR=$(snap_sql "$WORK/wm.sql") || fail "$NAME" "the watermark query failed"
