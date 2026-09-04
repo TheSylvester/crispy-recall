@@ -18,6 +18,7 @@ import { globSync } from 'glob';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { transcriptGlob } from './paths.js';
+import { mirrorRoots } from './hub/mirror.js';
 import type { TranscriptEntry } from './transcript.js';
 
 /** Subset of the session descriptor that the lifted recall code reads. */
@@ -82,6 +83,25 @@ export function listAllSessions(opts?: { vendors?: ('claude' | 'codex')[] }): Sh
         path: file,
         isSidechain: false,
         vendor: 'codex',
+      });
+    }
+  }
+
+  // Satellite mirror roots (spec §2.5): `recall backfill` and `repair --full`
+  // re-ingest the mirror beside the home roots. The pattern is built exactly
+  // as above so the path string matches the hub's watermark key byte-for-byte.
+  for (const r of mirrorRoots()) {
+    if (!vendors.includes(r.vendor)) continue;
+    const files = globSync(
+      transcriptGlob(r.root, r.vendor === 'claude' ? 'projects' : 'sessions', '**', '*.jsonl'),
+      { nodir: true },
+    );
+    for (const file of files) {
+      out.push({
+        sessionId: sessionIdFromPath(file, r.vendor),
+        path: file,
+        isSidechain: false,
+        vendor: r.vendor,
       });
     }
   }

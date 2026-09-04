@@ -167,7 +167,7 @@ function resolveProjectScope(): ProjectScope {
 
 // Collect positional args (skip flags and their values)
 // --commit / --blame consume positionals separately below.
-const FLAG_WITH_VALUE = new Set(['--limit', '--offset', '--since', '--until', '--project', '--project-key', '--vendor', '--commit']);
+const FLAG_WITH_VALUE = new Set(['--limit', '--offset', '--since', '--until', '--project', '--project-key', '--vendor', '--commit', '--bind', '--port', '--host', '--revoke']);
 const FLAG_BOOLEAN = new Set([
   '--raw', '--raw-messages', '--no-idf',
   '--help', '-h', '--version', '-v', '--list', '--all', '--reverse', '--recent', '--blame',
@@ -179,6 +179,8 @@ const FLAG_BOOLEAN = new Set([
   '--statusline', '--no-statusline',
   // statusline subcommand flag
   '--suggest',
+  // hub subcommand flag
+  '--i-know-this-is-public',
 ]);
 
 const positional: string[] = [];
@@ -230,6 +232,13 @@ USAGE
   recall statusline [--suggest]      Print the session-id chip for the Claude Code
                                      statusline (or, with --suggest, detect your
                                      current statusline and show how to add it)
+  recall hub serve [--bind <addr>] [--port <n>] [--detach]
+                                     Run the hub daemon: mirrors satellite
+                                     transcripts and answers their queries
+  recall hub token --host <name>     Issue (or rotate) a satellite's bearer token
+  recall hub token --revoke <name>   Revoke a satellite's token (no restart)
+  recall hub status [--json]         Daemon, per-host mirror and push/query state
+  recall hub install-service         Register the systemd user unit (Linux)
 
 ARGUMENTS
   query         Free-text search (FTS5 + optional semantic)
@@ -298,6 +307,14 @@ REPAIR FLAGS (with 'recall repair')
                    Re-ingests the affected sessions, which drops their
                    vectors, then launches the re-embed drain. Asks first on a
                    terminal; pass --yes to skip the prompt
+
+HUB FLAGS (with 'recall hub serve')
+  --bind <addr>    Address to listen on (persisted; default 127.0.0.1). A
+                   non-loopback bind needs at least one token
+  --port <n>       Port (persisted; default 7877)
+  --detach         Run in the background, logging to ~/.recall/logs/hub.log
+  --i-know-this-is-public
+                   Allow an all-interfaces bind (0.0.0.0 / ::)
 
 WORKFLOW
   1. Search:  recall "your query"
@@ -1152,7 +1169,7 @@ async function runBackfill() {
 // T1 wiring — opportunistic mtime-scan before any DB-touching subcommand.
 // ---------------------------------------------------------------------------
 
-const T1_SKIP = new Set(['backfill', 'status', 'doctor', 'repair', 'uninstall']);
+const T1_SKIP = new Set(['backfill', 'status', 'doctor', 'repair', 'uninstall', 'hub']);
 
 async function maybeRunT1() {
   const skipForFlag = hasFlag('--help') || hasFlag('-h') || hasFlag('--version');
@@ -1233,7 +1250,7 @@ async function runInstallerSubcommand(cmd: string): Promise<void> {
     }
     if (hasFlag('--fts')) { repairFts(); console.log('FTS5 index rebuilt.'); exit(0); }
     if (hasFlag('--vectors')) { repairVectors(); console.log('Vectors cleared — they re-embed on the next sweep.'); exit(0); }
-    if (hasFlag('--full')) { await repairFull({ yes: hasFlag('--yes') }); exit(0); }
+    if (hasFlag('--full')) { const r = await repairFull({ yes: hasFlag('--yes') }); exit(r.refused ? 1 : 0); }
     if (hasFlag('--rekey-projects')) {
       const { repairRekeyProjects } = await import('../installer/repair.js');
       const r = repairRekeyProjects({ force: hasFlag('--force') });
@@ -1324,6 +1341,22 @@ async function main() {
   if (positional[0] && INSTALLER_SUBCOMMANDS.has(positional[0])) {
     await runInstallerSubcommand(positional[0]);
     exit(0);
+  }
+
+  // Hub daemon subcommands (spec §2.1) — BEFORE maybeRunT1: `hub serve` owns
+  // its own DB open + preflight, and `hub token`/`status` never touch the DB.
+  if (positional[0] === 'hub') {
+    const { runHubCommand } = await import('../hub/cli.js');
+    const code = await runHubCommand(positional[1], {
+      bind: flagValue('--bind'),
+      port: flagValue('--port'),
+      detach: hasFlag('--detach'),
+      publicOk: hasFlag('--i-know-this-is-public'),
+      host: flagValue('--host'),
+      revoke: flagValue('--revoke'),
+      json: hasFlag('--json'),
+    });
+    exit(code);
   }
 
   // Opportunistic catch-up for everything that touches the DB.

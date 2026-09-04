@@ -48,6 +48,12 @@ export interface RecallConfig {
     priorStatusLine: { type?: string; command?: string } | null;
     installedAt: string; // ISO
   };
+  /** Hub daemon bind record (spec §2.1). An ABSENT `bind` key means ANY (§2.2). */
+  hub?: {
+    bind: string;
+    port: number;
+    installedAt: string;
+  };
 }
 
 /** Absolute path to ~/.recall/config.json. */
@@ -105,6 +111,31 @@ export function writeStatuslineConfig(statusline: NonNullable<RecallConfig['stat
     summary: `config.json written (statusline.installed=${statusline.installed})`,
   });
   return merged;
+}
+
+/**
+ * Write the hub bind record, merging over any existing config. Mirrors
+ * writeStatuslineConfig. Creates ~/.recall/ if missing.
+ */
+export function writeHubConfig(hub: NonNullable<RecallConfig['hub']>): RecallConfig {
+  const p = configPath();
+  mkdirSync(dirname(p), { recursive: true });
+  const existing = readConfig() ?? {};
+  const merged: RecallConfig = { ...existing, hub };
+  writeFileAtomic(p, JSON.stringify(merged, null, 2) + '\n');
+  log({
+    source: 'installer/config',
+    level: 'info',
+    summary: `config.json written (hub.bind=${hub.bind} hub.port=${hub.port})`,
+  });
+  return merged;
+}
+
+/** The persisted hub record, or null when config.json has none. */
+export function readHubConfig(): RecallConfig['hub'] | null {
+  const hub = readConfig()?.hub;
+  if (!hub || typeof hub !== 'object') return null;
+  return hub;
 }
 
 /**

@@ -15,7 +15,8 @@ import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { getDb, RETRIEVAL_SCHEMA_DDL, PROJECT_KEY_BACKFILL_KEY, LEGACY_CODEX_ID_SQL } from '../db.js';
-import { dbPath, binDir } from '../paths.js';
+import { dbPath, binDir, remoteRoot } from '../paths.js';
+import { mirrorRoots } from '../hub/mirror.js';
 import { log } from '../log.js';
 import { deriveProjectKey } from '../recall/project-key.js';
 import { isUnderRemoteRoot } from '../recall/mirror-meta.js';
@@ -136,12 +137,36 @@ function countPendingCodexSessions(): number {
 
 export interface RepairFullOptions { yes?: boolean }
 
+export interface RepairFullResult {
+  /** True when the run was refused (mirror root present but unenumerable) — nothing was touched. */
+  refused: boolean;
+  /** Mirror hosts whose transcripts were re-ingested beside the home roots. */
+  mirrorHosts: string[];
+}
+
 /**
  * Destructive full reingest: delete all messages (+ cascades to vectors/FTS)
  * and the ingest_watermark, then reingest every transcript from JSONL.
  * Auto-confirms under `--yes` or when stdin is not a TTY (scriptable/testable).
  */
-export async function repairFull(opts: RepairFullOptions = {}): Promise<void> {
+export async function repairFull(opts: RepairFullOptions = {}): Promise<RepairFullResult> {
+  // Spec §2.5: the mirror is part of what a full repair re-ingests. Name the
+  // hosts BEFORE deleting, and refuse when `remoteRoot()` exists but holds no
+  // enumerable vendor root — a wipe now could never be re-ingested.
+  const roots = mirrorRoots();
+  const hosts = [...new Set(roots.map((r) => r.root.split('/').slice(-2)[0]!))].sort();
+  if (existsSync(remoteRoot()) && roots.length === 0) {
+    console.error(
+      `recall repair --full: ${remoteRoot()} exists but enumerates no mirror roots ` +
+      '(<host>/claude or <host>/codex) — refusing to delete the index. ' +
+      'Restore the mirror or remove the empty directory first.',
+    );
+    return { refused: true, mirrorHosts: [] };
+  }
+  console.log(hosts.length
+    ? `repair --full: mirror hosts to re-ingest: ${hosts.join(', ')}`
+    : 'repair --full: no mirror hosts (home roots only)');
+
   const auto = opts.yes || !process.stdin.isTTY;
   if (!auto) {
     const go = await confirm({
@@ -150,7 +175,7 @@ export async function repairFull(opts: RepairFullOptions = {}): Promise<void> {
     });
     if (isCancel(go) || !go) {
       log({ source: 'installer/repair', level: 'info', summary: 'repair --full cancelled' });
-      return;
+      return { refused: false, mirrorHosts: hosts };
     }
   }
 
@@ -181,7 +206,16 @@ export async function repairFull(opts: RepairFullOptions = {}): Promise<void> {
   const { mtimeScan } = await import('../recall/mtime-scan.js');
   await startRecallCatchup({ autoEmbed: true });
   await mtimeScan();
+  // Mirror watermarks: listAllSessions (inside the catch-up) already ingested
+  // the mirror files; this pass records their (mtime, size) so the hub sweep
+  // sees them as unchanged. It is the hub's own sweep, so the cross-host
+  // collision guard (S11) applies here too. Sidecars are never touched.
+  if (roots.length > 0) {
+    const { runMirrorSweep } = await import('../hub/sweep.js');
+    await runMirrorSweep();
+  }
   log({ source: 'installer/repair', level: 'info', summary: 'full repair reingest complete' });
+  return { refused: false, mirrorHosts: hosts };
 }
 
 // ---------------------------------------------------------------------------

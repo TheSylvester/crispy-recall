@@ -184,9 +184,14 @@ export function getDb(dbPath: string, opts?: GetDbOptions): RecallDb {
       throw new MigrationPendingError(dbPath);
     }
     // Installer migration mode: hand back the connection with NO ensureSchema —
-    // the migration module owns every piece of DDL against an old DB.
+    // the migration module owns every piece of DDL against an old DB. The
+    // `temp.` stem scratch is the exception: it touches no persistent object,
+    // and without it `fts5Stem` on this connection throws `no such table:
+    // temp._stem`, swallows it and silently degrades every IDF lookup to the
+    // unstemmed lowercase word.
     db = adapter;
     currentDbPath = dbPath;
+    ensureStemScratch(db);
     log({ source: 'db', level: 'info', summary: `DB: opened pending-migration DB at ${dbPath} (installer mode)` });
     return db;
   }
@@ -205,9 +210,37 @@ export function getDb(dbPath: string, opts?: GetDbOptions): RecallDb {
   currentDbPath = dbPath;
 
   ensureSchema(db);
+  ensureStemScratch(db);
   log({ source: 'db', level: 'info', summary: `DB: initialized at ${dbPath}` });
 
   return db;
+}
+
+/**
+ * Per-connection porter-stem scratch tables in the `temp.` schema (spec S14).
+ *
+ * SHADOWING RULE: SQLite resolves an unqualified table name against `temp`
+ * BEFORE `main`, so once these exist every bare `_stem` / `_stem_vocab`
+ * statement on this connection means the SCRATCH table. Any statement that
+ * means the persistent one must say `main.` (upgrade-migrate.ts's repair
+ * does).
+ *
+ * `fts5Stem` (query-sanitizer.ts) runs three autocommit statements on a
+ * scratch FTS5 table; on the SHARED persistent `_stem` two processes
+ * interleave (reproduced: 14/6,000 wrong stems). A `temp.` table is private
+ * to this connection, so no other process can ever see it. The persistent
+ * `_stem`/`_stem_vocab` stay in ensureSchema for older binaries but are no
+ * longer read. Verified on better-sqlite3 12 / SQLite 3.53: `fts5vocab(temp,
+ * _stem, 'row')` resolves the temp-schema source table.
+ */
+function ensureStemScratch(db: RecallDb): void {
+  db.exec(`
+    CREATE VIRTUAL TABLE IF NOT EXISTS temp._stem USING fts5(
+      t, tokenize='porter unicode61'
+    );
+    CREATE VIRTUAL TABLE IF NOT EXISTS temp._stem_vocab
+      USING fts5vocab(temp, _stem, 'row');
+  `);
 }
 
 /** The durable marker row that says the retrieval-class schema is in place. */
@@ -640,10 +673,10 @@ function ensureSchema(db: RecallDb): void {
     // _stem — helper table to resolve porter stems via FTS5's own tokenizer
     // ====================================================================
     db.exec(`
-      CREATE VIRTUAL TABLE IF NOT EXISTS _stem USING fts5(
+      CREATE VIRTUAL TABLE IF NOT EXISTS main._stem USING fts5(
         t, tokenize='porter unicode61'
       );
-      CREATE VIRTUAL TABLE IF NOT EXISTS _stem_vocab
+      CREATE VIRTUAL TABLE IF NOT EXISTS main._stem_vocab
         USING fts5vocab(_stem, 'row');
     `);
 

@@ -8,7 +8,7 @@
  * @module installer/doctor
  */
 
-import { existsSync, readFileSync } from 'node:fs';
+import { closeSync, existsSync, fstatSync, openSync, readFileSync, readSync } from 'node:fs';
 import { join, isAbsolute } from 'node:path';
 import Database from 'better-sqlite3';
 import { runPreflight, claudeSettingsPath, type PreflightReport } from './preflight.js';
@@ -16,9 +16,12 @@ import { readConfig } from './config.js';
 import { integrityCheck } from './repair.js';
 import { detectStatusline } from './statusline-suggest.js';
 import { isBindingLoadError, CODEX_REKEY_MIGRATION_KEY, LEGACY_CODEX_ID_SQL } from '../db.js';
-import { binDir, dbPath, statuslineScript } from '../paths.js';
+import { binDir, dbPath, logsDir, remoteRoot, statuslineScript } from '../paths.js';
 import { EMBED_VERSION } from '../recall/embed-config.js';
 import { META_RESIDUE_SQL } from '../recall/purge-meta.js';
+import { mirrorHostSummary, mirrorHosts } from '../hub/mirror.js';
+import { hubDaemonAlive, readHostRecords } from '../hub/runtime.js';
+import { classifyBind } from '../hub/server.js';
 
 export interface DoctorOptions {
   json?: boolean;
@@ -73,13 +76,15 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<number> {
   const embedder = readConfig()?.embedder ?? null;
   const binding = checkBindingHealth();
   const statusline = checkStatuslineHealth();
+  const hub = checkHubHealth();
 
   if (opts.json) {
-    console.log(JSON.stringify({ ...report, embedder, binding, statusline }, null, 2));
+    console.log(JSON.stringify({ ...report, embedder, binding, statusline, hub }, null, 2));
   } else {
     printTable(report, embedder?.mode ?? 'cpu', embedder?.fallbackReason);
     printBinding(binding);
     printStatusline(statusline);
+    printHub(hub);
   }
   const bindingFailed = binding.installed && binding.problems.length > 0;
   // Statusline coverage is WARN-only — it never affects the exit code.
@@ -134,6 +139,184 @@ function printStatusline(h: StatuslineHealth): void {
   } else {
     for (const w of h.warnings) console.log(`  ⚠ ${w}`);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Hub (spec §2.5) — WARN only, never exit-1
+// ---------------------------------------------------------------------------
+
+export interface HubHostHealth {
+  host: string;
+  files: number;
+  lastPush: string | null;
+  sidecarless: number;
+}
+
+/**
+ * Cross-host session-id collisions (spec S11, §2.5).
+ *
+ * The spec's `SELECT session_id, COUNT(DISTINCT transcript_path) … GROUP BY
+ * session_id HAVING c > 1` can never return a row: `session_provenance`
+ * declares `session_id` as the PRIMARY KEY (db.ts), so one id owns exactly
+ * one path by construction. A refused push, by design, writes NO provenance
+ * at all — the collision leaves no trace in that table.
+ *
+ * The evidence that DOES exist is what the daemon records when it refuses:
+ * the per-host `refusedCollisions` counter in `run/hub-hosts.json` and the
+ * `session-id collision …` lines in `logs/hub.log`. This report is built from
+ * those two, and from nothing else.
+ *
+ * A DB cross-check was tried and REMOVED: joining session_provenance to
+ * ingest_watermark on a suffix match of the session id is unindexable (a
+ * leading wildcard with a non-constant right-hand side) and measured 54.5 s
+ * read-only on a 27,508 × 36,880-row live DB, inside a synchronous
+ * `recall doctor`. It was also WRONG: it reported 15 purely local
+ * duplicate-subagent-id pairs (one `agent-<hex>` transcript under two project
+ * directories, both under `~/.claude`, neither under `remoteRoot()`) as
+ * cross-host collisions on a healthy hub. Local duplicate subagent ids are
+ * tracked separately (spec §10, R-c2vs0c) and are not S11 collisions.
+ */
+export interface HubCollisionReport {
+  /** Hosts with a non-zero refusal counter. */
+  refusedByHost: Array<{ host: string; count: number }>;
+  /** `session-id collision …` lines in the hub.log tail window. */
+  logLines: number;
+  /** True when the log was longer than the window, so `logLines` is a floor. */
+  logLinesTruncated: boolean;
+  /** The last 5 `sid=` values from those lines, oldest first. */
+  recentSessionIds: string[];
+}
+
+export interface HubHealth {
+  /** Configured bind (null = no hub record in config.json). */
+  bind: string | null;
+  bindIsAny: boolean;
+  daemonAlive: boolean;
+  daemonPid: number | null;
+  hosts: HubHostHealth[];
+  /** Cross-host session-id collision evidence (never a DB GROUP BY — see above). */
+  collisions: HubCollisionReport;
+  warnings: string[];
+}
+
+const COLLISION_LINE = /session-id collision host=(\S+) sid=(\S+)/;
+
+/** How much of hub.log the report reads. It is append-only and unrotated —
+ *  one line per request and per five-minute sweep — so it is read from the
+ *  END, never whole. */
+export const HUB_LOG_TAIL_BYTES = 256 * 1024;
+
+/** Read the refusal evidence the daemon persists. Never throws. */
+export function readCollisionEvidence(): Omit<HubCollisionReport, never> {
+  const refusedByHost = Object.entries(readHostRecords())
+    .filter(([, r]) => (r.refusedCollisions ?? 0) > 0)
+    .map(([host, r]) => ({ host, count: r.refusedCollisions }))
+    .sort((a, b) => a.host.localeCompare(b.host));
+
+  let lines: string[] = [];
+  let truncated = false;
+  let fd: number | undefined;
+  try {
+    fd = openSync(join(logsDir(), 'hub.log'), 'r');
+    const size = fstatSync(fd).size;
+    const want = Math.min(size, HUB_LOG_TAIL_BYTES);
+    const start = size - want;
+    truncated = start > 0;
+    const buf = Buffer.allocUnsafe(want);
+    let read = 0;
+    while (read < want) {
+      const n = readSync(fd, buf, read, want - read, start + read);
+      if (n <= 0) break;
+      read += n;
+    }
+    const window = buf.subarray(0, read).toString('utf-8').split('\n');
+    // A positioned read can land mid-line; the first element is then a
+    // fragment, so drop it rather than half-parse it.
+    if (truncated) window.shift();
+    lines = window.filter((l) => COLLISION_LINE.test(l));
+  } catch { /* no log yet */ } finally {
+    if (fd !== undefined) { try { closeSync(fd); } catch { /* ignore */ } }
+  }
+
+  const ids: string[] = [];
+  for (const l of lines) {
+    const m = COLLISION_LINE.exec(l);
+    if (m?.[2] && !ids.includes(m[2])) ids.push(m[2]);
+  }
+  return { refusedByHost, logLines: lines.length, logLinesTruncated: truncated, recentSessionIds: ids.slice(-5) };
+}
+
+/** `12` or `≥12` — the count is a floor when the tail window was truncated. */
+function countLabel(c: HubCollisionReport): string {
+  return `${c.logLinesTruncated ? '≥' : ''}${c.logLines}`;
+}
+
+/** True when there is anything to report — printHub stays silent otherwise. */
+export function hasCollisionEvidence(c: HubCollisionReport): boolean {
+  return c.refusedByHost.length > 0 || c.logLines > 0;
+}
+
+/**
+ * Hub-side findings: a mirror with no live daemon, an all-interfaces bind,
+ * per-host mirror facts, and the refusal-evidence collision report. All
+ * WARN — none of it enters `problems` or moves the exit code.
+ */
+export function checkHubHealth(): HubHealth {
+  const warnings: string[] = [];
+  const hubConfig = readConfig()?.hub ?? null;
+  const bind = hubConfig ? (hubConfig.bind ?? null) : null;
+  // An absent `bind` key on an existing hub record is ANY (§2.2).
+  const bindIsAny = !!hubConfig && classifyBind(hubConfig.bind) === 'any';
+  if (bindIsAny) {
+    warnings.push(`hub bind is ${bind === null || bind === '' ? 'absent/empty' : bind} (every interface) — set config.json hub.bind to 127.0.0.1 or your Tailscale address`);
+  }
+
+  const { alive, record } = hubDaemonAlive();
+  const records = readHostRecords();
+  const hosts: HubHostHealth[] = mirrorHosts().map((host) => {
+    const s = mirrorHostSummary(host);
+    return { host, files: s.files, lastPush: records[host]?.lastPushAt ?? null, sidecarless: s.sidecarless };
+  });
+  if (hosts.length > 0 && !alive) {
+    warnings.push(`${remoteRoot()} holds ${hosts.length} satellite host(s) but no hub daemon is running — run \`recall hub serve\` (or \`recall hub install-service\`)`);
+  }
+  for (const h of hosts) {
+    if (h.sidecarless > 0) warnings.push(`host ${h.host}: ${h.sidecarless} mirror file(s) without a sidecar (project key will be NULL for them)`);
+  }
+
+  // The report reads two small files and touches the DATABASE not at all: it
+  // is the daemon's own refusal record, and `recall doctor` must stay fast on
+  // a 1 GB index.
+  const collisions = readCollisionEvidence();
+  const recent = collisions.recentSessionIds.length ? ` (recent ids: ${collisions.recentSessionIds.join(', ')})` : '';
+
+  for (const r of collisions.refusedByHost) {
+    warnings.push(
+      `host ${r.host}: ${r.count} push(es) refused as session-id collisions — those sessions are NOT indexed${recent}`,
+    );
+  }
+  if (collisions.refusedByHost.length === 0 && collisions.logLines > 0) {
+    warnings.push(
+      `${countLabel(collisions)} session-id collision line(s) in hub.log — those pushes were refused and are NOT indexed${recent}`,
+    );
+  }
+
+  return { bind, bindIsAny, daemonAlive: alive, daemonPid: record?.pid ?? null, hosts, collisions, warnings };
+}
+
+export function printHub(h: HubHealth): void {
+  if (h.bind === null && h.hosts.length === 0 && !h.daemonAlive && !hasCollisionEvidence(h.collisions)) return;
+  console.log('\nHub (satellite mode)');
+  console.log('--------------------');
+  console.log(`Bind:           ${h.bind === null ? 'not configured' : (h.bind === '' ? "'' (ANY)" : h.bind)}${h.bindIsAny ? '  [ANY]' : ''}`);
+  console.log(`Daemon:         ${h.daemonAlive ? `alive (pid ${h.daemonPid})` : 'not running'}`);
+  for (const host of h.hosts) {
+    console.log(`Host ${host.host}: files ${host.files}, last push ${host.lastPush ?? 'never'}, sidecar-less ${host.sidecarless}, daemon alive ${h.daemonAlive ? 'yes' : 'no'}`);
+  }
+  if (hasCollisionEvidence(h.collisions)) {
+    console.log(`Collisions:     ${countLabel(h.collisions)} logged, ${h.collisions.refusedByHost.reduce((n, r) => n + r.count, 0)} refused push(es)`);
+  }
+  for (const w of h.warnings) console.log(`  ⚠ ${w}`);
 }
 
 /** Path to the staged addon (beside the bundles). */

@@ -39,17 +39,45 @@ export interface ScanResult {
   scanned: number;
   unchanged: number;
   ingested: number;
+  /** Files a `guard` vetoed (the hub's cross-host collision refusal). A
+   *  refusal is PERMANENT until the operator acts, so it is counted apart
+   *  from `failed`, which means "retry me on the next sweep". */
+  refused: number;
   failed: number;
 }
 
-export async function mtimeScan(opts?: { vendors?: ('claude' | 'codex')[] }): Promise<ScanResult> {
-  const vendors = opts?.vendors ?? ['claude', 'codex'];
-  const claudeRoot = process.env['CLAUDE_CONFIG_DIR'] ?? join(homedir(), '.claude');
-  const codexRoot = process.env['CODEX_HOME'] ?? join(homedir(), '.codex');
+/** A scan root: the VENDOR directory (`<remoteRoot()>/<host>/claude` or
+ *  `.../codex`) and the vendor its files belong to (spec §2.5). */
+export interface ScanRoot {
+  root: string;
+  vendor: 'claude' | 'codex';
+}
 
+export interface MtimeScanOptions {
+  vendors?: ('claude' | 'codex')[];
+  /** When given, REPLACES the two home roots (and `vendors` is ignored). Each
+   *  entry's pattern is built exactly as the home roots are, so the watermark
+   *  key (the glob'd string) is byte-identical to `mirrorFilePath(...)`. */
+  roots?: ScanRoot[];
+  /** Pre-ingest veto (the hub's cross-host collision check, spec S11). A
+   *  returned string is the refusal reason: the file counts as `failed`, is
+   *  not ingested, and its watermark is left untouched. */
+  guard?: (file: string, vendor: 'claude' | 'codex') => string | null;
+}
+
+export async function mtimeScan(opts?: MtimeScanOptions): Promise<ScanResult> {
   const patterns: Array<[string, 'claude' | 'codex']> = [];
-  if (vendors.includes('claude')) patterns.push([transcriptGlob(claudeRoot, 'projects', '**', '*.jsonl'), 'claude']);
-  if (vendors.includes('codex')) patterns.push([transcriptGlob(codexRoot, 'sessions', '**', '*.jsonl'), 'codex']);
+  if (opts?.roots) {
+    for (const r of opts.roots) {
+      patterns.push([transcriptGlob(r.root, r.vendor === 'claude' ? 'projects' : 'sessions', '**', '*.jsonl'), r.vendor]);
+    }
+  } else {
+    const vendors = opts?.vendors ?? ['claude', 'codex'];
+    const claudeRoot = process.env['CLAUDE_CONFIG_DIR'] ?? join(homedir(), '.claude');
+    const codexRoot = process.env['CODEX_HOME'] ?? join(homedir(), '.codex');
+    if (vendors.includes('claude')) patterns.push([transcriptGlob(claudeRoot, 'projects', '**', '*.jsonl'), 'claude']);
+    if (vendors.includes('codex')) patterns.push([transcriptGlob(codexRoot, 'sessions', '**', '*.jsonl'), 'codex']);
+  }
 
   const db = getDb(dbPath());
   const watermarks = new Map<string, WatermarkRow>();
@@ -58,7 +86,7 @@ export async function mtimeScan(opts?: { vendors?: ('claude' | 'codex')[] }): Pr
     watermarks.set(row.transcript_path, row);
   }
 
-  const result: ScanResult = { scanned: 0, unchanged: 0, ingested: 0, failed: 0 };
+  const result: ScanResult = { scanned: 0, unchanged: 0, ingested: 0, refused: 0, failed: 0 };
 
   for (const [pattern, vendor] of patterns) {
     const files = await glob(pattern, { nodir: true });
@@ -73,6 +101,23 @@ export async function mtimeScan(opts?: { vendors?: ('claude' | 'codex')[] }): Pr
         continue;
       }
       const sessionId = sessionIdFromPath(file, vendor);
+      if (opts?.guard) {
+        let refusal: string | null = null;
+        try { refusal = opts.guard(file, vendor); } catch (e) { refusal = (e as Error).message; }
+        if (refusal !== null) {
+          result.refused++;
+          // DEBUG, not warn: a refusal is permanent, so every sweep would
+          // re-log it forever. The durable record is the guard's own
+          // once-per-path `session-id collision … source=scan` hub.log line.
+          log({
+            level: 'debug',
+            source: 'recall:mtime-scan',
+            summary: `Ingest refused, watermark not advanced: ${file}`,
+            data: { path: file, vendor, reason: refusal },
+          });
+          continue;
+        }
+      }
       try {
         // ingestSessionMessages signals load/parse and DB-insert failures via a
         // returned `error` field (soft errors), not by throwing. Treat those as
@@ -108,7 +153,9 @@ export async function mtimeScan(opts?: { vendors?: ('claude' | 'codex')[] }): Pr
   return result;
 }
 
-function sessionIdFromPath(file: string, vendor: 'claude' | 'codex'): string {
+/** Session id from a transcript path (also used by the hub push handler on
+ *  the `/`-normalized vendor-relative path). */
+export function sessionIdFromPath(file: string, vendor: 'claude' | 'codex'): string {
   // Claude: ~/.claude/projects/<encoded>/<session-uuid>.jsonl  → basename minus .jsonl
   // Codex:  ~/.codex/sessions/YYYY/MM/DD/rollout-<ISO>-<uuid>.jsonl → trailing uuid
   const base = file.split('/').pop()!.replace(/\.jsonl$/, '');

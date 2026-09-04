@@ -26,12 +26,12 @@
  */
 
 import { existsSync } from 'node:fs';
-import { basename, join } from 'node:path';
+import { basename } from 'node:path';
 import { glob } from 'glob';
 import {
   getDb, isCodexRekeyPending, CODEX_REKEY_MIGRATION_KEY, LEGACY_CODEX_ID_SQL,
 } from '../db.js';
-import { dbPath, recallRoot, transcriptGlob } from '../paths.js';
+import { dbPath, remoteRoot, transcriptGlob } from '../paths.js';
 import { listCodexSessionFiles } from '../adapters/codex/codex-jsonl-reader.js';
 import { ingestSessionMessages, countIndexableRecords } from '../recall/message-ingest.js';
 import { log } from '../log.js';
@@ -65,11 +65,6 @@ export interface CodexRekeyResult {
   snapshotPath: string | null;
 }
 
-/** Mirror root for the hub's satellite transcripts.
- *  // U2 replaces this with remoteRoot() from paths.ts */
-function remoteRootForRekey(): string {
-  return process.env['RECALL_REMOTE_ROOT'] ?? join(recallRoot(), 'remote');
-}
 
 /**
  * Rewrite every legacy Codex message id to the full-uuid form, then write the
@@ -228,7 +223,7 @@ async function resolveRollout(
   // (d) the hub's satellite mirror
   const hits = await glob(
     transcriptGlob(
-      remoteRootForRekey(), '*', 'codex', 'sessions', '**', `rollout-*-${sessionId}.jsonl`,
+      remoteRoot(), '*', 'codex', 'sessions', '**', `rollout-*-${sessionId}.jsonl`,
     ),
     { nodir: true },
   );
