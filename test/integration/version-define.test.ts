@@ -66,6 +66,13 @@ function runStaged(file: string, args: string[]): Promise<{ code: number; stdout
 }
 
 describe('build-time version define', () => {
+  it('is testing a FRESH dist/ — the define is baked at build time', () => {
+    expect(
+      readFileSync(join(ROOT, 'dist', 'recall.js'), 'utf8'),
+      'dist is stale — run `npm run build` (the version define is baked at build time)',
+    ).toContain(JSON.stringify(pkg.version));
+  });
+
   it('a STAGED dist/recall.js prints the package version, not "unknown"', async () => {
     const staged = join(tmp, 'recall.js');
     expect(existsSync(join(ROOT, 'dist', 'recall.js'))).toBe(true);

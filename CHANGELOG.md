@@ -1,6 +1,8 @@
 # Changelog
 
-## 0.4.0 (unreleased) — 2026-09-04
+## 0.4.0 (unreleased)
+
+_2026-09-04_
 
 Satellite mode: one hub keeps the database and the model, and any number of
 satellite machines push their transcripts to it and forward their queries there.
@@ -44,6 +46,9 @@ satellite machines push their transcripts to it and forward their queries there.
   is what lets a satellite run on Node 20.
 - **`recall --version` prints the real version from a staged bundle.** Hooks,
   the daemon and the satellite CLI reported `unknown` before.
+- **On Windows, non-git directories that differ only in path casing now scope
+  together**, through the project-key half of the filter; `project_id` itself is
+  still stored with its original casing.
 
 ### Known limitations
 

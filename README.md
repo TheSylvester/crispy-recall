@@ -23,14 +23,16 @@ recall downloads a local embedding runtime and model, sets up a `Stop` hook in C
 
 A **hub** is the machine that keeps the database and runs the embedding model. A **satellite** is a machine that only pushes its transcripts to the hub and forwards its queries there; it needs no database, no model and no native addon, and it runs on Node.js 20+.
 
-Install the hub first with the route above, then start its daemon and issue one token per satellite:
+Install the hub first with the route above, then issue one token per satellite and start the daemon:
 
 ```bash
-recall hub serve --bind <tailnet-address>   # listens on 127.0.0.1 by default
-recall hub token --host <name>              # prints the token once
+recall hub token --host <name>                       # prints the token once
+recall hub serve --bind <tailnet-address> --detach   # binds 127.0.0.1 unless --bind is given
 ```
 
-`recall hub install-service` registers a systemd user unit on Linux so the daemon survives a logout or a reboot. On each satellite, install recall in that environment too and register it against the hub:
+A non-loopback `--bind` requires at least one token, so issue the token first; `recall hub serve` runs in the foreground (for systemd) unless you pass `--detach`. `--bind`/`--port` are persisted on the first `hub serve`, and `recall hub token` prints the satellite install command from that persisted address.
+
+`recall hub install-service` registers a systemd user unit on Linux so the daemon starts at login; it prints the `loginctl enable-linger <user>` command to run if you also want it to survive a logout or a reboot. On each satellite, install recall in that environment too and register it against the hub:
 
 ```bash
 npm install -g crispy-recall
@@ -248,7 +250,7 @@ Migration works from `recall.db`, not the source transcripts, so indexed history
 | `recall "<query>" --project-key K` | Scope by an already-derived repo key (`git:`/`origin:`/`path:`), skipping derivation. |
 | `recall hub serve [--bind <addr>] [--port <n>] [--detach]` | Run the hub daemon: mirror satellite transcripts and answer their queries (hub only). |
 | `recall hub token --host <name> \| --revoke <name>` | Issue (or rotate) a satellite's bearer token, or revoke one without a restart (hub only). |
-| `recall hub status` | Show the daemon, the resolved address, and per-host mirror and push/query state (hub only). |
+| `recall hub status [--json]` | Show the daemon, the resolved address, and per-host mirror and push/query state (hub only). |
 | `recall hub install-service` | Register the systemd user unit so the daemon starts at login (hub only). |
 | `recall install --hub <url> --token <t>\|-` | Register this machine as a satellite of that hub; `-` reads the token from stdin (satellite only). |
 | `recall push [--full]` | Push pending transcripts to the hub now; `--full` re-offers every transcript (satellite only). |
@@ -272,16 +274,16 @@ The installed statusline never opens the database. Its only I/O is one guarded `
 ## Privacy and data
 
 - Your index lives in `~/.recall/recall.db`.
-- Search and indexing stay on your machine.
+- On a single machine, search and indexing stay on that machine. In satellite mode the satellite forwards its query text and cwd to your hub and the hub does all indexing (see below).
 - While a query is being embedded, its text is written to a transient file under `~/.recall/run/query-embed/` (mode 0600) and deleted as soon as the embedding completes.
 - There is no telemetry.
 - The database is plain SQLite and inspectable with ordinary SQLite tools.
-- Network access is limited to downloading the embedding runtime and model when missing, plus host reachability probes during install and doctor checks.
+- On a single machine, network access is limited to downloading the embedding runtime and model when missing, plus host reachability probes during install and doctor checks. A satellite additionally talks only to the hub URL you configured.
 - `recall uninstall --purge` removes the local store completely.
 
 The installed integration is inspectable too: Claude's skill and hook live under `~/.claude/skills/recall/` and `~/.claude/settings.json`. When Codex is detected, recall also uses `~/.codex/skills/recall/` and `~/.codex/hooks.json`.
 
-In satellite mode, each satellite pushes its transcript **bytes** to the hub over plain HTTP. There is no TLS in v1, so put the hub port on a private network. The hub stores those bytes under `~/.recall/remote/<host>/` and indexes them beside its own sessions. Authorization is coarse: a hub token grants read of the whole hub index, and write only to that host's mirror. Tokens are stored hashed in `~/.recall/hub-tokens.json` on the hub and in plain text in `~/.recall/satellite-token` (mode 0600) on the satellite; `recall hub token --revoke <name>` takes effect immediately, with no daemon restart.
+In satellite mode, each satellite pushes its transcript **bytes** to the hub, and forwards its query text and cwd to the hub, over plain HTTP. There is no TLS in v1, so put the hub port on a private network. The hub stores those bytes under `~/.recall/remote/<host>/` and indexes them beside its own sessions. Authorization is coarse: a hub token grants read of the whole hub index, and write only to that host's mirror. Tokens are stored hashed in `~/.recall/hub-tokens.json` on the hub and in plain text in `~/.recall/satellite-token` (mode 0600) on the satellite; `recall hub token --revoke <name>` takes effect immediately, with no daemon restart.
 
 The index deliberately outlives source-transcript cleanup. recall doesn't encrypt `recall.db`; treat `~/.recall/` with the same care as your original Claude Code and Codex histories.
 
