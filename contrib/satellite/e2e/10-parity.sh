@@ -17,7 +17,9 @@
 #            kind='agent' (U0's session_meta cap fix reclassifies leaked child
 #            rollouts) — anything else is FAIL.
 #   scope  — (iii) scope-change proof: the same queries WITHOUT --all from
-#            /home/silver/dev/recall; pre set ⊆ post set and post contains ≥1
+#            /home/silver/dev/recall, with --limit 1000 on both sides (the
+#            default 75-session display cap would let a larger candidate pool
+#            displace pre-set sessions by rank); pre set ⊆ post set and post contains ≥1
 #            session whose project_id is under /home/silver/dev/recall/ or
 #            /home/silver/dev/recall-agent-fix-*.
 #
@@ -101,7 +103,7 @@ case "$mode" in
   scope)
     for i in "${!QUERIES[@]}"; do
       n=$((i+1)); q=${QUERIES[$i]}
-      run_query "$q" "$RUNS/scope-post-$n.txt" "" "$MAIN"
+      run_query "$q" "$RUNS/scope-post-$n.txt" "--limit 1000" "$MAIN"
       [ -f "$RUNS/scope-pre-$n.txt" ] || { echo "  q$n: no scope-pre run (run 'scope-pre' at the branch base first)"; fail=1; continue; }
       pre_s=$(session_list "$RUNS/scope-pre-$n.txt" | sort -u); post_s=$(session_list "$RUNS/scope-post-$n.txt" | sort -u)
       lost=$(comm -23 <(echo "$pre_s") <(echo "$post_s") | grep -c . || true)
@@ -117,7 +119,7 @@ case "$mode" in
   scope-pre)
     for i in "${!QUERIES[@]}"; do
       n=$((i+1)); q=${QUERIES[$i]}
-      run_query "$q" "$RUNS/scope-pre-$n.txt" "" "$MAIN"
+      run_query "$q" "$RUNS/scope-pre-$n.txt" "--limit 1000" "$MAIN"
       echo "  q$n scope-pre rows=$(session_list "$RUNS/scope-pre-$n.txt" | wc -l)"
     done
     ;;
