@@ -200,6 +200,10 @@ function seedNewGeneration(): void {
   raw.exec(TABLES_0_3_1);
   raw.exec(FTS_0_3_1);
   raw.exec(`INSERT INTO schema_meta(key, value) VALUES('retrieval_class_migration','complete')`);
+  // A 0.3.1 DB that has already been through the U0 Codex re-key: this suite
+  // is about the project_key column, not the codex gate (covered by
+  // codex-rekey-migration.test.ts), so the fixture carries that marker too.
+  raw.exec(`INSERT INTO schema_meta(key, value) VALUES('codex_message_id_v2','complete')`);
   const ins = raw.prepare(
     `INSERT INTO messages (message_id, session_id, message_seq, message_text, project_id, created_at, message_role, retrieval_class)
      VALUES (?, ?, ?, ?, ?, ?, ?, 'hot')`,
@@ -320,6 +324,14 @@ describe.skipIf(platform() === 'win32')('ensureSchema adds project_key', () => {
     _resetDb();
     const res = await runRetrievalClassMigration();
     expect(res.performed).toBe(true);
+
+    // The retrieval migration leaves the Codex re-key pending (U0 gate); stamp
+    // it as complete here — the re-key itself is proven in
+    // codex-rekey-migration.test.ts — so the next open is a NORMAL open.
+    _resetDb();
+    const stamp = new Database(dbPath());
+    stamp.exec(`INSERT OR REPLACE INTO schema_meta(key, value) VALUES('codex_message_id_v2','complete')`);
+    stamp.close();
 
     _resetDb();
     expect(columns()).toContain('project_key');
