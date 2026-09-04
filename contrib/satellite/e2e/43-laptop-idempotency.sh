@@ -151,7 +151,7 @@ for l in other[:5]: print("OTHERLINE %s" % l)
 print("BAD %d" % len(bad))
 for l in bad[:5]: print("BADLINE %s" % l)
 PY
-grep -v '^APPENDEDPATH ' "$WORK/verdict" | sed 's/^/    /'
+grep -vE '^(APPENDEDPATH|SEENPATH) ' "$WORK/verdict" | sed 's/^/    /'
 UNCHANGED=$(awk '/^UNCHANGED /{print $2}' "$WORK/verdict")
 APPENDED=$(awk '/^APPENDED /{print $2}' "$WORK/verdict")
 NEWFILES=$(awk '/^NEWFILES /{print $2}' "$WORK/verdict")
@@ -162,8 +162,12 @@ step "run 2 over the frozen set: $UNCHANGED unchanged, $APPENDED strict appends 
 [ "$BAD" = 0 ] || fail "$NAME" "$BAD run-2 line(s) re-sent bytes the hub already held; every frozen-set line must be 'offset==size' or a strict append"
 [ "$OTHERFAILED" = 0 ] || fail "$NAME" "run 2 logged $OTHERFAILED path-less push-failed line(s) (transport or manifest failure)"
 [ $((UNCHANGED+APPENDED)) -ge 1 ] || fail "$NAME" "run 2 accounted for no frozen-set file"
-awk '/^APPENDEDPATH /{print substr($0, 14)}' "$WORK/verdict" | sort -u > "$WORK/appended-log"
-awk '/^SEENPATH /{print substr($0, 10)}' "$WORK/verdict" | sort -u > "$WORK/seen"
+# LC_ALL=C: a locale-aware `sort -u` treats two paths that collate equally as
+# duplicates and drops one, and en_US.UTF-8 ignores '-' and '.' at the primary
+# level. Every set operation below is bytewise, and the grown/seen arithmetic
+# happens inside python, which holds both lists already.
+awk '/^APPENDEDPATH /{print substr($0, 14)}' "$WORK/verdict" | LC_ALL=C sort -u > "$WORK/appended-log"
+awk '/^SEENPATH /{print substr($0, 10)}' "$WORK/verdict" | LC_ALL=C sort -u > "$WORK/seen"
 
 # A frozen file can also GROW out of band: the laptop's Stop hook may deliver its
 # tail between the freeze and run 2, in which case run 2 finds nothing to send
@@ -171,7 +175,9 @@ awk '/^SEENPATH /{print substr($0, 10)}' "$WORK/verdict" | sort -u > "$WORK/seen
 # not enough; re-scan the sizes and let the disk decide what was appended to.
 find "$MROOT" -name '*.jsonl' ! -name '*.superseded-*' -printf '%s|%p\0' 2>/dev/null > "$WORK/scan2.z"
 scan_list "$WORK/scan2.z" "$WORK/set2" "$WORK/sizes2" > /dev/null || fail "$NAME" "a mirror path cannot be handled by this script"
-python3 - "$WORK/sizes1" "$WORK/sizes2" "$WORK/grown" <<'PY' || fail "$NAME" "a frozen mirror file shrank between the two runs"
+SCANRC=0
+python3 - "$WORK/sizes1" "$WORK/sizes2" "$WORK/appended-log" "$WORK/seen" \
+         "$WORK/grown" "$WORK/appended" "$WORK/unaccounted" <<'PY' || SCANRC=$?
 import sys
 def load(f):
     d={}
@@ -179,24 +185,38 @@ def load(f):
         p,_,s=l.rstrip("\n").rpartition("|")
         if p: d[p]=int(s)
     return d
+def lines(f):
+    return {l.rstrip("\n") for l in open(f) if l.strip()}
 a=load(sys.argv[1]); b=load(sys.argv[2])
-grown=[p for p,s in a.items() if p in b and b[p] > s]
-shrank=[p for p,s in a.items() if p in b and b[p] < s]
-open(sys.argv[3],'w').write(''.join(p+'\n' for p in sorted(grown)))
-for p in shrank[:5]: print("    %s shrank %d -> %d" % (p,a[p],b[p]))
-print("    frozen files that grew on disk during the run: %d" % len(grown))
-sys.exit(1 if shrank else 0)
+logapp=lines(sys.argv[3]); seen=lines(sys.argv[4])
+grown  = sorted(p for p,s in a.items() if p in b and b[p] > s)
+shrank = sorted(p for p,s in a.items() if p in b and b[p] < s)
+# Absent from the run-2 scan: the hub renamed it `*.superseded-<ts>` on a reset
+# push. It is neither grown nor shrank, and the strict-equality branch below
+# would blame it for "moving" — name the real cause here instead.
+vanished = sorted(p for p in a if p not in b)
+open(sys.argv[5],'w').write(''.join(p+'\n' for p in grown))
+# Bytewise set arithmetic, in the one place that holds every list.
+open(sys.argv[6],'w').write(''.join(p+'\n' for p in sorted(logapp | set(grown))))
+unaccounted = sorted(set(grown) - seen)
+open(sys.argv[7],'w').write(''.join(p+'\n' for p in unaccounted))
+print("    frozen files: %d grew on disk, %d in the log's append set, %d in the union"
+      % (len(grown), len(logapp), len(logapp | set(grown))))
+for p in shrank[:5]:   print("    %s shrank %d -> %d" % (p,a[p],b[p]))
+for p in vanished[:5]: print("    a frozen mirror file was superseded during the run: %s" % p)
+for p in unaccounted[:5]: print("    grew but run 2 logged no line for it: %s" % p)
+if vanished: sys.exit(2)
+if shrank: sys.exit(1)
+sys.exit(3 if unaccounted else 0)
 PY
-sort -u "$WORK/appended-log" "$WORK/grown" > "$WORK/appended"
+case "$SCANRC" in
+  0) ;;
+  1) fail "$NAME" "a frozen mirror file shrank between the two runs";;
+  2) fail "$NAME" "a frozen mirror file was superseded during the run (a reset push renamed it *.superseded-<ts>)";;
+  3) fail "$NAME" "$(wc -l < "$WORK/unaccounted") frozen mirror file(s) grew during the run and run 2 logged no line for them";;
+  *) fail "$NAME" "the frozen-set re-scan failed (exit $SCANRC)";;
+esac
 step "APPENDED set: $(wc -l < "$WORK/appended-log") from the log, $(wc -l < "$WORK/grown") from the disk, $(wc -l < "$WORK/appended") in union"
-# A file that grew but which run 2 logged as neither an append nor an
-# `offset==size` is the genuine idempotency violation: run 2 never accounted
-# for it at all.
-comm -23 "$WORK/grown" "$WORK/seen" > "$WORK/unaccounted"
-if [ -s "$WORK/unaccounted" ]; then
-  head -5 "$WORK/unaccounted" | sed 's/^/    /'
-  fail "$NAME" "$(wc -l < "$WORK/unaccounted") frozen mirror file(s) grew during the run and run 2 logged no line for them"
-fi
 
 hub_sql_file "$WORK/wm.sql" > "$WORK/wmset2" || fail "$NAME" "the watermark query failed after run 2"
 [ -s "$WORK/wmset2" ] || fail "$NAME" "the watermark query returned nothing after run 2"
