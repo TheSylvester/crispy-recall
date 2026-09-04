@@ -149,6 +149,9 @@ export class QueryRunner {
     }
   }
 
+  /** No pre-spawn DB close (db.ts closeDbBeforeChildSpawn): the daemon holds a
+   *  live connection whose shared DMS lock denies this child the exclusive
+   *  lock a wal-index reset would need, so the exemption is deliberate. */
   private spawnOnce(argv: string[]): Promise<QueryRun> {
     return new Promise((resolve) => {
       let stdout = '';

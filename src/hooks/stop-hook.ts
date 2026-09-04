@@ -14,7 +14,7 @@
 import { ingestSessionMessages } from "../recall/message-ingest.js";
 import { deriveProjectKey } from "../recall/project-key.js";
 import { readSatelliteConfig } from "../installer/config.js";
-import { getDb, closeDbBeforeChildSpawn } from "../db.js";
+import { getDb } from "../db.js";
 import { binDir, dbPath, logsDir } from "../paths.js";
 import { appendFileSync, mkdirSync } from "fs";
 import { spawn } from "child_process";
@@ -177,10 +177,10 @@ async function runStopHook(): Promise<void> {
   // embedding-eligible gap (they are excluded from every gap selector), so a
   // SubagentStop child would be pure detached churn.
   if (!target.hook.isSubagent && ingestedClass !== 'agent') {
-    // Close before the child attaches: embed-pending opens the same WAL DB and
-    // may reset the wal-index, which SIGBUSes a process still mapping the old
-    // `-shm` (db.ts closeDbBeforeChildSpawn). Nothing below touches the DB.
-    closeDbBeforeChildSpawn();
+    // No pre-spawn close here: this process holds a LIVE connection, whose
+    // shared DMS lock denies the child the exclusive lock a wal-index reset
+    // needs (db.ts closeDbBeforeChildSpawn). Closing would add a WAL
+    // checkpoint and a re-open to every turn end.
     spawn(
       process.execPath,
       [join(binDir(), "embed-pending.js"), canonicalId],

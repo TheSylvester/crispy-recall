@@ -98,12 +98,34 @@ function buildFixture(): void {
   raw.close();
 }
 
-/** Kill whatever detached drain the install left behind. */
+/**
+ * Kill the detached drain the install left behind — and ONLY that.
+ *
+ * A recorded pid outlives its process, and the number could have been reused
+ * by then. Probe with signal 0 first, then confirm `/proc/<pid>/cmdline` still
+ * names a recall bundle under THIS temp root before signalling.
+ */
 function killDrain(): void {
+  let pid: number;
   try {
-    const pid = Number(readFileSync(join(recallHome, 'run', 'backfill.pid'), 'utf-8').trim());
-    if (Number.isInteger(pid) && pid > 0) process.kill(pid, 'SIGKILL');
-  } catch { /* no drain, or already gone */ }
+    pid = Number(readFileSync(join(recallHome, 'run', 'backfill.pid'), 'utf-8').trim());
+  } catch {
+    return; // no drain was ever recorded
+  }
+  if (!Number.isInteger(pid) || pid <= 0) return;
+  try {
+    process.kill(pid, 0); // alive?
+  } catch {
+    return; // already gone
+  }
+  let cmdline = '';
+  try {
+    cmdline = readFileSync(`/proc/${pid}/cmdline`, 'utf-8').replace(/\0/g, ' ');
+  } catch {
+    return; // cannot confirm identity → never signal
+  }
+  if (!cmdline.includes('recall.js') || !cmdline.includes(recallHome)) return;
+  try { process.kill(pid, 'SIGKILL'); } catch { /* raced with its own exit */ }
 }
 
 beforeEach(() => {

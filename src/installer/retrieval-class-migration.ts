@@ -38,10 +38,11 @@ import { existsSync, readFileSync, unlinkSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import Database from 'better-sqlite3';
 import {
-  getDb, _resetDb, isRetrievalMigrationPending, RETRIEVAL_MIGRATION_KEY, RETRIEVAL_SCHEMA_DDL,
+  getDb, _resetDb, isRetrievalMigrationPending, resolveNativeBindingPath,
+  RETRIEVAL_MIGRATION_KEY, RETRIEVAL_SCHEMA_DDL,
   type RecallDb,
 } from '../db.js';
-import { dbPath, binDir, runDir } from '../paths.js';
+import { dbPath, runDir } from '../paths.js';
 import { embedLockPath } from '../recall/embed-lock.js';
 import { backfillAlreadyRunning } from './upgrade-migrate.js';
 import { backupStamp } from './settings-merge.js';
@@ -82,11 +83,15 @@ export function retrievalMigrationPending(): boolean {
 /** Open a raw better-sqlite3 handle, staged-binding first (bundled runtime
  *  has no node_modules) — mirrors upgrade-migrate.ts openReadonly. */
 function openRaw(dbFile: string, opts: { readonly: boolean }): Database.Database | null {
-  const staged = join(binDir(), 'better_sqlite3.node');
+  // The SAME binding getDb loaded: a second copy of the addon would be a
+  // second SQLite instance, and closing this handle would then drop the
+  // process's POSIX locks out from under the shared connection (db.ts
+  // resolveNativeBindingPath).
+  const binding = resolveNativeBindingPath();
   const options = { readonly: opts.readonly, fileMustExist: true } as const;
   try {
-    return existsSync(staged)
-      ? new Database(dbFile, { ...options, nativeBinding: staged })
+    return binding
+      ? new Database(dbFile, { ...options, nativeBinding: binding })
       : new Database(dbFile, options);
   } catch {
     try {
