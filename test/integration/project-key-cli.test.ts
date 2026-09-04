@@ -62,9 +62,14 @@ function childEnv(): NodeJS.ProcessEnv {
 
 interface RunResult { status: number | null; stdout: string; stderr: string }
 
-function runCli(args: string[], cwd?: string): RunResult {
+function runCli(args: string[], opts?: { cwd?: string; realGit?: boolean }): RunResult {
+  // `realGit` hands the child the REAL PATH: the cases that must actually
+  // derive a key need the real executable, not the recording stub.
+  const env = opts?.realGit
+    ? { ...childEnv(), PATH: process.env['PATH'] ?? '' }
+    : childEnv();
   const r = spawnSync(process.execPath, [CLI_BUNDLE, ...args, '--no-catchup'], {
-    env: childEnv(), cwd: cwd ?? recallHome, encoding: 'utf-8', timeout: 60_000,
+    env, cwd: opts?.cwd ?? recallHome, encoding: 'utf-8', timeout: 60_000,
   });
   return { status: r.status, stdout: r.stdout ?? '', stderr: r.stderr ?? '' };
 }
@@ -167,11 +172,31 @@ describe.skipIf(platform() === 'win32')('recall CLI project scoping', () => {
     expect(gitSpawns()).toBe(0);
   });
 
-  it('a bare --project on a path that is not a repo derives a path: key and scopes to it', () => {
+  it('--project scopes by path when the target is not a repo (step 0, no spawn)', () => {
+    // /x/two does not exist, so derivation short-circuits at step 0 to a
+    // path: key — git is never reached.
     const r = runCli(['--project', '/x/two', TERM, '--raw']);
     expect(r.status, r.stderr).toBe(0);
     expect(r.stdout).toContain('S2');
     expect(r.stdout).not.toContain('S1');
+    expect(r.stdout).not.toContain('S3');
+    expect(gitSpawns()).toBe(0);
+  });
+
+  it('--project <repo> derives git:<root> and returns every session of that repo', () => {
+    const r = runCli(['--project', repoDir, TERM, '--raw'], { realGit: true });
+    expect(r.status, r.stderr).toBe(0);
+    // S1 matches on the path half, S2 on the key half — one repo, two cwds.
+    expect(r.stdout).toContain('S1');
+    expect(r.stdout).toContain('S2');
+    expect(r.stdout).not.toContain('S3');
+  });
+
+  it('no --project at all: the cwd is derived the same way (precedence 4)', () => {
+    const r = runCli([TERM, '--raw'], { cwd: repoDir, realGit: true });
+    expect(r.status, r.stderr).toBe(0);
+    expect(r.stdout).toContain('S1');
+    expect(r.stdout).toContain('S2');
     expect(r.stdout).not.toContain('S3');
   });
 

@@ -63,19 +63,33 @@ function runGit(cwd: string, args: string[], timeout?: number): SpawnSyncReturns
 }
 
 /**
- * A failure git may recover from on a retry: the 3 s timeout fired (spawnSync
- * reports `status: null`, `signal: 'SIGTERM'`, `error.code: 'ETIMEDOUT'`), the
- * child died on a signal, or the fork itself ran out of memory.
+ * A failure git may recover from on a retry: the spawn itself failed for any
+ * reason other than "there is no git here" (ETIMEDOUT from the 3 s timeout,
+ * EAGAIN/EMFILE/ENOMEM under load, EACCES on a transient mount), or the child
+ * died on a signal. spawnSync reports a timeout as `status: null`,
+ * `signal: 'SIGTERM'`, `error.code: 'ETIMEDOUT'`.
+ *
+ * ENOENT is NOT transient: it means the executable is absent, which the
+ * gitMissing branches answer with a path key.
  */
 function isTransient(r: SpawnSyncReturns<string>): boolean {
   const code = (r.error as NodeJS.ErrnoException | undefined)?.code;
-  if (code === 'ETIMEDOUT' || code === 'ENOMEM') return true;
+  if (code !== undefined && code !== 'ENOENT') return true;
   return r.signal != null;
 }
 
-/** Lowercase the WHOLE path on win32 only. Applied to the KEY, never project_id. */
+/**
+ * Lowercase the WHOLE path for a Windows key. Applied to the KEY only — never
+ * to `project_id`, which keeps normalizePath's drive-letter-only rule.
+ *
+ * The fold triggers on the HOST or on the SHAPE of the path. Shape matters
+ * because `repair --rekey-projects` runs on the Linux hub over `project_id`
+ * values a Windows satellite wrote (`c:/WinDev/Proj`): without the shape test
+ * the hub would key `path:c:/WinDev/Proj` while the satellite keys
+ * `path:c:/windev/proj`, and the two would never unify.
+ */
 export function foldKeyPath(p: string, platform: NodeJS.Platform = process.platform): string {
-  return platform === 'win32' ? p.toLowerCase() : p;
+  return platform === 'win32' || /^[A-Za-z]:\//.test(p) ? p.toLowerCase() : p;
 }
 
 function pathKey(p: string): string {
@@ -104,8 +118,11 @@ export function normalizeOrigin(url: string): string | undefined {
     return undefined;
   }
 
-  // user:pass@host
-  const at = s.lastIndexOf('@');
+  // user:pass@host — inside the AUTHORITY only. An `@` further along is part
+  // of the path (`/team/proj@v2/repo.git`) and must survive.
+  const firstSlash = s.indexOf('/');
+  const authEnd = firstSlash < 0 ? s.length : firstSlash;
+  const at = s.lastIndexOf('@', authEnd - 1);
   if (at >= 0) s = s.slice(at + 1);
 
   if (!scheme) {
@@ -212,7 +229,13 @@ function derive(cwd: string): ProjectKeyResult {
   }
 
   // 4. Origin URL — the only identity a shallow clone can share with its peers.
-  const origin = runGit(cwd, ['config', '--get', 'remote.origin.url'], GIT_TIMEOUT_MS);
+  //    Same transient rule as steps 1 and 3: a git that never answered must
+  //    not silently downgrade the repo to a path key.
+  let origin = runGit(cwd, ['config', '--get', 'remote.origin.url'], GIT_TIMEOUT_MS);
+  if (isTransient(origin)) {
+    origin = runGit(cwd, ['config', '--get', 'remote.origin.url']);
+    if (isTransient(origin)) return transient();
+  }
   if (origin.status === 0) {
     const value = normalizeOrigin(origin.stdout ?? '');
     if (value) return { kind: 'origin', key: 'origin:' + value, ...(toplevel ? { toplevel } : {}) };

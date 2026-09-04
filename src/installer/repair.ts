@@ -155,6 +155,7 @@ export function repairRekeyProjects(opts: { force: boolean }): RekeyProjectsResu
   ) as Array<{ project_id: string }>).map((r) => r.project_id);
 
   const derived: Array<{ projectId: string; key: string }> = [];
+  let considered = 0;
   let skippedMirror = 0;
   let transient = 0;
 
@@ -172,6 +173,7 @@ export function repairRekeyProjects(opts: { force: boolean }): RekeyProjectsResu
     const allMirrored = paths.length > 0
       && paths.every((r) => typeof r.path === 'string' && isUnderRemoteRoot(r.path));
     if (allMirrored) { skippedMirror++; continue; }
+    considered++;
 
     const result = deriveProjectKey(projectId);
     if (result.transientFailure || !result.key) { transient++; continue; }
@@ -215,9 +217,9 @@ export function repairRekeyProjects(opts: { force: boolean }): RekeyProjectsResu
   log({
     source: 'installer/repair',
     level: 'info',
-    summary: `project keys: ${derived.length} project_ids, ${updated} rows updated, ` +
+    summary: `project keys: ${considered} project_ids, ${updated} rows updated, ` +
       `${skippedMirror} mirror-only skipped, ${transient} transient (left NULL)`,
   });
 
-  return { projectIds: derived.length, updated, skippedMirror, transient, markerWritten };
+  return { projectIds: considered, updated, skippedMirror, transient, markerWritten };
 }

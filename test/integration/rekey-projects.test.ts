@@ -133,7 +133,9 @@ describe.skipIf(platform() === 'win32')('repairRekeyProjects', () => {
     expect(keyOf('S1')).toBe('path:/x/one');
     expect(keyOf('S2')).toBe('path:/x/two');
     expect(keyOf('S3')).toBe('path:/x/three');
-    expect(keyOf('S4')).toBe('path:c:/WinDev/Proj');
+    // A Windows-SHAPED project_id folds on the Linux hub exactly as it does
+    // on the satellite that wrote it.
+    expect(keyOf('S4')).toBe('path:c:/windev/proj');
     // The mirror row keeps the key its satellite derived.
     expect(keyOf('M1')).toBe(MIRROR_KEY);
 

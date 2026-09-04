@@ -132,8 +132,10 @@ async function runStopHook(): Promise<void> {
       {
         projectId: payload.cwd ?? undefined,
         // Derive ONCE per turn (spec §4.2): two git spawns, ~4-7 ms. A throw
-        // is caught by the enclosing try, so the hook still exits 0.
-        projectKey: payload.cwd ? deriveProjectKey(payload.cwd).key : undefined,
+        // is caught by the enclosing try, so the hook still exits 0. A
+        // transient failure becomes an explicit null — ingest must not repeat
+        // the derivation that just failed.
+        projectKey: payload.cwd ? (deriveProjectKey(payload.cwd).key ?? null) : undefined,
         hook: target.hook,
       },
     );

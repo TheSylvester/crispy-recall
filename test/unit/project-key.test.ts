@@ -241,6 +241,42 @@ exit 1`);
     expect(readFileSync(state, 'utf8').trim()).toBe('2');
   }, 30_000);
 
+  it('a shallow repo whose `config` dies twice is transient, never a path key', () => {
+    const state = join(sandbox, 'config-calls');
+    fakeGit(`
+case "$*" in
+  *rev-parse*) echo true; echo "$PWD"; exit 0;;
+  *config*)
+    n=0; [ -f "${state}" ] && n=$(cat "${state}")
+    n=$((n+1)); echo $n > "${state}"
+    kill -TERM $$; sleep 30; exit 0;;
+esac
+exit 1`);
+    const dir = join(sandbox, 'transient-config');
+    mkdirSync(dir, { recursive: true });
+
+    const r = deriveProjectKey(dir);
+    expect(r.key).toBeUndefined();
+    expect(r.transientFailure).toBe(true);
+    expect(r.kind).toBe('transient');
+    expect(readFileSync(state, 'utf8').trim()).toBe('2'); // one retry, no more
+  }, 30_000);
+
+  it('a spawn error other than ENOENT (EACCES) is transient, not a path key', () => {
+    // A `git` that exists but cannot be executed → EACCES. PATH holds ONLY
+    // this directory, so execvp has nowhere else to look and the error stands.
+    const dir = mkdtempSync(join(sandbox, 'fakegit-noexec-'));
+    writeFileSync(join(dir, 'git'), '#!/bin/sh\nexit 0\n', { mode: 0o644 });
+    chmodSync(join(dir, 'git'), 0o644);
+    process.env['PATH'] = dir;
+
+    const target = join(sandbox, 'eacces-target');
+    mkdirSync(target, { recursive: true });
+    const r = deriveProjectKey(target);
+    expect(r.key).toBeUndefined();
+    expect(r.transientFailure).toBe(true);
+  });
+
   it('a transient result is NOT cached — the next caller retries', () => {
     const state = join(sandbox, 'retry-calls');
     fakeGit(`
@@ -292,6 +328,8 @@ describe('normalizeOrigin', () => {
     ['https://github.com/x/y/', 'github.com/x/y'],
     ['https://GitHub.COM/TheSylvester/Crispy-Recall.git', 'github.com/thesylvester/crispy-recall'],
     ['https://user:pass@github.com/x/y.git', 'github.com/x/y'],
+    // An `@` in the PATH is not a credential — only the authority is stripped.
+    ['https://git.example.com/team/proj@v2/repo.git', 'git.example.com/team/proj@v2/repo'],
     ['https://github.com:443/x/y.git', 'github.com/x/y'],
     ['ssh://git@github.com/x/y.git', 'github.com/x/y'],
     ['ssh://git@github.com:2222/x/y.git', 'github.com/x/y'],
@@ -313,9 +351,16 @@ describe('normalizeOrigin', () => {
 });
 
 describe('foldKeyPath', () => {
-  it('lowercases the WHOLE path on win32 and nothing on linux', () => {
+  it('lowercases the WHOLE path on win32', () => {
     expect(foldKeyPath('C:/WinDev/Proj', 'win32')).toBe('c:/windev/proj');
-    expect(foldKeyPath('C:/WinDev/Proj', 'linux')).toBe('C:/WinDev/Proj');
+    expect(foldKeyPath('/home/u/Dev/Proj', 'win32')).toBe('/home/u/dev/proj');
+  });
+
+  it('folds a Windows-SHAPED path on any host, and leaves a POSIX path alone', () => {
+    // The hub re-keys Windows satellite project_ids on Linux; both sides must
+    // land on the same key.
+    expect(foldKeyPath('C:/WinDev/Proj', 'linux')).toBe('c:/windev/proj');
+    expect(foldKeyPath('/home/u/Dev/Proj', 'linux')).toBe('/home/u/Dev/Proj');
   });
 });
 

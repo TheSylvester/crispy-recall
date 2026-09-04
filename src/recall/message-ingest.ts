@@ -227,14 +227,18 @@ export async function ingestSessionMessages(
   const projectId = rawProjectId ? normalizePath(rawProjectId) : null;
 
   //    project_key (spec §4.2): repo identity beside the cwd string. An
-  //    explicit key wins (Stop hook, hub push handler). For a MIRRORED
+  //    explicit key wins (Stop hook, hub push handler) — including an
+  //    explicit `null`, which means "the caller derived nothing" and must
+  //    NOT fall back to a sidecar read or a derivation. For a MIRRORED
   //    transcript the cwd names a directory that does not exist here, so the
   //    key comes from the satellite's sidecar and deriveProjectKey is NEVER
   //    called. Everything else derives locally through the memoized cache.
   const projectKey = rawProjectId
-    ? (options?.projectKey ?? (isUnderRemoteRoot(transcriptPath)
-        ? (readMirrorMeta(transcriptPath)?.key ?? null)
-        : (deriveProjectKey(rawProjectId).key ?? null)))
+    ? (options?.projectKey !== undefined
+        ? options.projectKey
+        : (isUnderRemoteRoot(transcriptPath)
+            ? (readMirrorMeta(transcriptPath)?.key ?? null)
+            : (deriveProjectKey(rawProjectId).key ?? null)))
     : null;
 
   // 4. Strip tool content, filter sub-agent entries and meta boilerplate.

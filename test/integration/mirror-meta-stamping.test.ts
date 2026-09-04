@@ -140,6 +140,29 @@ describe.skipIf(platform() === 'win32')('mirrored ingest reads the sidecar, neve
     });
   }
 
+  it('an explicit projectKey: null on a LOCAL transcript stores NULL and derives nothing', async () => {
+    // The Stop hook passes null when its own derivation failed transiently.
+    // Ingest must respect that, not retry the derivation it already lost.
+    const sid = randomUUID();
+    const cwd = join(recallHome, 'local-project');
+    mkdirSync(cwd, { recursive: true });
+    const file = join(cwd, `${sid}.jsonl`);
+    const entries = [
+      { type: 'user', uuid: `${sid}-m0`, parentUuid: null, sessionId: sid, cwd,
+        timestamp: '2026-05-01T10:00:00.000Z',
+        message: { role: 'user', content: `local fixture prompt${PAD}` } },
+      { type: 'assistant', uuid: `${sid}-m1`, parentUuid: `${sid}-m0`, sessionId: sid, cwd,
+        timestamp: '2026-05-01T10:00:01.000Z',
+        message: { role: 'assistant', content: `local fixture reply${PAD}` } },
+    ];
+    writeFileSync(file, entries.map((e) => JSON.stringify(e)).join('\n') + '\n');
+
+    const res = await ingestSessionMessages(sid, file, 'claude', { projectId: cwd, projectKey: null });
+    expect(res.error).toBeUndefined();
+    expect(rowsFor(sid)).toEqual([{ project_id: normalizePath(cwd), project_key: null }]);
+    expect(gitRan()).toBe(false);
+  });
+
   it('a second option-less ingest (the sweep / repair --full path) changes nothing', async () => {
     const sid = randomUUID();
     const file = writeMirrored(sid, goodSidecar);
