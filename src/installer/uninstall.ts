@@ -11,7 +11,7 @@
 import { existsSync, rmSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { removeStopHook, removeStatusLine } from './settings-merge.js';
-import { clearStatuslineConfig } from './config.js';
+import { clearStatuslineConfig, satelliteTokenPath } from './config.js';
 import { removeNudge } from './claudemd-nudge.js';
 import {
   claudeSettingsPath, claudeMdPath, claudeRecallSkillPath,
@@ -48,6 +48,14 @@ export function runUninstall(opts: UninstallOptions = {}): UninstallResult {
   // replaced recall's statusLine) so doctor/reinstall never act on a stale one.
   if (removeStatusLine(claudeSettingsPath()).changed) removed.push(claudeSettingsPath());
   clearStatuslineConfig();
+
+  // Satellite bearer token — the only copy on this machine. Removed on a plain
+  // uninstall too (not just --purge): leaving a live hub credential behind
+  // after the user removed recall would be the wrong default.
+  if (existsSync(satelliteTokenPath())) {
+    rmSync(satelliteTokenPath(), { force: true });
+    removed.push(satelliteTokenPath());
+  }
 
   // ~/.recall/ only on --purge (includes DB + config.json).
   let purged = false;

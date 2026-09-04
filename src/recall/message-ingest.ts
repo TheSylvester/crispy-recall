@@ -41,6 +41,8 @@ import { DOC_PREFIX, EMBED_VERSION, buildEmbedText } from './embed-config.js';
 import { getDb } from '../db.js';
 import { dbPath } from '../paths.js';
 import { normalizePath } from '../url-path-resolver.js';
+import { deriveProjectKey } from './project-key.js';
+import { isUnderRemoteRoot, readMirrorMeta } from './mirror-meta.js';
 import { log } from '../log.js';
 import { parseJsonlFile } from '../adapters/claude/jsonl-reader.js';
 import { adaptClaudeEntries } from '../adapters/claude/claude-entry-adapter.js';
@@ -66,6 +68,10 @@ export interface IngestResult {
 
 export interface IngestOptions {
   projectId?: string;
+  /** Pre-derived project key (spec §4.2). The Stop hook derives once from
+   *  payload.cwd; the hub push handler passes the satellite's sidecar key.
+   *  `null` stores NULL explicitly. */
+  projectKey?: string | null;
   force?: boolean;
   verbose?: boolean;
   /** Hook-supplied classification evidence (Stop/SubagentStop payload). */
@@ -256,6 +262,21 @@ export async function ingestSessionMessages(
   const rawProjectId = options?.projectId ?? entriesCwd(rawEntries);
   const projectId = rawProjectId ? normalizePath(rawProjectId) : null;
 
+  //    project_key (spec §4.2): repo identity beside the cwd string. An
+  //    explicit key wins (Stop hook, hub push handler) — including an
+  //    explicit `null`, which means "the caller derived nothing" and must
+  //    NOT fall back to a sidecar read or a derivation. For a MIRRORED
+  //    transcript the cwd names a directory that does not exist here, so the
+  //    key comes from the satellite's sidecar and deriveProjectKey is NEVER
+  //    called. Everything else derives locally through the memoized cache.
+  const projectKey = rawProjectId
+    ? (options?.projectKey !== undefined
+        ? options.projectKey
+        : (isUnderRemoteRoot(transcriptPath)
+            ? (readMirrorMeta(transcriptPath)?.key ?? null)
+            : (deriveProjectKey(rawProjectId).key ?? null)))
+    : null;
+
   // 4. Strip tool content, filter sub-agent entries and meta boilerplate.
   //    shouldDropAsMeta whitelists task notifications and cross-session
   //    messages — those carry real signal despite the isMeta flag.
@@ -288,6 +309,7 @@ export async function ingestSessionMessages(
       created_at: createdAt,
       message_role: entry.message?.role ?? entry.type ?? null,
       retrieval_class: retrievalClass,
+      project_key: projectKey,
     });
   }
 

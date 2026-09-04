@@ -26,6 +26,8 @@ import { existsSync, utimesSync } from 'node:fs';
 import { freemem } from 'node:os';
 import { confirm, isCancel } from '@clack/prompts';
 import { listAllSessions } from '../session-manager-shim.js';
+import { isUnderRemoteRoot } from './mirror-meta.js';
+import { mirrorSweepGuard } from '../hub/sweep.js';
 import {
   getIndexedSessionIds,
   getEmbeddingGapStats,
@@ -137,6 +139,11 @@ export async function runFts5Catchup(opts?: { vendors?: ('claude' | 'codex')[] }
     if (s.isSidechain) continue;
     if (alreadyIndexed.has(s.sessionId)) continue;
     if (!existsSync(s.path)) continue;
+    // Mirror files carry the hub's cross-host collision guard (spec S11): the
+    // home roots were enumerated first, so a satellite transcript whose id
+    // already belongs to a local (or another host's) session is refused here
+    // exactly as the push path and the sweep refuse it — never merged.
+    if (isUnderRemoteRoot(s.path) && mirrorSweepGuard(s.path, s.vendor) !== null) continue;
 
     try {
       const result = await ingestSessionMessages(s.sessionId, s.path, s.vendor);

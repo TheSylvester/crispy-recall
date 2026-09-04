@@ -39,6 +39,9 @@ export interface MessageRecord {
   /** 'hot' (canonical root; default) or 'agent' (durable leaf provenance —
    *  explicitly readable, excluded from default retrieval and vectors). */
   retrieval_class?: 'hot' | 'agent';
+  /** Repo-derived project identity (spec §4): `git:`/`origin:`/`path:` prefixed,
+   *  NULL when the transcript carries no cwd or a derivation was transient. */
+  project_key?: string | null;
 }
 
 /** Durable per-session provenance persisted alongside an ingest. */
@@ -129,8 +132,8 @@ export function insertMessages(
     }
     const stmt = d.prepare(
       `INSERT OR IGNORE INTO messages
-       (message_id, session_id, message_seq, message_text, project_id, created_at, message_role, retrieval_class)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+       (message_id, session_id, message_seq, message_text, project_id, created_at, message_role, retrieval_class, project_key)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     );
     for (const m of messages) {
       stmt.run([
@@ -142,6 +145,7 @@ export function insertMessages(
         m.created_at,
         m.message_role,
         m.retrieval_class ?? 'hot',
+        m.project_key ?? null,
       ]);
     }
 
@@ -241,6 +245,40 @@ export interface MessageSearchMeta {
   session_hits: Record<string, number>;
 }
 
+/**
+ * The project-scope predicate, shared by all five filter sites (spec §4.4, S3).
+ *
+ * Returns a BARE predicate — no leading/trailing `AND`, no surrounding spaces —
+ * and pushes its binds onto `params` in the order they appear. Empty string
+ * when there is nothing to scope by (`--all`), so the caller can skip it.
+ *
+ * The OR form covers rows a key alone would miss: rows written by an older
+ * binary, rows not yet re-keyed, transcripts with no cwd, and mixed-case
+ * Windows `project_id` values (normalizePath lowercases only the drive letter).
+ */
+export function projectScopeSql(
+  alias: string | null,
+  projectId: string | undefined,
+  projectKey: string | undefined,
+  params: (string | number)[],
+): string {
+  const p = alias ? `${alias}.project_id` : 'project_id';
+  const k = alias ? `${alias}.project_key` : 'project_key';
+  if (projectKey && projectId) {
+    params.push(projectKey, projectId);
+    return `(${k} = ? OR ${p} = ?)`;
+  }
+  if (projectId) {
+    params.push(projectId);
+    return `${p} = ?`;
+  }
+  if (projectKey) {
+    params.push(projectKey);
+    return `${k} = ?`;
+  }
+  return '';
+}
+
 export function searchMessagesFts(
   query: string,
   limit: number = 20,
@@ -248,6 +286,7 @@ export function searchMessagesFts(
   sessionId?: string,
   excludeSessionId?: string,
   skipIdf?: boolean,
+  projectKey?: string,
 ): MessageSearchResult[] {
   try {
     const sanitized = sanitizeFts5Query(query, { skipIdf });
@@ -255,10 +294,8 @@ export function searchMessagesFts(
 
     const params: (string | number)[] = [sanitized];
     let extraClauses = '';
-    if (projectId) {
-      extraClauses += 'AND m.project_id = ? ';
-      params.push(projectId);
-    }
+    const scope = projectScopeSql('m', projectId, projectKey, params);
+    if (scope) extraClauses += 'AND ' + scope + ' ';
     if (sessionId) {
       extraClauses += 'AND m.session_id = ? ';
       params.push(sessionId);
@@ -318,6 +355,7 @@ export function searchMessagesFtsMeta(
   projectId?: string,
   sessionId?: string,
   excludeSessionId?: string,
+  projectKey?: string,
 ): MessageSearchMeta {
   try {
     const sanitized = sanitizeFts5Query(query);
@@ -325,10 +363,8 @@ export function searchMessagesFtsMeta(
 
     const params: (string | number)[] = [sanitized];
     let extraClauses = '';
-    if (projectId) {
-      extraClauses += 'AND m.project_id = ? ';
-      params.push(projectId);
-    }
+    const scope = projectScopeSql('m', projectId, projectKey, params);
+    if (scope) extraClauses += 'AND ' + scope + ' ';
     if (sessionId) {
       extraClauses += 'AND m.session_id = ? ';
       params.push(sessionId);
@@ -445,6 +481,7 @@ export function grepMessages(
   sessionId?: string,
   projectId?: string,
   excludeSessionId?: string,
+  projectKey?: string,
 ): GrepMatch[] {
   try {
     let re: RegExp;
@@ -465,10 +502,8 @@ export function grepMessages(
       where += ' AND session_id = ?';
       params.push(sessionId);
     }
-    if (projectId) {
-      where += ' AND project_id = ?';
-      params.push(projectId);
-    }
+    const scope = projectScopeSql(null, projectId, projectKey, params);
+    if (scope) where += ' AND ' + scope;
     if (excludeSessionId) {
       where += ' AND session_id != ?';
       params.push(excludeSessionId);
@@ -734,7 +769,7 @@ export function searchMessagesSemantic(
   queryQ8: Int8Array,
   queryNorm: number,
   queryScale: number,
-  opts?: { limit?: number; projectId?: string; sessionId?: string; excludeSessionId?: string; tolerant?: boolean },
+  opts?: { limit?: number; projectId?: string; projectKey?: string; sessionId?: string; excludeSessionId?: string; tolerant?: boolean },
 ): MessageSearchResult[] {
   try {
     const limit = opts?.limit ?? 20;
@@ -744,10 +779,8 @@ export function searchMessagesSemantic(
     // vectors (write guard + migration purge), but a stale one must not score.
     const params: (string | number)[] = [];
     let filterClauses = ` AND m.retrieval_class = 'hot'`;
-    if (opts?.projectId) {
-      filterClauses += ' AND m.project_id = ?';
-      params.push(opts.projectId);
-    }
+    const scope = projectScopeSql('m', opts?.projectId, opts?.projectKey, params);
+    if (scope) filterClauses += ' AND ' + scope;
     if (opts?.sessionId) {
       filterClauses += ' AND m.session_id = ?';
       params.push(opts.sessionId);

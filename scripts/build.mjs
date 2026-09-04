@@ -5,11 +5,12 @@
  *   - dist/stop-hook.js      (Claude Code / Codex Stop hook entry point)
  *   - dist/embed-pending.js  (detached child that drains unvectorized messages)
  *   - dist/statusline.js     (Claude Code statusLine command — lean, stdlib-only)
+ *   - dist/push-pending.js   (satellite: pushes transcript bytes to the hub)
  * All bundles get a `#!/usr/bin/env node` shebang and 0755 perms.
  */
 
 import { build } from 'esbuild';
-import { chmodSync, copyFileSync, mkdirSync, readdirSync, rmSync, statSync } from 'node:fs';
+import { chmodSync, copyFileSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
 
@@ -17,6 +18,11 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const root = resolve(__dirname, '..');
 
 mkdirSync(join(root, 'dist'), { recursive: true });
+
+// The version every bundle reports (spec §6). A staged bundle under
+// `~/.recall/bin` has no sibling package.json, so without this define every
+// hook, daemon and satellite printed `unknown`.
+const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
 
 // Drop a stale wasm sidecar from a pre-migration build — dist/ is not cleaned
 // between builds and the bundles now load better_sqlite3.node, not the wasm.
@@ -33,6 +39,7 @@ const sharedOpts = {
   banner: { js: '#!/usr/bin/env node' },
   external: [],
   loader: { '.md': 'text' },
+  define: { __RECALL_VERSION__: JSON.stringify(pkg.version) },
 };
 
 await Promise.all([
@@ -56,12 +63,18 @@ await Promise.all([
     entryPoints: [join(root, 'src/hooks/statusline.ts')],
     outfile: join(root, 'dist/statusline.js'),
   }),
+  build({
+    ...sharedOpts,
+    entryPoints: [join(root, 'src/cli/push-pending.ts')],
+    outfile: join(root, 'dist/push-pending.js'),
+  }),
 ]);
 
 chmodSync(join(root, 'dist/recall.js'), 0o755);
 chmodSync(join(root, 'dist/stop-hook.js'), 0o755);
 chmodSync(join(root, 'dist/embed-pending.js'), 0o755);
 chmodSync(join(root, 'dist/statusline.js'), 0o755);
+chmodSync(join(root, 'dist/push-pending.js'), 0o755);
 
 // Copy the better-sqlite3 native addon alongside the bundle. The bundles load
 // it via an explicit `nativeBinding: join(__dirname, 'better_sqlite3.node')`
@@ -97,7 +110,7 @@ try {
   console.warn(`Warning: failed to copy SKILL.md.template: ${err.message}`);
 }
 
-console.log('Built dist/recall.js, dist/stop-hook.js, dist/embed-pending.js, dist/statusline.js');
+console.log('Built dist/recall.js, dist/stop-hook.js, dist/embed-pending.js, dist/statusline.js, dist/push-pending.js');
 
 /**
  * Locate the compiled better-sqlite3 addon under its package dir. Prefers the

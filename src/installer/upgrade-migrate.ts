@@ -185,8 +185,13 @@ function integrityStatus(): { ok: boolean; detail: string } {
 function repairStemTables(): boolean {
   try {
     const d = getDb(dbPath(), { allowPendingMigration: true });
-    d.exec('DROP TABLE IF EXISTS _stem_vocab');
-    d.exec('DROP TABLE IF EXISTS _stem');
+    // `main.`-QUALIFIED: every connection now carries per-connection
+    // `temp._stem`/`temp._stem_vocab` scratch tables (db.ts ensureStemScratch,
+    // spec S14), and SQLite resolves an unqualified name against `temp` FIRST
+    // — an unqualified DROP would delete the scratch and leave the corrupt
+    // persistent table in place.
+    d.exec('DROP TABLE IF EXISTS main._stem_vocab');
+    d.exec('DROP TABLE IF EXISTS main._stem');
     // Reopen so ensureSchema recreates _stem / _stem_vocab from scratch (a
     // pending-migration DB skips ensureSchema; its _stem is rebuilt by the
     // retrieval migration's shared DDL / next normal open). Kept inside the

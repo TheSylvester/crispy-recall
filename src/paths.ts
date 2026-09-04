@@ -39,6 +39,16 @@ export function recallRoot(): string {
   return join(homedir(), '.recall');
 }
 
+/** Root of the satellite transcript mirror: `~/.recall/remote/` unless
+ *  RECALL_REMOTE_ROOT overrides it. Inside RECALL_HOME by default, so test
+ *  isolation, `uninstall --purge` and the backup routine all reach it.
+ *  Never carries a trailing separator. */
+export function remoteRoot(): string {
+  const env = process.env['RECALL_REMOTE_ROOT'];
+  if (env && env.length > 0) return env;
+  return join(recallRoot(), 'remote');
+}
+
 /** Path to the SQLite database. */
 export function dbPath(): string {
   return join(recallRoot(), 'recall.db');

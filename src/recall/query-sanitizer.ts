@@ -49,12 +49,14 @@ const IDF_PERCENTILE_THRESHOLD = 0.15;
  *
  * Returns the stemmed form, or the lowercase word if stemming fails.
  */
-function fts5Stem(word: string): string {
+export function fts5Stem(word: string): string {
   try {
     const d = getDb(dbPath());
-    d.exec('DELETE FROM _stem');
-    d.exec(`INSERT INTO _stem(t) VALUES ('${word.replace(/'/g, "''")}')`);
-    const row = d.get('SELECT term FROM _stem_vocab LIMIT 1');
+    // temp.-qualified: the per-connection scratch tables (db.ts
+    // ensureStemScratch), never the shared persistent `_stem` (S14 race).
+    d.exec('DELETE FROM temp._stem');
+    d.exec(`INSERT INTO temp._stem(t) VALUES ('${word.replace(/'/g, "''")}')`);
+    const row = d.get('SELECT term FROM temp._stem_vocab LIMIT 1');
     return row ? (row as Record<string, unknown>).term as string : word.toLowerCase();
   } catch {
     return word.toLowerCase();

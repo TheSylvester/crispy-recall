@@ -169,6 +169,8 @@ describe('dualPathSearch', () => {
       'sess1',
       undefined,
       undefined,
+      // trailing projectKey (spec §4.4) — absent here, so undefined
+      undefined,
     );
     expect(mockSearchSemantic).toHaveBeenCalledWith(
       expect.any(Int8Array),

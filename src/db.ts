@@ -184,9 +184,14 @@ export function getDb(dbPath: string, opts?: GetDbOptions): RecallDb {
       throw new MigrationPendingError(dbPath);
     }
     // Installer migration mode: hand back the connection with NO ensureSchema —
-    // the migration module owns every piece of DDL against an old DB.
+    // the migration module owns every piece of DDL against an old DB. The
+    // `temp.` stem scratch is the exception: it touches no persistent object,
+    // and without it `fts5Stem` on this connection throws `no such table:
+    // temp._stem`, swallows it and silently degrades every IDF lookup to the
+    // unstemmed lowercase word.
     db = adapter;
     currentDbPath = dbPath;
+    ensureStemScratch(db);
     log({ source: 'db', level: 'info', summary: `DB: opened pending-migration DB at ${dbPath} (installer mode)` });
     return db;
   }
@@ -205,13 +210,46 @@ export function getDb(dbPath: string, opts?: GetDbOptions): RecallDb {
   currentDbPath = dbPath;
 
   ensureSchema(db);
+  ensureStemScratch(db);
   log({ source: 'db', level: 'info', summary: `DB: initialized at ${dbPath}` });
 
   return db;
 }
 
+/**
+ * Per-connection porter-stem scratch tables in the `temp.` schema (spec S14).
+ *
+ * SHADOWING RULE: SQLite resolves an unqualified table name against `temp`
+ * BEFORE `main`, so once these exist every bare `_stem` / `_stem_vocab`
+ * statement on this connection means the SCRATCH table. Any statement that
+ * means the persistent one must say `main.` (upgrade-migrate.ts's repair
+ * does).
+ *
+ * `fts5Stem` (query-sanitizer.ts) runs three autocommit statements on a
+ * scratch FTS5 table; on the SHARED persistent `_stem` two processes
+ * interleave (reproduced: 14/6,000 wrong stems). A `temp.` table is private
+ * to this connection, so no other process can ever see it. The persistent
+ * `_stem`/`_stem_vocab` stay in ensureSchema for older binaries but are no
+ * longer read. Verified on better-sqlite3 12 / SQLite 3.53: `fts5vocab(temp,
+ * _stem, 'row')` resolves the temp-schema source table.
+ */
+function ensureStemScratch(db: RecallDb): void {
+  db.exec(`
+    CREATE VIRTUAL TABLE IF NOT EXISTS temp._stem USING fts5(
+      t, tokenize='porter unicode61'
+    );
+    CREATE VIRTUAL TABLE IF NOT EXISTS temp._stem_vocab
+      USING fts5vocab(temp, _stem, 'row');
+  `);
+}
+
 /** The durable marker row that says the retrieval-class schema is in place. */
 export const RETRIEVAL_MIGRATION_KEY = 'retrieval_class_migration';
+
+/** The durable marker row that says every existing row carries a project_key.
+ *  Written for free on a FRESH database; on a pre-existing one it is written
+ *  only by the attended `recall repair --rekey-projects` (spec §4.3). */
+export const PROJECT_KEY_BACKFILL_KEY = 'project_key_backfill';
 
 /**
  * Pending iff a `messages` table already exists but the durable
@@ -517,6 +555,7 @@ export const RETRIEVAL_SCHEMA_DDL = {
       created_at      INTEGER NOT NULL,
       message_role    TEXT,
       retrieval_class TEXT NOT NULL DEFAULT 'hot',
+      project_key     TEXT,
       UNIQUE(session_id, message_id)
     );
 
@@ -613,6 +652,10 @@ function ensureSchema(db: RecallDb): void {
   // pending-migration OLD DB to the next opener. DDL is transactional in
   // SQLite, so fresh init is atomic (concurrent openers serialize on the
   // write lock and each statement is IF NOT EXISTS).
+  // Probed BEFORE any DDL: a database with no `messages` table is FRESH, so
+  // there are no unkeyed rows and the project-key backfill marker can be
+  // written for free. A pre-existing DB gets the column but NOT the marker —
+  // `recall repair --rekey-projects` is the attended step that fills it.
   // A FRESH database (no messages table yet) initializes new-generation on
   // every marker, including the Codex re-key: no legacy row can exist. An
   // EXISTING database must NOT get the codex marker here — only the attended
@@ -630,10 +673,10 @@ function ensureSchema(db: RecallDb): void {
     // _stem — helper table to resolve porter stems via FTS5's own tokenizer
     // ====================================================================
     db.exec(`
-      CREATE VIRTUAL TABLE IF NOT EXISTS _stem USING fts5(
+      CREATE VIRTUAL TABLE IF NOT EXISTS main._stem USING fts5(
         t, tokenize='porter unicode61'
       );
-      CREATE VIRTUAL TABLE IF NOT EXISTS _stem_vocab
+      CREATE VIRTUAL TABLE IF NOT EXISTS main._stem_vocab
         USING fts5vocab(_stem, 'row');
     `);
 
@@ -671,6 +714,27 @@ function ensureSchema(db: RecallDb): void {
     }
 
     // ====================================================================
+    // messages.project_key — repo-derived project identity (spec §4.2)
+    // ====================================================================
+    // Same race-safe idiom as embed_version above: several processes hit
+    // ensureSchema at once, so a lost ALTER race is resolved by re-checking
+    // table_info rather than by throwing. The INDEX must live HERE and never
+    // in RETRIEVAL_SCHEMA_DDL.tables — `tables` is exec'd against
+    // pre-existing DBs (below and by retrieval-class-migration.ts), where the
+    // column does not exist yet and an index on it would throw.
+    const hasProjectKey = () =>
+      (db.all(`PRAGMA table_info(messages)`) as Array<{ name: string }>)
+        .some((c) => c.name === 'project_key');
+    if (!hasProjectKey()) {
+      try {
+        db.exec(`ALTER TABLE messages ADD COLUMN project_key TEXT`);
+      } catch (e) {
+        if (!hasProjectKey()) throw e;
+      }
+    }
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_messages_project_key ON messages(project_key)`);
+
+    // ====================================================================
     // ingest_watermark — steady-state catch-up tracking (plan §5.4 / §5.14
     // justified deviation #2).
     // ====================================================================
@@ -695,6 +759,14 @@ function ensureSchema(db: RecallDb): void {
       db.exec(`
         INSERT OR IGNORE INTO schema_meta(key, value)
         VALUES ('${CODEX_REKEY_MIGRATION_KEY}', 'complete');
+      `);
+    }
+
+    // Fresh DB only: no pre-existing rows means nothing to re-key.
+    if (fresh) {
+      db.exec(`
+        INSERT OR IGNORE INTO schema_meta(key, value)
+        VALUES ('${PROJECT_KEY_BACKFILL_KEY}', 'complete');
       `);
     }
 

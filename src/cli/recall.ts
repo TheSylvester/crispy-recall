@@ -27,6 +27,7 @@ import { getDb, closeDb } from '../db.js';
 import { getDbPath, listSessions } from '../recall/memory-queries.js';
 import { readSessionMessages, getMessageByUuid } from '../recall/message-store.js';
 import { normalizePath } from '../url-path-resolver.js';
+import { deriveProjectKey } from '../recall/project-key.js';
 import { mtimeScan } from '../recall/mtime-scan.js';
 import {
   startRecallCatchup,
@@ -41,7 +42,9 @@ import {
   type SessionMatch,
 } from '../git-attribution.js';
 import { renderStatuslineSegment, type StatuslineInput } from '../recall/statusline-segment.js';
-import { mkdirSync, openSync, writeFileSync, readFileSync } from 'node:fs';
+import { readSatelliteConfig, type SatelliteConfig } from '../installer/config.js';
+import { getVersion as packageVersion } from '../version.js';
+import { mkdirSync, openSync, writeFileSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { join } from 'node:path';
 
@@ -130,22 +133,62 @@ function exit(code: number): never {
 }
 
 // Project scoping: default to CWD (inherited from parent session's projectPath),
-// --project overrides, --all disables scoping entirely.
-const effectiveProject = allProjects ? undefined : normalizePath(projectFlag ?? process.cwd());
+// --project overrides, --all disables scoping entirely. Beside the path, the
+// scope carries the repo-derived key (spec §4.4) so worktrees, clones and
+// subdirectories of one repository resolve to one project.
+//
+// Resolved LAZILY — at module scope every `--version`, `--help`, `install`,
+// `statusline`, `backfill`, `--commit` and `--blame` run would spawn git.
+interface ProjectScope { projectId?: string; projectKey?: string }
+let scopeCache: ProjectScope | undefined;
+
+function projectScope(): ProjectScope {
+  if (scopeCache) return scopeCache;
+  scopeCache = resolveProjectScope();
+  return scopeCache;
+}
+
+function resolveProjectScope(): ProjectScope {
+  // 1. --all: no scope at all.
+  if (allProjects) return {};
+  const keyFlag = flagValue('--project-key');
+  // 2. An explicit key (the hub appends one to every proxied query) is
+  //    authoritative — never re-derive, the hub's cwd does not exist here.
+  if (keyFlag) {
+    return { projectKey: keyFlag, projectId: normalizePath(projectFlag ?? process.cwd()) };
+  }
+  // 3/4. Derive once from --project, else from the cwd.
+  const path = projectFlag ?? process.cwd();
+  const derived = deriveProjectKey(path);
+  if (derived.transientFailure) {
+    console.error('recall: project key unavailable (git did not answer) — scoping by path only');
+    return { projectId: normalizePath(path) };
+  }
+  return { projectId: normalizePath(path), ...(derived.key ? { projectKey: derived.key } : {}) };
+}
 
 // Collect positional args (skip flags and their values)
 // --commit / --blame consume positionals separately below.
-const FLAG_WITH_VALUE = new Set(['--limit', '--offset', '--since', '--until', '--project', '--vendor', '--commit']);
+const FLAG_WITH_VALUE = new Set([
+  '--limit', '--offset', '--since', '--until', '--project', '--project-key', '--vendor', '--commit',
+  // hub daemon (spec §2.1)
+  '--bind', '--port', '--host', '--revoke',
+  // satellite mode (spec §3.4)
+  '--hub', '--token', '--named',
+]);
 const FLAG_BOOLEAN = new Set([
   '--raw', '--raw-messages', '--no-idf',
   '--help', '-h', '--version', '-v', '--list', '--all', '--reverse', '--recent', '--blame',
   '--no-catchup', '--auto-embed', '--detach', '--purge-meta', '--dry-run',
   // installer subcommand flags
   '--yes', '--offline', '--json', '--purge', '--integrity',
-  '--fts', '--vectors', '--full', '--rekey-codex', '--no-claudemd', '--no-backfill', '--auto-backfill',
+  '--fts', '--vectors', '--full', '--rekey-codex', '--rekey-projects', '--force',
+  '--no-claudemd', '--no-backfill', '--auto-backfill',
   '--statusline', '--no-statusline',
   // statusline subcommand flag
   '--suggest',
+  // hub subcommand flag
+  '--i-know-this-is-public',
 ]);
 
 const positional: string[] = [];
@@ -160,19 +203,71 @@ for (let i = 0; i < argv.length; i++) {
 // Help
 // ---------------------------------------------------------------------------
 
-/** Read the package version from the bundle's sibling package.json. */
+/** Package version — the build-time define, else a package.json fallback (§6). */
 function getVersion(): string {
-  try {
-    const pkg = JSON.parse(
-      readFileSync(join(__dirname, '..', 'package.json'), 'utf8'),
-    ) as { version?: string };
-    return pkg.version ?? 'unknown';
-  } catch {
-    return 'unknown';
-  }
+  return packageVersion();
+}
+
+/** Satellite record, resolved at most ONCE per process (spec §3.4). */
+let satelliteCache: SatelliteConfig | null | undefined;
+function satellite(): SatelliteConfig | null {
+  if (satelliteCache === undefined) satelliteCache = readSatelliteConfig();
+  return satelliteCache;
+}
+
+/** Help for a satellite: no local index, so no backfill/repair/runtime flags. */
+function printSatelliteHelp(sat: SatelliteConfig) {
+  console.log(`
+recall — satellite of ${sat.hubUrl} (host ${sat.host || 'unknown'}).
+
+This machine keeps no index. Transcripts are pushed to the hub and every
+query runs there; output and exit codes are relayed unchanged.
+
+USAGE
+  recall "query"                     Search sessions on the hub
+  recall search <terms…>             Search explicitly
+  recall <session-id> [<message-id>] Read messages from a session
+  recall read <session-ref> [<message-ref>]
+  recall --list                      List recent sessions
+  recall --commit <hash>             Sessions that produced a commit (LOCAL sessions only)
+  recall --blame <path>[:<line>[-<line>]]…   (LOCAL sessions only)
+  recall push [--full]               Push pending transcripts to the hub now
+  recall install --hub <url> --token <t>     (Re)register this satellite
+  recall doctor                      Hub reachability, auth, retention, pending bytes
+  recall status                      Satellite summary
+  recall uninstall [--purge]         Remove hooks, skill and the hub token
+
+FLAGS
+  --limit N        Max results for search/list modes
+  --offset N       Continue reading from this message sequence number
+  --since DATE     Only sessions after this date (ISO-8601)
+  --until DATE     Only sessions before this date (ISO-8601)
+  --project PATH   Scope to a specific project path (default: CWD)
+  --all            Search across all projects
+  --recent         Strongly boost recent sessions in search ranking
+  --reverse        Read session messages newest-first
+  --raw            Output raw JSON instead of formatted tables
+  --raw-messages   Output the FULL pre-shaping per-message ranked list as JSON
+  --no-idf         Bypass the FTS5 IDF high-frequency-term filter
+  --list           List sessions mode
+  --help, -h       Show this help
+  --version, -v    Print the recall version
+
+INSTALL FLAGS (with 'recall install')
+  --hub URL        Hub base URL, e.g. http://100.79.117.97:7877
+  --token T        Bearer token for that hub ('-' reads one line from stdin;
+                   RECALL_HUB_TOKEN is also honored). Stored 0600 in
+                   ~/.recall/satellite-token and never printed.
+  --yes            Accept the manifest without prompting
+
+NOT AVAILABLE HERE
+  recall backfill, recall repair, recall hub — there is no local database.
+`);
 }
 
 function printHelp() {
+  const sat = satellite();
+  if (sat) { printSatelliteHelp(sat); return; }
   console.log(`
 recall — Unified CLI — session transcript memory.
 
@@ -191,9 +286,19 @@ USAGE
   recall --blame <path>[:<line>[-<line>]]...  Sessions responsible for a file
                                      or a specific line/range (via git blame)
   recall backfill [flags]            Catch up FTS5 + embeddings against transcript files
+  recall repair --rekey-projects [--force]
+                                     Fill messages.project_key for existing rows
+                                     (attended; --force also re-keys keyed rows)
   recall statusline [--suggest]      Print the session-id chip for the Claude Code
                                      statusline (or, with --suggest, detect your
                                      current statusline and show how to add it)
+  recall hub serve [--bind <addr>] [--port <n>] [--detach]
+                                     Run the hub daemon: mirrors satellite
+                                     transcripts and answers their queries
+  recall hub token --host <name>     Issue (or rotate) a satellite's bearer token
+  recall hub token --revoke <name>   Revoke a satellite's token (no restart)
+  recall hub status [--json]         Daemon, per-host mirror and push/query state
+  recall hub install-service         Register the systemd user unit (Linux)
 
 ARGUMENTS
   query         Free-text search (FTS5 + optional semantic)
@@ -214,6 +319,8 @@ FLAGS
   --since DATE     Only sessions after this date (list and search modes, ISO-8601)
   --until DATE     Only sessions before this date (inclusive of the day, ISO-8601)
   --project PATH   Scope to a specific project path (default: CWD)
+  --project-key K  Scope by an already-derived repo key (git:/origin:/path:);
+                   skips derivation. Used by the hub for proxied queries.
   --all            Search across all projects (disables project scoping)
   --recent         Strongly boost recent sessions in search ranking
   --reverse        Read session messages newest-first (default: oldest-first)
@@ -260,6 +367,14 @@ REPAIR FLAGS (with 'recall repair')
                    Re-ingests the affected sessions, which drops their
                    vectors, then launches the re-embed drain. Asks first on a
                    terminal; pass --yes to skip the prompt
+
+HUB FLAGS (with 'recall hub serve')
+  --bind <addr>    Address to listen on (persisted; default 127.0.0.1). A
+                   non-loopback bind needs at least one token
+  --port <n>       Port (persisted; default 7877)
+  --detach         Run in the background, logging to ~/.recall/logs/hub.log
+  --i-know-this-is-public
+                   Allow an all-interfaces bind (0.0.0.0 / ::)
 
 WORKFLOW
   1. Search:  recall "your query"
@@ -430,7 +545,10 @@ function resolveMessageRef(sessionId: string, ref: string): string {
 function runList() {
   initDb();
   const effectiveLimit = limit > 0 ? limit : 50;
-  const sessions = listSessions(getDbPath(), effectiveLimit, since, undefined, effectiveProject, until);
+  const scope = projectScope();
+  const sessions = listSessions(
+    getDbPath(), effectiveLimit, since, undefined, scope.projectId, until, scope.projectKey,
+  );
 
   if (raw) {
     console.log(JSON.stringify(sessions, null, 2));
@@ -657,9 +775,11 @@ function runReadTurn(sessionId: string, messageId: string) {
 async function runSearch(query: string) {
   initDb();
   const ceiling = limit > 0 ? limit : 200;
+  const scope = projectScope();
   const r = await dualPathSearch(query, {
     limit: ceiling,
-    projectId: effectiveProject,
+    ...(scope.projectId ? { projectId: scope.projectId } : {}),
+    ...(scope.projectKey ? { projectKey: scope.projectKey } : {}),
     ...(noIdf ? { skipIdf: true } : {}),
     ...(recent ? { recencyDecay: 0.10 } : {}), // default is off; --recent opts into absolute age decay
   });
@@ -1109,7 +1229,7 @@ async function runBackfill() {
 // T1 wiring — opportunistic mtime-scan before any DB-touching subcommand.
 // ---------------------------------------------------------------------------
 
-const T1_SKIP = new Set(['backfill', 'status', 'doctor', 'repair', 'uninstall']);
+const T1_SKIP = new Set(['backfill', 'status', 'doctor', 'repair', 'uninstall', 'hub']);
 
 async function maybeRunT1() {
   const skipForFlag = hasFlag('--help') || hasFlag('-h') || hasFlag('--version');
@@ -1151,6 +1271,8 @@ async function runInstallerSubcommand(cmd: string): Promise<void> {
       noBackfill: hasFlag('--no-backfill'),
       autoBackfill: hasFlag('--auto-backfill'),
       json,
+      ...(flagValue('--hub') ? { hub: flagValue('--hub')! } : {}),
+      ...(flagValue('--token') ? { token: flagValue('--token')! } : {}),
     });
     if (json) console.log(JSON.stringify(res, null, 2));
     exit(res.aborted ? 1 : 0);
@@ -1190,8 +1312,20 @@ async function runInstallerSubcommand(cmd: string): Promise<void> {
     }
     if (hasFlag('--fts')) { repairFts(); console.log('FTS5 index rebuilt.'); exit(0); }
     if (hasFlag('--vectors')) { repairVectors(); console.log('Vectors cleared — they re-embed on the next sweep.'); exit(0); }
-    if (hasFlag('--full')) { await repairFull({ yes: hasFlag('--yes') }); exit(0); }
-    console.error('recall repair: specify --fts, --vectors, --full, or --rekey-codex');
+    if (hasFlag('--full')) { const r = await repairFull({ yes: hasFlag('--yes') }); exit(r.refused ? 1 : 0); }
+    if (hasFlag('--rekey-projects')) {
+      const { repairRekeyProjects } = await import('../installer/repair.js');
+      const r = repairRekeyProjects({ force: hasFlag('--force') });
+      console.log(
+        `project keys: ${r.projectIds} project_ids, ${r.updated} rows updated, ` +
+        `${r.skippedMirror} mirror-only skipped, ${r.transient} transient (left NULL)`,
+      );
+      if (!r.markerWritten) {
+        console.error('recall repair --rekey-projects: incomplete — re-run when git is responsive.');
+      }
+      exit(r.markerWritten ? 0 : 1);
+    }
+    console.error('recall repair: specify --fts, --vectors, --full, --rekey-codex, or --rekey-projects');
     exit(1);
   }
 }
@@ -1226,6 +1360,97 @@ async function runStatuslineSubcommand(): Promise<void> {
   exit(0);
 }
 
+// ---------------------------------------------------------------------------
+// Satellite mode (spec §3.4)
+// ---------------------------------------------------------------------------
+
+/** `recall push [--full]` — an explicit, user-invoked push. */
+async function runPushInline(full: boolean): Promise<void> {
+  const { runPush } = await import('../satellite/push.js');
+  // A live holder is polled for 5 s, then we proceed anyway: a query must not
+  // be held hostage by a long detached `--full` run (S6).
+  await runPush({ full, lockWaitMs: 5000, proceedWithoutLock: true });
+}
+
+/**
+ * The pre-query flush (S6): bounded to ~5 s and NEVER escalated to a full
+ * sweep. The hub asks every satellite for a full manifest at least once per
+ * 24 h; answering that inside an interactive `recall` call would re-enumerate
+ * every transcript on the machine while the user waits. The detached pusher
+ * the Stop hook spawns answers it instead.
+ */
+async function flushBeforeQuery(): Promise<void> {
+  const { runPush } = await import('../satellite/push.js');
+  await runPush({
+    full: false, allowFullSweep: false, budgetMs: 5000,
+    lockWaitMs: 5000, proceedWithoutLock: true,
+  });
+}
+
+/** argv minus `--project <v>` and `--project-key <v>` — the hub is the SOLE
+ *  writer of scope flags (§2.3 Query rules), so the client must not send them. */
+function stripScopeFlags(a: string[]): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < a.length; i++) {
+    const t = a[i]!;
+    if (t === '--project' || t === '--project-key') { i++; continue; }
+    out.push(t);
+  }
+  return out;
+}
+
+/**
+ * Forward this invocation to the hub and relay the reply byte-identically,
+ * including the exit code (D3). Returns the exit code to use.
+ */
+async function forwardQuery(): Promise<number> {
+  const sat = satellite()!;
+  const scope = projectFlag ?? process.cwd();
+  const forwardArgv = stripScopeFlags(argv);
+
+  // Bounded inline flush first, so a query run seconds after a turn sees it.
+  try { await flushBeforeQuery(); } catch { /* push logs its own failures */ }
+
+  const { hubRequest, parseJson, HubTransportError } = await import('../satellite/hub-client.js');
+  const { HEADER_STALE } = await import('../hub/protocol.js');
+  const derived = deriveProjectKey(scope);
+  const body = JSON.stringify({
+    argv: forwardArgv,
+    cwd: scope,
+    ...(derived.key ? { key: derived.key } : {}),
+  });
+
+  let res;
+  try {
+    res = await hubRequest(sat.hubUrl, {
+      method: 'POST',
+      path: '/v1/query',
+      token: sat.token,
+      headers: { 'content-type': 'application/json' },
+      body,
+      timeoutMs: 130_000,
+    });
+  } catch (e) {
+    const reason = e instanceof HubTransportError ? e.reason : (e as Error).message;
+    console.error(`recall: hub ${sat.hubUrl} unreachable: ${reason}`);
+    return 2;
+  }
+  if (res.status < 200 || res.status > 299) {
+    const reason = (res.body.toString('utf-8').trim().split('\n')[0] ?? '').slice(0, 200);
+    console.error(`recall: hub ${sat.hubUrl} replied ${res.status} ${reason}`);
+    return 2;
+  }
+  const payload = parseJson<{ stdout?: string; stderr?: string; exit?: number }>(res);
+  if (!payload) {
+    console.error(`recall: hub ${sat.hubUrl} replied ${res.status} with an unparseable body`);
+    return 2;
+  }
+  if (payload.stdout) process.stdout.write(payload.stdout);
+  if (payload.stderr) process.stderr.write(payload.stderr);
+  if (res.headers[HEADER_STALE] === '1') console.error('recall: hub results may be stale');
+  return typeof payload.exit === 'number' ? payload.exit : 0;
+}
+
 async function main() {
   if (showVersion) {
     console.log(getVersion());
@@ -1235,6 +1460,25 @@ async function main() {
   if (showHelp) {
     printHelp();
     exit(0);
+  }
+
+  // ---- Satellite guard (spec §3.4) ----
+  // Sits directly under the --version/--help block and above EVERY path that
+  // could open a database: `backfill` reaches initDb() and `repair` (inside
+  // INSTALLER_SUBCOMMANDS) reaches getDb, either of which would create a local
+  // recall.db on a machine that must never have one.
+  const sat = satellite();
+  if (sat) {
+    const c = positional[0];
+    if (c === 'backfill' || c === 'repair' || c === 'hub') {
+      console.error(`recall ${c}: not available in satellite mode (queries run on the hub)`);
+      exit(1);
+    }
+    if (c === 'push') { await runPushInline(hasFlag('--full')); exit(0); }
+    if (hasFlag('--commit') || blameMode) { await runCommitAttribution(); exit(0); }
+    if (c === 'statusline' && positional.length === 1) { await runStatuslineSubcommand(); exit(0); }
+    if (c && INSTALLER_SUBCOMMANDS.has(c)) { await runInstallerSubcommand(c); exit(0); }
+    exit(await forwardQuery());
   }
 
   // Commit attribution — dispatched before the positional subcommands so a
@@ -1269,6 +1513,22 @@ async function main() {
   if (positional[0] && INSTALLER_SUBCOMMANDS.has(positional[0])) {
     await runInstallerSubcommand(positional[0]);
     exit(0);
+  }
+
+  // Hub daemon subcommands (spec §2.1) — BEFORE maybeRunT1: `hub serve` owns
+  // its own DB open + preflight, and `hub token`/`status` never touch the DB.
+  if (positional[0] === 'hub') {
+    const { runHubCommand } = await import('../hub/cli.js');
+    const code = await runHubCommand(positional[1], {
+      bind: flagValue('--bind'),
+      port: flagValue('--port'),
+      detach: hasFlag('--detach'),
+      publicOk: hasFlag('--i-know-this-is-public'),
+      host: flagValue('--host'),
+      revoke: flagValue('--revoke'),
+      json: hasFlag('--json'),
+    });
+    exit(code);
   }
 
   // Opportunistic catch-up for everything that touches the DB.
