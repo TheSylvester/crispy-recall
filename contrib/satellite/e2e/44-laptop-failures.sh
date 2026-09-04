@@ -22,7 +22,7 @@ HOSTS_JSON=$HOME/.recall/run/hub-hosts.json
 
 restart_hub() {
   systemctl --user start recall-hub 2>/dev/null
-  wait_until 20 'hub_health | grep -q ok' || printf '  WARNING: the hub did not come back — start recall-hub by hand\n'
+  wait_until 20 "hub_health | grep -q '\"ok\":true'" || printf '  WARNING: the hub did not come back — start recall-hub by hand\n'
 }
 trap restart_hub EXIT
 
@@ -40,7 +40,7 @@ printf '%s\n' "$BAD" | grep '^recall: hub ' | grep -q '401' || fail "$NAME" "the
 LOG0=$(lap "wc -l < ~/.recall/logs/push.log")
 step "stopping recall-hub"
 systemctl --user stop recall-hub || fail "$NAME" "could not stop recall-hub"
-wait_until 15 '! hub_health | grep -q ok' || fail "$NAME" "the hub still answers after stop"
+wait_until 15 "! hub_health | grep -q '\"ok\":true'" || fail "$NAME" "the hub still answers after stop"
 N=$(nonce)
 step "nonce HUB-DOWN-$N (hub down)"
 TSTART=$(date +%s)
@@ -68,7 +68,7 @@ step "push.log $LOG0 → $LOG1 lines while the hub was down"
 
 step "starting recall-hub"
 systemctl --user start recall-hub || fail "$NAME" "could not start recall-hub"
-wait_until 15 'hub_health | grep -q ok' || fail "$NAME" "the hub did not come back within 15 s"
+wait_until 15 "hub_health | grep -q '\"ok\":true'" || fail "$NAME" "the hub did not come back within 15 s"
 # The satellite has NO retry timer: the transcripts on disk are the spool and the
 # CLI flushes INSIDE the query (recall.ts:1417-1418 flushBeforeQuery). So the
 # FIRST query after the restart is the reconnect that drains the queue, and the
@@ -95,7 +95,7 @@ LAPFILE=\~/.claude/$REL
 step "fixture: mirror $MFILE   laptop ~/.claude/$REL"
 step "stopping recall-hub for the 6b fixture"
 systemctl --user stop recall-hub || fail "$NAME" "could not stop recall-hub"
-wait_until 15 '! hub_health | grep -q ok' || fail "$NAME" "the hub still answers after stop"
+wait_until 15 "! hub_health | grep -q '\"ok\":true'" || fail "$NAME" "the hub still answers after stop"
 lap "touch -d '-10 days' $LAPFILE" || fail "$NAME" "could not backdate the laptop transcript"
 rm -f "$MFILE" "$MFILE.meta.json" || fail "$NAME" "could not remove the mirror file"
 sqlite3 "$HOME/.recall/recall.db" "DELETE FROM ingest_watermark WHERE transcript_path='$MFILE'" \
@@ -114,7 +114,7 @@ print('    lastFullManifestAt for',host,'=',rec['lastFullManifestAt'])
 PY
 step "starting recall-hub"
 systemctl --user start recall-hub || fail "$NAME" "could not start recall-hub"
-wait_until 15 'hub_health | grep -q ok' || fail "$NAME" "the hub did not come back within 15 s"
+wait_until 15 "hub_health | grep -q '\"ok\":true'" || fail "$NAME" "the hub did not come back within 15 s"
 
 N2=$(nonce)
 step "one ordinary turn on the laptop (nonce SWEEP-$N2); nobody runs 'recall push --full'"

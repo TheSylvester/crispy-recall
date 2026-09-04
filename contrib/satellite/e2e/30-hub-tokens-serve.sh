@@ -56,7 +56,7 @@ else
   step "starting the detached daemon on $HUB_ADDR:$HUB_PORT"
   "$RECALL_BIN" hub serve --bind "$HUB_ADDR" --port "$HUB_PORT" --detach \
     || fail "$NAME" "hub serve --detach exited nonzero"
-  wait_until 15 'hub_health | grep -q ok' || fail "$NAME" "the daemon did not answer /v1/health within 15 s"
+  wait_until 15 "hub_health | grep -q '\"ok\":true'" || fail "$NAME" "the daemon did not answer /v1/health within 15 s"
 fi
 step "health: $(hub_health)"
 assert_hub_config || fail "$NAME" "config.json hub.bind/port were not persisted as $HUB_ADDR:$HUB_PORT"

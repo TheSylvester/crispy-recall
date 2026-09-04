@@ -11,6 +11,11 @@
 # win_cmd (WSL → cmd.exe interop). Nothing here echoes a bearer token.
 set -u
 
+# The acceptance seat is itself a Claude Code session, and the native binary
+# refuses a nested run while CLAUDECODE is set ("Claude Code cannot be launched
+# inside another Claude Code session"). Scripts 20, 41 and 44 run `claude -p`.
+unset CLAUDECODE
+
 E2E_LOG_DIR=${RECALL_E2E_LOG_DIR:-$HOME/.recall/logs/e2e}
 mkdir -p "$E2E_LOG_DIR"
 

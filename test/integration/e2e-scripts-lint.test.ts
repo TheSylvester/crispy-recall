@@ -19,7 +19,8 @@
  */
 import { describe, expect, it } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { readdirSync, readFileSync } from 'node:fs';
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const DIR = join(__dirname, '..', '..', 'contrib', 'satellite', 'e2e');
@@ -170,6 +171,21 @@ describe('contrib/satellite/e2e — script lint', () => {
       if (!called) continue;
       expect(lib, `${f} calls ${h}`).toMatch(new RegExp(`^${h}\\s*\\(\\)`, 'm'));
     }
+  });
+
+  // The acceptance seat is a Claude Code session; the native binary refuses a
+  // nested `claude -p` while CLAUDECODE is set. lib.sh must clear it for every
+  // script that sources it. RECALL_E2E_LOG_DIR points at a temp dir so sourcing
+  // lib.sh cannot mkdir under the owner's live ~/.recall.
+  it('lib.sh unsets CLAUDECODE', () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'e2e-lint-'));
+    const out = execFileSync(
+      'bash',
+      ['-c', `. "${join(DIR, 'lib.sh')}"; printf '[%s]' "\${CLAUDECODE-unset}"`],
+      { env: { ...process.env, CLAUDECODE: '1', RECALL_E2E_LOG_DIR: tmp }, encoding: 'utf8' },
+    );
+    expect(out).toBe('[unset]');
+    rmSync(tmp, { recursive: true, force: true });
   });
 
   it('the README run order names exactly the runnable scripts', () => {
