@@ -12,6 +12,7 @@
  * @module hooks/stop-hook
  */
 import { ingestSessionMessages } from "../recall/message-ingest.js";
+import { deriveProjectKey } from "../recall/project-key.js";
 import { getDb } from "../db.js";
 import { binDir, dbPath, logsDir } from "../paths.js";
 import { appendFileSync, mkdirSync } from "fs";
@@ -128,7 +129,15 @@ async function runStopHook(): Promise<void> {
       target.sessionId,
       target.transcriptPath,
       vendor,
-      { projectId: payload.cwd ?? undefined, hook: target.hook },
+      {
+        projectId: payload.cwd ?? undefined,
+        // Derive ONCE per turn (spec §4.2): two git spawns, ~4-7 ms. A throw
+        // is caught by the enclosing try, so the hook still exits 0. A
+        // transient failure becomes an explicit null — ingest must not repeat
+        // the derivation that just failed.
+        projectKey: payload.cwd ? (deriveProjectKey(payload.cwd).key ?? null) : undefined,
+        hook: target.hook,
+      },
     );
     ingestedClass = result?.retrievalClass;
     canonicalId = result?.sessionId ?? target.sessionId;

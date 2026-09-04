@@ -46,6 +46,10 @@ export interface BindingHealth {
    *  pre-migration schema). Non-zero → warn to run `recall backfill
    *  --purge-meta`; whitelisted rows (task notifications) are not counted. */
   metaResidue: number | null;
+  /** True when a `messages` table exists but the project_key backfill marker
+   *  is not 'complete' (null when there is no DB / no messages table). WARN
+   *  only — it never enters `problems` and never flips the exit code. */
+  projectKeyBackfillPending: boolean | null;
   problems: string[];
 }
 
@@ -125,13 +129,14 @@ function stagedBindingPath(): string {
   return join(binDir(), 'better_sqlite3.node');
 }
 
-function checkBindingHealth(): BindingHealth {
+export function checkBindingHealth(): BindingHealth {
   const problems: string[] = [];
   const installed = existsSync(join(binDir(), 'recall.js'));
   if (!installed) {
     return {
       installed: false, markerPresent: false, abiOk: null, pinnedNodeOk: null,
       bindingLoads: false, journalMode: null, embedCoverage: null, metaResidue: null,
+      projectKeyBackfillPending: null,
       problems: ['recall is not installed — run `recall install`'],
     };
   }
@@ -169,6 +174,7 @@ function checkBindingHealth(): BindingHealth {
   let journalMode: string | null = null;
   let embedCoverage: number | null = null;
   let metaResidue: number | null = null;
+  let projectKeyBackfillPending: boolean | null = null;
   const localBinding = stagedBindingPath();
   const dbFile = dbPath();
   if (existsSync(dbFile)) {
@@ -225,6 +231,17 @@ function checkBindingHealth(): BindingHealth {
           if (!complete) {
             problems.push('retrieval-class schema migration pending — run `recall install` to finish it');
           }
+          // Project-key backfill (spec §4.3): WARN only, never a problem —
+          // unkeyed rows still match through the project_id half of the
+          // filter, so search is correct, just not repo-unified.
+          try {
+            const pk = raw
+              .prepare(`SELECT value FROM schema_meta WHERE key='project_key_backfill'`)
+              .get() as { value?: string } | undefined;
+            projectKeyBackfillPending = pk?.value !== 'complete';
+          } catch {
+            projectKeyBackfillPending = true; // no schema_meta table at all
+          }
         }
       } catch { /* detection is best-effort */ }
       raw.close();
@@ -258,10 +275,13 @@ function checkBindingHealth(): BindingHealth {
     }
   }
 
-  return { installed, markerPresent, abiOk, pinnedNodeOk, bindingLoads, journalMode, embedCoverage, metaResidue, problems };
+  return {
+    installed, markerPresent, abiOk, pinnedNodeOk, bindingLoads, journalMode,
+    embedCoverage, metaResidue, projectKeyBackfillPending, problems,
+  };
 }
 
-function printBinding(b: BindingHealth): void {
+export function printBinding(b: BindingHealth): void {
   const ok = (v: boolean) => (v ? 'OK' : 'FAIL');
   console.log('\nSQLite binding (better-sqlite3, native WAL)');
   console.log('------------------------------------------');
@@ -282,6 +302,9 @@ function printBinding(b: BindingHealth): void {
         ? 'Meta residue:   none'
         : `Meta residue:   ⚠ ${b.metaResidue} boilerplate rows indexed — run: recall backfill --purge-meta`,
     );
+  }
+  if (b.projectKeyBackfillPending) {
+    console.log('Project keys: backfill pending — run: recall repair --rekey-projects');
   }
   if (b.problems.length) {
     console.log('  Issues:');

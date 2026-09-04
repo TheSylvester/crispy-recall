@@ -196,6 +196,11 @@ export function getDb(dbPath: string, opts?: GetDbOptions): RecallDb {
 /** The durable marker row that says the retrieval-class schema is in place. */
 export const RETRIEVAL_MIGRATION_KEY = 'retrieval_class_migration';
 
+/** The durable marker row that says every existing row carries a project_key.
+ *  Written for free on a FRESH database; on a pre-existing one it is written
+ *  only by the attended `recall repair --rekey-projects` (spec §4.3). */
+export const PROJECT_KEY_BACKFILL_KEY = 'project_key_backfill';
+
 /**
  * Pending iff a `messages` table already exists but the durable
  * retrieval-class marker does not say 'complete'. A fresh/empty DB is never
@@ -457,6 +462,7 @@ export const RETRIEVAL_SCHEMA_DDL = {
       created_at      INTEGER NOT NULL,
       message_role    TEXT,
       retrieval_class TEXT NOT NULL DEFAULT 'hot',
+      project_key     TEXT,
       UNIQUE(session_id, message_id)
     );
 
@@ -553,6 +559,14 @@ function ensureSchema(db: RecallDb): void {
   // pending-migration OLD DB to the next opener. DDL is transactional in
   // SQLite, so fresh init is atomic (concurrent openers serialize on the
   // write lock and each statement is IF NOT EXISTS).
+  // Probed BEFORE any DDL: a database with no `messages` table is FRESH, so
+  // there are no unkeyed rows and the project-key backfill marker can be
+  // written for free. A pre-existing DB gets the column but NOT the marker —
+  // `recall repair --rekey-projects` is the attended step that fills it.
+  const fresh = !db.get(
+    `SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'messages'`,
+  );
+
   db.exec('BEGIN IMMEDIATE');
   try {
     db.exec(RETRIEVAL_SCHEMA_DDL.tables);
@@ -603,6 +617,27 @@ function ensureSchema(db: RecallDb): void {
     }
 
     // ====================================================================
+    // messages.project_key — repo-derived project identity (spec §4.2)
+    // ====================================================================
+    // Same race-safe idiom as embed_version above: several processes hit
+    // ensureSchema at once, so a lost ALTER race is resolved by re-checking
+    // table_info rather than by throwing. The INDEX must live HERE and never
+    // in RETRIEVAL_SCHEMA_DDL.tables — `tables` is exec'd against
+    // pre-existing DBs (below and by retrieval-class-migration.ts), where the
+    // column does not exist yet and an index on it would throw.
+    const hasProjectKey = () =>
+      (db.all(`PRAGMA table_info(messages)`) as Array<{ name: string }>)
+        .some((c) => c.name === 'project_key');
+    if (!hasProjectKey()) {
+      try {
+        db.exec(`ALTER TABLE messages ADD COLUMN project_key TEXT`);
+      } catch (e) {
+        if (!hasProjectKey()) throw e;
+      }
+    }
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_messages_project_key ON messages(project_key)`);
+
+    // ====================================================================
     // ingest_watermark — steady-state catch-up tracking (plan §5.4 / §5.14
     // justified deviation #2).
     // ====================================================================
@@ -623,6 +658,14 @@ function ensureSchema(db: RecallDb): void {
       INSERT OR IGNORE INTO schema_meta(key, value)
       VALUES ('${RETRIEVAL_MIGRATION_KEY}', 'complete');
     `);
+
+    // Fresh DB only: no pre-existing rows means nothing to re-key.
+    if (fresh) {
+      db.exec(`
+        INSERT OR IGNORE INTO schema_meta(key, value)
+        VALUES ('${PROJECT_KEY_BACKFILL_KEY}', 'complete');
+      `);
+    }
 
     db.exec('COMMIT');
   } catch (e) {

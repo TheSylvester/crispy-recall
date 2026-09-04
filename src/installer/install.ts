@@ -24,7 +24,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
 import { binDir, modelsDir, runDir, logsDir, recallRoot, dbPath } from '../paths.js';
-import { getDb, isBindingLoadError, isRetrievalMigrationPending } from '../db.js';
+import { getDb, isBindingLoadError, isRetrievalMigrationPending, PROJECT_KEY_BACKFILL_KEY } from '../db.js';
 import { getEmbedVersionStats, getEmbeddingGapStats } from '../recall/message-store.js';
 import {
   runPreflight, preflightPassed, acquireInstallLock, releaseInstallLock,
@@ -674,6 +674,25 @@ export async function runInstall(opts: InstallOptions = {}): Promise<InstallResu
         };
       }
     }
+
+    // ---- 6.8 Project-key backfill notice (upgrade path) ----
+    // Never run here: the backfill spawns git per distinct project_id and is
+    // attended by design (spec §4.3). Rows without a key still match through
+    // the project_id half of the filter, so this is advice, not a gate.
+    try {
+      const d = getDb(dbPath());
+      const hasMessages = d.get(
+        `SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'messages'`,
+      );
+      if (hasMessages) {
+        const marker = d.get(
+          `SELECT value FROM schema_meta WHERE key = ?`, [PROJECT_KEY_BACKFILL_KEY],
+        ) as { value?: string } | undefined;
+        if (marker?.value !== 'complete') {
+          say('project keys: run `recall repair --rekey-projects` once to key existing rows');
+        }
+      }
+    } catch { /* advisory only — never block an install */ }
 
     // ---- 7. Claude / Codex filesystem edits (LAST) ----
     const runnable = recallBinCommand();
