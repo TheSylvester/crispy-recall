@@ -27,12 +27,12 @@ Install the hub first with the route above, then issue one token per satellite a
 
 ```bash
 recall hub token --host <name>                       # prints the token once
-recall hub serve --bind <tailnet-address> --detach   # binds 127.0.0.1 unless --bind is given
+recall hub serve --bind <tailnet-address> --detach   # first run without --bind listens on 127.0.0.1; later runs reuse the persisted address
 ```
 
-A non-loopback `--bind` requires at least one token, so issue the token first; `recall hub serve` runs in the foreground (for systemd) unless you pass `--detach`. `--bind`/`--port` are persisted on the first `hub serve`, and `recall hub token` prints the satellite install command from that persisted address.
+A non-loopback `--bind` requires at least one token, so issue the token first; `recall hub serve` runs in the foreground (for systemd) unless you pass `--detach`. `--bind`/`--port` are persisted on the first `hub serve`. `recall hub token` prints a ready-made `recall install --hub <url> --token -` line from that persisted address; before the first `hub serve` has persisted one it falls back to `http://127.0.0.1:7877`, so substitute your `--bind` address by hand, or re-run `recall hub token --host <name>` once the daemon is up (re-running rotates that host's token).
 
-`recall hub install-service` registers a systemd user unit on Linux so the daemon starts at login; it prints the `loginctl enable-linger <user>` command to run if you also want it to survive a logout or a reboot. On each satellite, install recall in that environment too and register it against the hub:
+`recall hub install-service` registers a systemd user unit on Linux so the daemon starts at login; when lingering is not already enabled it prints the `loginctl enable-linger <user>` command, which is what makes the daemon survive a logout or a reboot. On each satellite, install recall in that environment too and register it against the hub:
 
 ```bash
 npm install -g crispy-recall
