@@ -30,7 +30,9 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { _setTestRoot } from '../../src/paths.js';
-import { decodeMeta, type AppendMeta } from '../../src/hub/protocol.js';
+import {
+  MAX_MANIFEST_BODY, MAX_MANIFEST_FILES, decodeMeta, type AppendMeta,
+} from '../../src/hub/protocol.js';
 import { startStubHub, type StubHub, type RecordedRequest } from '../helpers/stub-hub.js';
 
 const REPO = join(__dirname, '..', '..');
@@ -431,6 +433,87 @@ describe('push-pending', () => {
       await other.close();
     }
   }, 60_000);
+
+  it('bounds manifest batches by BYTES, not just by file count', async () => {
+    // Long mirror-relative paths cross MAX_MANIFEST_BODY well before they
+    // reach MAX_MANIFEST_FILES, so 1100 files must produce MORE than the two
+    // batches the count rule alone would give.
+    const deep = join(claudeDir, 'projects', 'p'.repeat(200), 'q'.repeat(200));
+    mkdirSync(deep, { recursive: true });
+    const body = `${JSON.stringify({ type: 'user', cwd: '/tmp/proj', message: { role: 'user', content: 'm' } })}\n`;
+    const rels: string[] = [];
+    for (let i = 0; i < 1100; i++) {
+      const id = `${String(i).padStart(4, '0')}-2222-4000-8000-000000000000`;
+      writeFileSync(join(deep, `${id}.jsonl`), body);
+      const rel = `projects/${'p'.repeat(200)}/${'q'.repeat(200)}/${id}.jsonl`;
+      rels.push(rel);
+      hub.seed('claude', rel, body);
+    }
+    const { code } = await runPushBundle();
+    expect(code).toBe(0);
+
+    const claudeManifests = hub.by('/v1/push/manifest')
+      .filter((m) => (m.json as { vendor: string }).vendor === 'claude');
+    expect(claudeManifests.length).toBeGreaterThan(2);
+    for (const m of claudeManifests) {
+      expect(m.bytes!.byteLength).toBeLessThanOrEqual(MAX_MANIFEST_BODY);
+      expect((m.json as { files: unknown[] }).files.length).toBeLessThanOrEqual(MAX_MANIFEST_FILES);
+      expect(m.status).toBe(200);
+    }
+    const manifested = claudeManifests.flatMap((m) => (m.json as { files: Array<{ path: string }> }).files.map((f) => f.path));
+    expect(manifested).toHaveLength(rels.length);
+    expect(new Set(manifested).size).toBe(rels.length);
+    expect(pushLog()).not.toContain('push-failed');
+  }, 120_000);
+
+  it('halves and retries a batch the hub answers 413, manifesting every file', async () => {
+    const other = await startStubHub({ host: 'sat-push', manifestMaxFiles: 100 });
+    const dir = join(claudeDir, 'projects', '-413');
+    mkdirSync(dir, { recursive: true });
+    const body = `${JSON.stringify({ type: 'user', cwd: '/tmp/proj', message: { role: 'user', content: 'm' } })}\n`;
+    const rels: string[] = [];
+    for (let i = 0; i < 250; i++) {
+      const id = `${String(i).padStart(4, '0')}-3333-4000-8000-000000000000`;
+      writeFileSync(join(dir, `${id}.jsonl`), body);
+      const rel = `projects/-413/${id}.jsonl`;
+      rels.push(rel);
+      other.seed('claude', rel, body);
+    }
+    makeSatellite(other.url, other.token);
+    try {
+      const { code } = await runPushBundle();
+      expect(code).toBe(0);
+      const claudeManifests = other.by('/v1/push/manifest')
+        .filter((m) => (m.json as { vendor: string }).vendor === 'claude');
+      const counts = claudeManifests.map((m) => (m.json as { files: unknown[] }).files.length);
+      // 250 → 413, then 125 / 125, each → 413, then 63 / 62 … until ≤ 100.
+      expect(counts[0]).toBe(250);
+      expect(counts[1]).toBe(125);
+      expect(counts).toContain(63);
+      const accepted = claudeManifests.filter((m) => m.status === 200);
+      const manifested = accepted.flatMap((m) => (m.json as { files: Array<{ path: string }> }).files.map((f) => f.path));
+      expect(new Set(manifested).size).toBe(rels.length);
+      for (const c of counts) expect(c).toBeLessThanOrEqual(250);
+      expect(pushLog()).not.toContain('push-failed');
+    } finally {
+      await other.close();
+    }
+  }, 60_000);
+
+  it('skips a single file the hub still answers 413, without failing the run', async () => {
+    const other = await startStubHub({ host: 'sat-push', manifestMaxFiles: 0 });
+    const c = claudeTranscript('-413-single', '/tmp/proj');
+    makeSatellite(other.url, other.token);
+    try {
+      const { code } = await runPushBundle();
+      expect(code).toBe(0);
+      expect(other.by('/v1/push/append')).toHaveLength(0);
+      expect(pushLog()).toContain(`manifest replied 413 path=${c.rel}`);
+      expect(pushLog()).not.toContain('push-failed');
+    } finally {
+      await other.close();
+    }
+  });
 
   it('treats an unparseable 200 manifest body as a transport failure', async () => {
     const other = await startStubHub({ host: 'sat-push', manifestGarbage: 'not json at all' });

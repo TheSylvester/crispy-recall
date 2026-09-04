@@ -12,7 +12,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { randomBytes, createHash } from 'node:crypto';
 import {
   HEADER_META, HEADER_STALE, HEADER_VERSION, HEADER_WIRE, MAX_APPEND_BYTES,
-  WIRE_VERSION, decodeMeta, validateRelPath, type AppendMeta,
+  MAX_MANIFEST_BODY, WIRE_VERSION, decodeMeta, validateRelPath, type AppendMeta,
 } from '../../src/hub/protocol.js';
 
 export interface RecordedRequest {
@@ -49,6 +49,8 @@ export interface StubHubOptions {
   manifestStatuses?: number[];
   /** Answer every manifest 200 with this raw (non-JSON) body. */
   manifestGarbage?: string;
+  /** 413 any manifest carrying more than this many files. */
+  manifestMaxFiles?: number;
 }
 
 export interface StubHub {
@@ -124,10 +126,17 @@ export async function startStubHub(opts: StubHubOptions = {}): Promise<StubHub> 
     }
 
     if (url.pathname === '/v1/push/manifest' && req.method === 'POST') {
-      const body = JSON.parse((await readBody(req)).toString('utf-8') || '{}') as {
+      const raw = await readBody(req);
+      rec.bytes = raw;
+      if (raw.byteLength > MAX_MANIFEST_BODY) { send(413, { error: 'body too large' }); return; }
+      const body = JSON.parse(raw.toString('utf-8') || '{}') as {
         vendor?: string; full?: boolean; files?: Array<{ path: string; size: number }>;
       };
       rec.json = body;
+      if (opts.manifestMaxFiles !== undefined && (body.files ?? []).length > opts.manifestMaxFiles) {
+        send(413, { error: 'too many files' });
+        return;
+      }
       if (opts.manifestDelayMs) await new Promise((r) => setTimeout(r, opts.manifestDelayMs));
       const forced = opts.manifestStatuses?.shift();
       if (forced !== undefined && forced !== 200) { send(forced, { error: 'forced' }); return; }

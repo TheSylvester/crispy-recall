@@ -44,6 +44,16 @@ export const LOCK_STALE_MS = 30 * 60 * 1000;
 /** Heartbeat period. embed-lock.ts has none; a 30-min `--full` run would
  *  otherwise outlive its own 30-min staleness window and be taken over. */
 export const LOCK_HEARTBEAT_MS = 60_000;
+/**
+ * Soft ceiling for a serialised manifest body: 32 KiB under the hub's
+ * `MAX_MANIFEST_BODY` (256 KiB). A batch of 1000 mirror-relative paths —
+ * `projects/<encoded-cwd>/<uuid>.jsonl` is ~100-110 bytes, more for a deep or
+ * non-ASCII cwd — can cross 256 KiB well before it reaches 1000 files, so the
+ * batcher bounds by BOTH count and bytes. The margin absorbs the envelope and
+ * any UTF-8 expansion the estimate under-counts.
+ */
+export const MANIFEST_BODY_SOFT_LIMIT = 224 * 1024;
+
 /** Bytes of a transcript read when peeking for the session cwd. */
 export const CWD_PEEK_BYTES = 64 * 1024;
 /** Lines of that peek inspected. */
@@ -376,68 +386,132 @@ async function pushVendor(
   if (named) consider(named, true);
   for (const f of swept) consider(f, false);
 
-  // ---- manifest, in ≤1000-file batches ----
+  // ---- manifest batches ----
   // An empty vendor still sends ONE empty manifest: that is how a satellite
   // whose recent set is empty learns `fullSweepDue` and recovers from an
   // outage longer than the 7-day window (S15).
-  const batches: Array<typeof files> = [];
-  for (let i = 0; i < files.length; i += MAX_MANIFEST_FILES) batches.push(files.slice(i, i + MAX_MANIFEST_FILES));
-  if (batches.length === 0) batches.push([]);
+  const batches = planManifestBatches(files, vr.vendor, full);
 
   for (const batch of batches) {
     if (!budgetLeft(ctx)) return out;
-    let res;
-    try {
-      res = await hubRequest(ctx.hubUrl, {
-        method: 'POST',
-        path: '/v1/push/manifest',
-        token: ctx.token,
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          vendor: vr.vendor,
-          full,
-          files: batch.map((f) => ({ path: f.rel, size: f.size, mtime: f.mtime })),
-        }),
-        timeoutMs: reqTimeout(ctx),
-      });
-    } catch (e) {
-      const reason = (e as HubTransportError).reason ?? (e as Error).message;
-      pushLog(`${nowIso()} push-failed host=${ctx.host} vendor=${vr.vendor} err=unreachable ${reason}`);
-      out.transportFailed = true;
-      return out;
-    }
-    if (res.status !== 200) {
-      pushLog(`${nowIso()} push-failed host=${ctx.host} vendor=${vr.vendor} err=manifest replied ${res.status}`);
-      // 401/426/5xx are whole-run conditions: no later batch can succeed.
-      // Anything else is this batch's problem, so the remaining batches — a
-      // different 1000 files — still get their chance.
-      if (res.status >= 500 || res.status === 401 || res.status === 426) {
-        out.transportFailed = true;
-        return out;
-      }
-      continue;
-    }
-    const body = parseJson<ManifestResponse>(res);
-    if (!body || !Array.isArray(body.files)) {
-      // Fatal, unlike a per-batch status rejection: a hub that answers 200
-      // with a body we cannot read is not a hub we can talk to at all, and a
-      // silent exit 0 would report a healthy push that never happened.
-      pushLog(`${nowIso()} push-failed host=${ctx.host} vendor=${vr.vendor} err=manifest body unparseable`);
-      out.transportFailed = true;
-      return out;
-    }
-    if (body.host && !ctx.host) ctx.host = body.host;
-    if (body.fullSweepDue) out.fullSweepDue = true;
-
-    const byRel = new Map(batch.map((f) => [f.rel, f]));
-    for (const entry of body.files) {
-      if (!budgetLeft(ctx)) return out;
-      const local = byRel.get(entry.path);
-      if (!local) continue;
-      await pushFile(ctx, vr, local, entry.offset, entry.reset === true, opts);
-    }
+    const r = await sendManifestBatch(ctx, vr, full, batch, opts);
+    if (r.fullSweepDue) out.fullSweepDue = true;
+    if (r.kind === 'fatal') { out.transportFailed = true; return out; }
   }
   return out;
+}
+
+type ManifestFile = { abs: string; rel: string; size: number; mtime: number; named: boolean };
+
+/**
+ * Split `files` into manifest batches bounded by BOTH `MAX_MANIFEST_FILES`
+ * and `MANIFEST_BODY_SOFT_LIMIT`.
+ *
+ * Sizes are accumulated per entry rather than re-serialising the whole body
+ * per file, which would be quadratic on a `--full` sweep of tens of thousands
+ * of transcripts.
+ */
+export function planManifestBatches<T extends { rel: string; size: number; mtime: number }>(
+  files: T[], vendor: HubVendor, full: boolean,
+): T[][] {
+  const envelopeBytes = Buffer.byteLength(JSON.stringify({ vendor, full, files: [] }), 'utf8');
+  const batches: T[][] = [];
+  let cur: T[] = [];
+  let bytes = envelopeBytes;
+  for (const f of files) {
+    // +1 for the separating comma.
+    const entryBytes = Buffer.byteLength(
+      JSON.stringify({ path: f.rel, size: f.size, mtime: f.mtime }), 'utf8',
+    ) + 1;
+    if (cur.length > 0 && (cur.length >= MAX_MANIFEST_FILES || bytes + entryBytes > MANIFEST_BODY_SOFT_LIMIT)) {
+      batches.push(cur);
+      cur = [];
+      bytes = envelopeBytes;
+    }
+    cur.push(f);
+    bytes += entryBytes;
+  }
+  if (cur.length > 0) batches.push(cur);
+  if (batches.length === 0) batches.push([]);
+  return batches;
+}
+
+interface BatchOutcome { kind: 'ok' | 'skipped' | 'fatal'; fullSweepDue: boolean }
+
+/**
+ * Send ONE manifest batch and push whatever it asks for.
+ *
+ * A `413` means this body was too large for the hub even though our own
+ * estimate passed (a longer path than we counted, a different hub limit): halve
+ * the batch and retry both halves, down to a single file. A single file that
+ * still 413s is logged and skipped — it is that file's problem, never the
+ * run's, so a 413 never sets `transportFailed`.
+ */
+async function sendManifestBatch(
+  ctx: Ctx, vr: VendorRoot, full: boolean, batch: ManifestFile[], opts: PushOptions,
+): Promise<BatchOutcome> {
+  if (!budgetLeft(ctx)) return { kind: 'skipped', fullSweepDue: false };
+  let res;
+  try {
+    res = await hubRequest(ctx.hubUrl, {
+      method: 'POST',
+      path: '/v1/push/manifest',
+      token: ctx.token,
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        vendor: vr.vendor,
+        full,
+        files: batch.map((f) => ({ path: f.rel, size: f.size, mtime: f.mtime })),
+      }),
+      timeoutMs: reqTimeout(ctx),
+    });
+  } catch (e) {
+    const reason = (e as HubTransportError).reason ?? (e as Error).message;
+    pushLog(`${nowIso()} push-failed host=${ctx.host} vendor=${vr.vendor} err=unreachable ${reason}`);
+    return { kind: 'fatal', fullSweepDue: false };
+  }
+
+  if (res.status === 413) {
+    if (batch.length > 1) {
+      const mid = Math.ceil(batch.length / 2);
+      const a = await sendManifestBatch(ctx, vr, full, batch.slice(0, mid), opts);
+      const b = await sendManifestBatch(ctx, vr, full, batch.slice(mid), opts);
+      const kind = a.kind === 'fatal' || b.kind === 'fatal' ? 'fatal' : 'ok';
+      return { kind, fullSweepDue: a.fullSweepDue || b.fullSweepDue };
+    }
+    pushLog(`${nowIso()} manifest replied 413 path=${batch[0]?.rel ?? '(empty batch)'}`);
+    return { kind: 'skipped', fullSweepDue: false };
+  }
+
+  if (res.status !== 200) {
+    pushLog(`${nowIso()} push-failed host=${ctx.host} vendor=${vr.vendor} err=manifest replied ${res.status}`);
+    // 401/426/5xx are whole-run conditions: no later batch can succeed.
+    // Anything else is this batch's problem, so the remaining batches — a
+    // different set of files — still get their chance.
+    if (res.status >= 500 || res.status === 401 || res.status === 426) {
+      return { kind: 'fatal', fullSweepDue: false };
+    }
+    return { kind: 'skipped', fullSweepDue: false };
+  }
+
+  const body = parseJson<ManifestResponse>(res);
+  if (!body || !Array.isArray(body.files)) {
+    // Fatal, unlike a per-batch status rejection: a hub that answers 200
+    // with a body we cannot read is not a hub we can talk to at all, and a
+    // silent exit 0 would report a healthy push that never happened.
+    pushLog(`${nowIso()} push-failed host=${ctx.host} vendor=${vr.vendor} err=manifest body unparseable`);
+    return { kind: 'fatal', fullSweepDue: false };
+  }
+  if (body.host && !ctx.host) ctx.host = body.host;
+
+  const byRel = new Map(batch.map((f) => [f.rel, f]));
+  for (const entry of body.files) {
+    if (!budgetLeft(ctx)) break;
+    const local = byRel.get(entry.path);
+    if (!local) continue;
+    await pushFile(ctx, vr, local, entry.offset, entry.reset === true, opts);
+  }
+  return { kind: 'ok', fullSweepDue: body.fullSweepDue === true };
 }
 
 async function pushFile(
