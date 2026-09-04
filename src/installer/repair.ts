@@ -14,7 +14,7 @@ import { confirm, isCancel } from '@clack/prompts';
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { getDb, RETRIEVAL_SCHEMA_DDL, PROJECT_KEY_BACKFILL_KEY, LEGACY_CODEX_ID_SQL } from '../db.js';
+import { getDb, closeDbBeforeChildSpawn, RETRIEVAL_SCHEMA_DDL, PROJECT_KEY_BACKFILL_KEY, LEGACY_CODEX_ID_SQL } from '../db.js';
 import { dbPath, binDir, remoteRoot } from '../paths.js';
 import { mirrorRoots } from '../hub/mirror.js';
 import { log } from '../log.js';
@@ -109,6 +109,9 @@ export async function repairRekeyCodex(
   if (result.performed && (result.vectorsDropped > 0 || getEmbeddingGapStats().gapCount > 0)) {
     const child = join(binDir(), 'embed-pending.js');
     if (existsSync(child)) {
+      // Close before the child attaches: it may reset the wal-index and
+      // SIGBUS this process's stale `-shm` map (db.ts closeDbBeforeChildSpawn).
+      closeDbBeforeChildSpawn();
       spawn(process.execPath, [child], {
         detached: true,
         stdio: 'ignore',

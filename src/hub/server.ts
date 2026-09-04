@@ -16,7 +16,7 @@ import { existsSync, statSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { hostname } from 'node:os';
 import { join } from 'node:path';
-import { closeDb } from '../db.js';
+import { closeDb, closeDbBeforeChildSpawn } from '../db.js';
 import { binDir } from '../paths.js';
 import { getBinaryPath, getModelPath } from '../recall/embedder.js';
 import type { ScanResult } from '../recall/mtime-scan.js';
@@ -191,6 +191,10 @@ function parseJson(buf: Buffer): unknown | Error {
 function defaultSpawnEmbed(canonicalId: string): void {
   const child = join(binDir(), 'embed-pending.js');
   if (!existsSync(child)) return;
+  // The daemon is long-lived, so it is the process most exposed to a child
+  // resetting the wal-index under its `-shm` map (db.ts
+  // closeDbBeforeChildSpawn). `getDb` re-opens lazily on the next job.
+  closeDbBeforeChildSpawn();
   spawn(process.execPath, [child, canonicalId], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
 }
 

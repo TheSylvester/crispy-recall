@@ -24,7 +24,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
 import { binDir, modelsDir, runDir, logsDir, recallRoot, dbPath } from '../paths.js';
-import { getDb, isBindingLoadError, isRetrievalMigrationPending, isCodexRekeyPending, PROJECT_KEY_BACKFILL_KEY } from '../db.js';
+import { getDb, isBindingLoadError, isRetrievalMigrationPending, isCodexRekeyPending, closeDbBeforeChildSpawn, PROJECT_KEY_BACKFILL_KEY } from '../db.js';
 import { getEmbedVersionStats, getEmbeddingGapStats } from '../recall/message-store.js';
 import {
   runPreflight, preflightPassed, acquireInstallLock, releaseInstallLock,
@@ -524,6 +524,7 @@ export async function runInstall(opts: InstallOptions = {}): Promise<InstallResu
   let backfillPid: number | undefined;
   let snapshotPath: string | undefined;
   let integrity: IntegrityStatus | undefined;
+  let finalCoverage = 1;
   let retrieval: RetrievalMigrationResult | undefined;
   let codexRekey: CodexRekeyResult | undefined;
   let drainLaunched = false;
@@ -873,6 +874,9 @@ export async function runInstall(opts: InstallOptions = {}): Promise<InstallResu
     // gap (coverage counts only vectors that exist, so guard the gap too) — and
     // never spawn a duplicate over a live drain.
     const coverage = getEmbedVersionStats().coverage;
+    // The report below reads this instead of re-querying: on the spawn branch
+    // the connection is deliberately closed and must not be re-opened.
+    finalCoverage = coverage;
     if (opts.noBackfill) {
       say('backfill skipped (--no-backfill)');
     } else if (opts.autoBackfill) {
@@ -884,11 +888,17 @@ export async function runInstall(opts: InstallOptions = {}): Promise<InstallResu
       await mtimeScan();
       sp?.stop('Backfill complete');
       drainLaunched = true;
+      finalCoverage = getEmbedVersionStats().coverage; // the foreground drain moved it
+
     } else if (backfillAlreadyRunning()) {
       say('backfill already running in background — not relaunching');
     } else if (migration.state === 'already-migrated' && coverage >= 1 && getEmbeddingGapStats().gapCount === 0) {
       say('already migrated (all vectors current) — no background re-embed needed');
     } else {
+      // Close FIRST: the child opens the same WAL database and may reset the
+      // wal-index, which SIGBUSes any process still mapping `<db>-shm`
+      // (db.ts closeDbBeforeChildSpawn). Nothing below re-opens it.
+      closeDbBeforeChildSpawn();
       backfillPid = spawnDetachedBackfill();
       drainLaunched = backfillPid !== undefined;
       say(backfillPid ? `backfill running in background (PID ${backfillPid})` : 'backfill could not be launched');
@@ -905,7 +915,9 @@ export async function runInstall(opts: InstallOptions = {}): Promise<InstallResu
   }
 
   // ---- 9. Final report ----
-  const finalCoverage = getEmbedVersionStats().coverage;
+  // `finalCoverage` was captured in phase 8, BEFORE the detached drain was
+  // spawned. Re-reading it here would re-open the database behind that child.
+
   const migrationInfo: MigrationInfo = {
     state: migration.state,
     coverage: finalCoverage,

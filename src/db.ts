@@ -362,6 +362,35 @@ export function _resetDb(): void {
   closeDb();
 }
 
+/**
+ * Release the shared connection BEFORE spawning a child that opens the same
+ * database, and never touch the database again in this process afterwards.
+ *
+ * In WAL mode SQLite keeps the wal-index (`<db>-shm`) `mmap`'d. A newly
+ * attaching connection may RESET that index — `ftruncate(<shm fd>, 3)` — and a
+ * process that still maps the old 32 KB region then dies with SIGBUS
+ * (BUS_ADRERR) the next time it reads the index. Measured on the 0.3.1 → codex
+ * re-key upgrade: the installer kept its connection open across
+ * `spawnDetachedBackfill()`, the detached `recall backfill` child truncated the
+ * shm, and the installer's next query (the final coverage read) took SIGBUS
+ * after every phase had already succeeded.
+ *
+ * `getDb` re-opens lazily, so a later caller in a long-lived process (the hub
+ * daemon) is unaffected — it simply gets a fresh connection and a fresh map.
+ */
+/** Test seam: is a shared connection currently open? (No I/O.) */
+export function _isDbOpen(): boolean {
+  return db !== null;
+}
+
+export function closeDbBeforeChildSpawn(): void {
+  try {
+    closeDb();
+  } catch {
+    // A failed close must never block the child: the spawn is the point.
+  }
+}
+
 // ============================================================================
 // Binding open + adapter
 // ============================================================================

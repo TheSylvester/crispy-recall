@@ -23,7 +23,7 @@
 
 import { dualPathSearch } from '../recall/vector-search.js';
 import { disposeEmbedder } from '../recall/embedder.js';
-import { getDb, closeDb } from '../db.js';
+import { getDb, closeDb, closeDbBeforeChildSpawn } from '../db.js';
 import { getDbPath, listSessions } from '../recall/memory-queries.js';
 import { readSessionMessages, getMessageByUuid } from '../recall/message-store.js';
 import { normalizePath } from '../url-path-resolver.js';
@@ -1196,6 +1196,9 @@ async function runBackfill() {
     const args = [process.argv[1]!, 'backfill', '--auto-embed'];
     const vendors = parseVendors();
     if (vendors) { args.push('--vendor', vendors[0]!); }
+    // Close before the child attaches: it may reset the wal-index and SIGBUS
+    // this process's stale `-shm` map (db.ts closeDbBeforeChildSpawn).
+    closeDbBeforeChildSpawn();
     const child = spawn(process.execPath, args, {
       detached: true,
       stdio: ['ignore', logFd, logFd],
