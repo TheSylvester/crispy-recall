@@ -3,6 +3,10 @@
  *
  * The scripts drive the owner's REAL machines, so this suite never executes a
  * script body: it spawns `bash -n` (a syntax check) and otherwise reads text.
+ * ONE exception: the CLAUDECODE test below SOURCES lib.sh, which runs its
+ * `mkdir -p`. That call passes both RECALL_E2E_LOG_DIR and HOME on a temp dir,
+ * so it cannot reach the owner's live ~/.recall even if one of the two is ever
+ * dropped — lib.sh reads no other filesystem root.
  * It encodes the rules that keep an acceptance run safe — read-only access to
  * the live database except one allow-listed watermark DELETE, no token literal,
  * no bare `ssh`/`cmd.exe`, a restore trap on every state-changing script, and a
@@ -32,7 +36,7 @@ const STATE_CHANGING = ['33-hub-hardening.sh', '44-laptop-failures.sh', '50-win-
 const HELPERS = [
   'pass', 'fail', 'step', 'load_tokens', 'nonce', 'hub_sql', 'lap', 'lap_put', 'lap_stdin',
   'win_cmd', 'wait_until', 'hub_health', 'require_hub_up', 'mirror_dir', 'log_file', 'write_token_file',
-  'rows',
+  'rows', 'hub_sql_file', 'path_list', 'in_list',
 ];
 
 const text = (f: string) => readFileSync(join(DIR, f), 'utf8');
@@ -51,16 +55,19 @@ describe('contrib/satellite/e2e — script lint', () => {
     expect(() => execFileSync('bash', ['-n', join(DIR, f)], { stdio: 'pipe' })).not.toThrow();
   });
 
-  // `set -u` must be in force before the first heredoc, and — for every script
-  // this unit owns — within the first 20 lines, so no body runs unguarded.
-  // 10-parity.sh is out of this unit's scope and carries a long file header.
-  it.each(SCRIPTS)('%s sets -u early', (f) => {
+  // `set -u` must be in force before ANY body runs: it may be preceded only by
+  // the shebang, comments, blank lines and the `source lib.sh` line, and it must
+  // come before the first heredoc. A length limit would only measure how long a
+  // script's DEVIATION header is.
+  it.each(SCRIPTS)('%s sets -u before any body', (f) => {
     const l = lines(f);
     const setU = l.findIndex((x) => /^set -u$/.test(x));
     expect(setU).toBeGreaterThanOrEqual(0);
+    const preamble = /^\s*(#|$)|^#!|^source "\$\(dirname "\$0"\)\/lib\.sh"$/;
+    const firstBody = l.findIndex((x) => !preamble.test(x));
+    expect(setU, `${f}: first body line is ${firstBody + 1} (${l[firstBody]})`).toBe(firstBody);
     const firstHeredoc = l.findIndex((x) => /<<-?'?[A-Za-z_]+'?/.test(x));
     if (firstHeredoc >= 0) expect(setU).toBeLessThan(firstHeredoc);
-    if (f !== '10-parity.sh') expect(setU).toBeLessThan(20);
   });
 
   it.each(NEEDS_LIB)('%s sources lib.sh', (f) => {
@@ -191,7 +198,7 @@ describe('contrib/satellite/e2e — script lint', () => {
     const out = execFileSync(
       'bash',
       ['-c', `. "${join(DIR, 'lib.sh')}"; printf '[%s]' "\${CLAUDECODE-unset}"`],
-      { env: { ...process.env, CLAUDECODE: '1', RECALL_E2E_LOG_DIR: tmp }, encoding: 'utf8' },
+      { env: { ...process.env, CLAUDECODE: '1', RECALL_E2E_LOG_DIR: tmp, HOME: tmp }, encoding: 'utf8' },
     );
     expect(out).toBe('[unset]');
     rmSync(tmp, { recursive: true, force: true });

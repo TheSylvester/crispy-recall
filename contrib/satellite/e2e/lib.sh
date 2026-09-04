@@ -124,6 +124,42 @@ hub_sql() { # $1 SQL — read-only, always
   sqlite3 -readonly "$HOME/.recall/recall.db" "$1"
 }
 
+# hub_sql_file <path to .sql> — the same read-only handle, with the statement on
+# STDIN. An IN-list of a few thousand mirror paths does not fit in one argv
+# element (execve E2BIG), and a rejected statement must be visible: callers check
+# the exit status.
+hub_sql_file() { # $1 SQL file
+  sqlite3 -readonly "$HOME/.recall/recall.db" < "$1"
+}
+
+# path_list <NUL-delimited input> <line-delimited output> — validates and
+# converts. A path holding a newline or a quote would desynchronise the line
+# readers AND the SQL IN-list at once, so anything outside [A-Za-z0-9._/-] is a
+# hard error. Prints the count.
+path_list() {
+  python3 - "$1" "$2" <<'PY'
+import re,sys
+data=open(sys.argv[1],'rb').read()
+paths=[p.decode('utf-8','surrogateescape') for p in data.split(b'\0') if p]
+bad=[p for p in paths if not re.fullmatch(r'[A-Za-z0-9._/-]+', p)]
+if bad:
+    print('unsafe path: %r' % bad[0], file=sys.stderr)
+    sys.exit(1)
+open(sys.argv[2],'w').write(''.join(p+'\n' for p in paths))
+print(len(paths))
+PY
+}
+
+# in_list <line-delimited path file> — an SQL IN-list, single quotes doubled.
+# Feed the result to hub_sql_file, never to argv.
+in_list() {
+  python3 - "$1" <<'PY'
+import sys
+paths=[l.rstrip("\n") for l in open(sys.argv[1]) if l.strip()]
+print(",".join("'" + p.replace("'", "''") + "'" for p in paths))
+PY
+}
+
 hub_health() {
   curl -s -m 4 "$HUB_URL/v1/health"
 }
