@@ -3,6 +3,10 @@
  *
  * The scripts drive the owner's REAL machines, so this suite never executes a
  * script body: it spawns `bash -n` (a syntax check) and otherwise reads text.
+ * ONE exception: the CLAUDECODE test below SOURCES lib.sh, which runs its
+ * `mkdir -p`. That call passes both RECALL_E2E_LOG_DIR and HOME on a temp dir,
+ * so it cannot reach the owner's live ~/.recall even if one of the two is ever
+ * dropped — lib.sh reads no other filesystem root.
  * It encodes the rules that keep an acceptance run safe — read-only access to
  * the live database except one allow-listed watermark DELETE, no token literal,
  * no bare `ssh`/`cmd.exe`, a restore trap on every state-changing script, and a
@@ -19,7 +23,8 @@
  */
 import { describe, expect, it } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { readdirSync, readFileSync } from 'node:fs';
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const DIR = join(__dirname, '..', '..', 'contrib', 'satellite', 'e2e');
@@ -31,7 +36,7 @@ const STATE_CHANGING = ['33-hub-hardening.sh', '44-laptop-failures.sh', '50-win-
 const HELPERS = [
   'pass', 'fail', 'step', 'load_tokens', 'nonce', 'hub_sql', 'lap', 'lap_put', 'lap_stdin',
   'win_cmd', 'wait_until', 'hub_health', 'require_hub_up', 'mirror_dir', 'log_file', 'write_token_file',
-  'rows',
+  'rows', 'hub_sql_file', 'scan_list', 'in_list',
 ];
 
 const text = (f: string) => readFileSync(join(DIR, f), 'utf8');
@@ -50,16 +55,19 @@ describe('contrib/satellite/e2e — script lint', () => {
     expect(() => execFileSync('bash', ['-n', join(DIR, f)], { stdio: 'pipe' })).not.toThrow();
   });
 
-  // `set -u` must be in force before the first heredoc, and — for every script
-  // this unit owns — within the first 20 lines, so no body runs unguarded.
-  // 10-parity.sh is out of this unit's scope and carries a long file header.
-  it.each(SCRIPTS)('%s sets -u early', (f) => {
+  // `set -u` must be in force before ANY body runs: it may be preceded only by
+  // the shebang, comments, blank lines and the `source lib.sh` line, and it must
+  // come before the first heredoc. A length limit would only measure how long a
+  // script's DEVIATION header is.
+  it.each(SCRIPTS)('%s sets -u before any body', (f) => {
     const l = lines(f);
     const setU = l.findIndex((x) => /^set -u$/.test(x));
     expect(setU).toBeGreaterThanOrEqual(0);
+    const preamble = /^\s*(#|$)|^#!|^source "\$\(dirname "\$0"\)\/lib\.sh"$/;
+    const firstBody = l.findIndex((x) => !preamble.test(x));
+    expect(setU, `${f}: first body line is ${firstBody + 1} (${l[firstBody]})`).toBe(firstBody);
     const firstHeredoc = l.findIndex((x) => /<<-?'?[A-Za-z_]+'?/.test(x));
     if (firstHeredoc >= 0) expect(setU).toBeLessThan(firstHeredoc);
-    if (f !== '10-parity.sh') expect(setU).toBeLessThan(20);
   });
 
   it.each(NEEDS_LIB)('%s sources lib.sh', (f) => {
@@ -75,6 +83,15 @@ describe('contrib/satellite/e2e — script lint', () => {
       expect(t).toMatch(/\bpass "/);
       expect(t).toMatch(/\bfail "/);
     }
+  });
+
+  // Every `pass` call names $NAME first, so the single printed PASS line always
+  // starts `PASS <script>` — a suffix like " (synthetic hook: …)" is allowed.
+  // (A script may hold more than one exit path; 61 has an early --run-less one.)
+  it.each(NEEDS_LIB)('%s passes on $NAME, optional suffix', (f) => {
+    const calls = [...text(f).matchAll(/(?:^|[\s;&|])pass "([^"]*)"/g)].map((m) => m[1]);
+    expect(calls.length).toBeGreaterThanOrEqual(1);
+    for (const c of calls) expect(c).toMatch(/^\$NAME/);
   });
 
   // Rule 10: no token literal may ever be committed.
@@ -170,6 +187,21 @@ describe('contrib/satellite/e2e — script lint', () => {
       if (!called) continue;
       expect(lib, `${f} calls ${h}`).toMatch(new RegExp(`^${h}\\s*\\(\\)`, 'm'));
     }
+  });
+
+  // The acceptance seat is a Claude Code session; the native binary refuses a
+  // nested `claude -p` while CLAUDECODE is set. lib.sh must clear it for every
+  // script that sources it. RECALL_E2E_LOG_DIR points at a temp dir so sourcing
+  // lib.sh cannot mkdir under the owner's live ~/.recall.
+  it('lib.sh unsets CLAUDECODE', () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'e2e-lint-'));
+    const out = execFileSync(
+      'bash',
+      ['-c', `. "${join(DIR, 'lib.sh')}"; printf '[%s]' "\${CLAUDECODE-unset}"`],
+      { env: { ...process.env, CLAUDECODE: '1', RECALL_E2E_LOG_DIR: tmp, HOME: tmp }, encoding: 'utf8' },
+    );
+    expect(out).toBe('[unset]');
+    rmSync(tmp, { recursive: true, force: true });
   });
 
   it('the README run order names exactly the runnable scripts', () => {

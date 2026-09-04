@@ -15,7 +15,15 @@ FLOOR_SQL="SELECT COUNT(*) FROM messages m WHERE m.retrieval_class='hot' AND m.m
 
 OUT=$("$RECALL_BIN" repair --rekey-codex --yes 2>&1) || fail "$NAME" "repair --rekey-codex exited nonzero"
 printf '%s\n' "$OUT" | sed 's/^/    /'
-if printf '%s\n' "$OUT" | grep -qiE 're-keyed|vectors dropped'; then
+# `repair --rekey-codex` prints ONE of two CLI lines (recall.ts:1312-1315):
+#   performed → `Codex message ids re-keyed (N/M sessions re-ingested).`
+#   no-op     → `Codex message ids are already re-keyed — nothing to do.`
+# Both contain "re-keyed", so the no-op line is excluded explicitly; the
+# migration additionally logs `vectors dropped: N`
+# (installer/codex-rekey-migration.ts:186) only when it does work.
+if printf '%s\n' "$OUT" | grep -q 'already re-keyed'; then
+  step "already re-keyed — no drain needed"
+elif printf '%s\n' "$OUT" | grep -qE 'vectors dropped|Codex message ids re-keyed \('; then
   step "the migration re-keyed sessions — waiting for the embed drain"
   FLOOR=$(hub_sql "$FLOOR_SQL")
   step "sub-50-char floor (never embedded by design, MIN_EMBED_CHARS): $FLOOR"
@@ -30,7 +38,7 @@ if printf '%s\n' "$OUT" | grep -qiE 're-keyed|vectors dropped'; then
   done
   step "vector gap now: $(hub_sql "$GAP_SQL")"
 else
-  step "no re-key happened (already complete or a no-op) — no drain needed"
+  step "no re-key line recognised in the output — no drain needed"
 fi
 
 RP=$("$RECALL_BIN" repair --rekey-projects 2>&1) || fail "$NAME" "repair --rekey-projects exited nonzero"

@@ -25,7 +25,7 @@ PY
 step "run/hub.json pid=${DETACHED:-none} systemd MainPID=${UNIT_PID:-0}"
 if [ -n "$DETACHED" ] && [ "$DETACHED" != "${UNIT_PID:-0}" ] && kill -0 "$DETACHED" 2>/dev/null; then
   kill -TERM "$DETACHED" || fail "$NAME" "could not signal the detached hub pid $DETACHED"
-  wait_until 15 '! hub_health | grep -q ok' || fail "$NAME" "the detached hub pid $DETACHED still answers after SIGTERM"
+  wait_until 15 "! hub_health | grep -q '\"ok\":true'" || fail "$NAME" "the detached hub pid $DETACHED still answers after SIGTERM"
   step "stopped detached hub pid $DETACHED to hand ownership to systemd"
 fi
 
@@ -36,7 +36,7 @@ else
 fi
 wait_until 20 '[ "$(systemctl --user is-active recall-hub 2>/dev/null)" = active ]' \
   || fail "$NAME" "recall-hub did not become active within 20 s"
-wait_until 15 'hub_health | grep -q ok' || fail "$NAME" "the unit is active but /v1/health does not answer"
+wait_until 15 "hub_health | grep -q '\"ok\":true'" || fail "$NAME" "the unit is active but /v1/health does not answer"
 step "systemd MainPID now $(systemctl --user show -p MainPID --value recall-hub)"
 
 H=$(lap "curl -s -m 5 $HUB_URL/v1/health") || fail "$NAME" "curl from the laptop failed"

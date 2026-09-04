@@ -6,6 +6,11 @@
 # markers, not by a "First: seq N" footer. `recall <sid>` (runReadSession,
 # recall.ts:645, footers :639-641) never prints "First: seq"; only
 # `recall <sid> <mid>` (runReadTurn, footers :771-773) does.
+#
+# DEVIATION §9.3.4 — "--project /tmp returns zero rows" is asserted as "the
+# laptop session is out of scope and every listed session is a hub session under
+# /tmp": the live hub holds hundreds of hub-local sessions run from /tmp and
+# semantic retrieval returns in-scope neighbours for any query.
 source "$(dirname "$0")/lib.sh"
 set -u
 NAME=42-laptop-queries
@@ -32,13 +37,30 @@ R2=$(lap "cd ~ && $P"'recall "SAT-LAPTOP-'"$NONCE"'" --project ~/dev/crispy') ||
 printf '%s\n' "$R2" | grep -q "$SID" || fail "$NAME" "--project ~/dev/crispy does not find the session from ~"
 R3=$(lap "cd ~ && $P"'recall "SAT-LAPTOP-'"$NONCE"'" --project /tmp'); RC3=$?
 step "--project /tmp exit code: $RC3"
-# A zero row count only means something when the query actually ran: an empty
-# output would score 0 as well.
+# A row count only means something when the query actually ran: an empty output
+# would score 0 as well.
 printf '%s\n' "$R3" | grep -q '^Results: ' \
   || fail "$NAME" "the --project /tmp query produced no Results: line"
 N3=$(printf '%s\n' "$R3" | rows)
 step "--project /tmp unique sessions: $N3"
-[ "$N3" = 0 ] || fail "$NAME" "--project /tmp returned $N3 sessions"
+printf '%s\n' "$R3" | grep -q "$SID" \
+  && fail "$NAME" "--project /tmp returned the laptop session $SID; the scope filter leaked"
+# The table row is `rank  session_id  message_id  date  tag  hits  snippet`
+# (recall.ts:998-1006); ids are opaque — UUID, agent-<7hex> or
+# codex-jsonl-<uuid>-<n>. Anything else on a row is not an id we can check.
+IDS=$(printf '%s\n' "$R3" | awk '$1 ~ /^[0-9]+$/ && NF >= 2 { print $2 }' | sort -u)
+CHECKED=0
+for sid in $IDS; do
+  case "$sid" in
+    [0-9a-f]*-[0-9a-f]*-[0-9a-f]*-[0-9a-f]*-[0-9a-f]*|agent-[0-9a-f]*|codex-jsonl-*) ;;
+    *) step "skipping unrecognised table token '$sid'"; continue;;
+  esac
+  C=$(hub_sql "SELECT COUNT(*) FROM messages WHERE session_id='$sid' AND (project_id = '/tmp' OR project_id LIKE '/tmp/%')")
+  [ "${C:-0}" -ge 1 ] || fail "$NAME" "--project /tmp listed session $sid, which has no row under /tmp"
+  CHECKED=$((CHECKED+1))
+done
+[ "$CHECKED" -ge 1 ] || [ "$N3" = 0 ] || fail "$NAME" "--project /tmp reported $N3 sessions but no id could be parsed from the table"
+step "--project /tmp: $CHECKED sessions, all under /tmp, laptop session absent"
 
 MID=$(hub_sql "SELECT message_id FROM messages WHERE session_id='$SID' ORDER BY message_seq LIMIT 1")
 step "first message id of $SID: $MID"

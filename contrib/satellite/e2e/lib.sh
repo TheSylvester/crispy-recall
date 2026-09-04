@@ -11,6 +11,11 @@
 # win_cmd (WSL → cmd.exe interop). Nothing here echoes a bearer token.
 set -u
 
+# The acceptance seat is itself a Claude Code session, and the native binary
+# refuses a nested run while CLAUDECODE is set ("Claude Code cannot be launched
+# inside another Claude Code session"). Scripts 20, 41 and 44 run `claude -p`.
+unset CLAUDECODE
+
 E2E_LOG_DIR=${RECALL_E2E_LOG_DIR:-$HOME/.recall/logs/e2e}
 mkdir -p "$E2E_LOG_DIR"
 
@@ -117,6 +122,53 @@ rows() {
 
 hub_sql() { # $1 SQL — read-only, always
   sqlite3 -readonly "$HOME/.recall/recall.db" "$1"
+}
+
+# hub_sql_file <path to .sql> — the same read-only handle, with the statement on
+# STDIN. An IN-list of a few thousand mirror paths does not fit in one argv
+# element (execve E2BIG), and a rejected statement must be visible: callers check
+# the exit status.
+hub_sql_file() { # $1 SQL file
+  sqlite3 -readonly "$HOME/.recall/recall.db" < "$1"
+}
+
+# scan_list <NUL-delimited "<size>|<path>" records> <paths out> <path|size out>
+# One atomic `find … -printf '%s|%p\0'` pass gives identity AND size together, so
+# no file can change between the two reads. Writes the sorted path list and the
+# path|size map, and prints the count.
+#
+# Validator limit, not a hub rule: the hub accepts any non-control, non-`?`
+# character in a rel segment (protocol.ts:227-236). Only what would desynchronise
+# a line reader is rejected here — a newline, a carriage return or leading and
+# trailing whitespace. in_list's quote doubling makes every other character safe
+# in SQL, and `path|size` is split at the LAST `|`, so a path may hold one.
+scan_list() {
+  python3 - "$1" "$2" "$3" <<'PY'
+import sys
+recs=[r for r in open(sys.argv[1],'rb').read().split(b'\0') if r]
+paths=[]
+for r in recs:
+    size,_,path = r.decode('utf-8','surrogateescape').partition('|')
+    if any(c in path for c in ('\n','\r')) or path != path.strip():
+        print('unsafe path (validator limit — a newline, CR or edge whitespace '
+              'breaks the line readers): %r' % path, file=sys.stderr)
+        sys.exit(1)
+    paths.append((path,int(size)))
+paths.sort()
+open(sys.argv[2],'w').write(''.join(p+'\n' for p,_ in paths))
+open(sys.argv[3],'w').write(''.join('%s|%d\n' % (p,s) for p,s in paths))
+print(len(paths))
+PY
+}
+
+# in_list <line-delimited path file> — an SQL IN-list, single quotes doubled.
+# Feed the result to hub_sql_file, never to argv.
+in_list() {
+  python3 - "$1" <<'PY'
+import sys
+paths=[l.rstrip("\n") for l in open(sys.argv[1]) if l.strip()]
+print(",".join("'" + p.replace("'", "''") + "'" for p in paths))
+PY
 }
 
 hub_health() {

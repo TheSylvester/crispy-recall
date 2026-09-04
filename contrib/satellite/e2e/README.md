@@ -22,6 +22,20 @@ Shared: `RECALL_E2E_LOG_DIR` (default `~/.recall/logs/e2e`), `RECALL_E2E_HUB_ADD
 `RECALL_E2E_PUSH_TIMEOUT` (43), `RECALL_E2E_SNAPSHOT_DIR` (61, 91), `RECALL_E2E_CONFIRM`
 (90, 91), `RECALL_E2E_HOOK_CMD` (91, defaults to the Phase-0 hook literal). `10-parity.sh` uses `RECALL_PARITY_HOME`, `RECALL_PARITY_BASE`,
 `RECALL_MAIN_CHECKOUT`, `RECALL_BASE_WORKTREE`.
+## Windows without an interactive login
+`RECALL_E2E_WIN_SYNTHETIC` (`auto` by default, `0` to disable, `1` to force the
+check) lets 51 and 52 continue when Windows Claude Code cannot authenticate: the
+script writes a two-entry transcript where Claude Code would have written one and
+pipes the Stop payload into the STAGED `C:\Users\silve\.recall\bin\stop-hook.js`.
+That proves the staged hook, the push, the mirror layout, the path and git key
+derivation and the vectorisation on Windows. It leaves a real transcript in the
+owner's Windows project directory: each one is printed as `LEFT-CHANGED:`,
+listed in `$RECALL_E2E_LOG_DIR/win-synthetic.paths`, and removed file by file by
+`90-teardown.sh`. It does NOT prove that Claude Code itself fires the hook on
+Windows, and 52's console-flash observation becomes "not observable in synthetic
+mode". The final line then reads
+`PASS <script> (synthetic hook: Windows Claude auth unavailable)`.
+
 ## Tokens
 `30-hub-tokens-serve.sh` is the only writer of `$RECALL_TOKEN_FILE` (default
 `~/.recall/e2e-tokens.env`, mode 0600, lines `RECALL_E2E_TOKEN=` and
