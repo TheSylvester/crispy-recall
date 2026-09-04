@@ -71,6 +71,12 @@ function codexSessionsDir(): string {
  *
  * The greedy `.*-` consumes the timestamp prefix, leaving the UUID capture group.
  */
+/** Bound on the first-line (session_meta) read: 256 KB. */
+const META_READ_LIMIT = 256 * 1024;
+
+/** Chunk size for the bounded read-to-first-newline. */
+const META_CHUNK_SIZE = 8192;
+
 const SESSION_ID_RE = /rollout-.*-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/;
 
 // ============================================================================
@@ -120,9 +126,21 @@ export function parseCodexJsonlFile(filepath: string): CodexJsonlEnvelope[] {
  * @returns Absolute path to the JSONL file, or null if not found
  */
 export function findCodexSessionFile(sessionId: string): string | null {
+  return listCodexSessionFiles().get(sessionId) ?? null;
+}
+
+/**
+ * Walk the Codex sessions tree ONCE and map every session UUID to its rollout.
+ *
+ * `findCodexSessionFile` is built on this: resolving N sessions one at a time
+ * re-walked the whole tree N times (the re-key migration resolves thousands).
+ * First match wins, exactly as the per-session walk did.
+ */
+export function listCodexSessionFiles(): Map<string, string> {
+  const found = new Map<string, string>();
   try {
     const sessionsDir = codexSessionsDir();
-    if (!fs.existsSync(sessionsDir)) return null;
+    if (!fs.existsSync(sessionsDir)) return found;
 
     // Walk YYYY/MM/DD directory tree
     for (const year of readdirSafe(sessionsDir)) {
@@ -140,18 +158,17 @@ export function findCodexSessionFile(sessionId: string): string | null {
           for (const file of readdirSafe(dayPath)) {
             if (!file.endsWith('.jsonl')) continue;
             const match = file.match(SESSION_ID_RE);
-            if (match && match[1] === sessionId) {
-              return path.join(dayPath, file);
+            if (match && match[1] && !found.has(match[1])) {
+              found.set(match[1], path.join(dayPath, file));
             }
           }
         }
       }
     }
-
-    return null;
   } catch {
-    return null;
+    return found;
   }
+  return found;
 }
 
 /**
@@ -170,13 +187,36 @@ export function extractCodexSessionMeta(
 
   try {
     fd = fs.openSync(filepath, 'r');
-    const buffer = Buffer.alloc(8192); // 8KB — plenty for session_meta
-    const bytesRead = fs.readSync(fd, buffer, 0, 8192, 0);
-    if (bytesRead === 0) return null;
-
-    const content = buffer.toString('utf-8', 0, bytesRead);
-    const newlineIdx = content.indexOf('\n');
-    const firstLine = newlineIdx >= 0 ? content.slice(0, newlineIdx) : content;
+    // Read to the FIRST newline with a 256 KB bound, never a fixed 8 KB slab:
+    // a session_meta line longer than the slab failed to parse, so the whole
+    // meta (subagent source, git.repository_url) went invisible and child
+    // rollouts leaked into the index as hot roots.
+    const chunks: Buffer[] = [];
+    let position = 0;
+    let newlineIdx = -1;
+    let atEof = false;
+    while (position < META_READ_LIMIT) {
+      const chunk = Buffer.alloc(Math.min(META_CHUNK_SIZE, META_READ_LIMIT - position));
+      const bytesRead = fs.readSync(fd, chunk, 0, chunk.length, position);
+      if (bytesRead === 0) { atEof = true; break; }
+      const slice = chunk.subarray(0, bytesRead);
+      const idx = slice.indexOf(0x0a);
+      chunks.push(slice);
+      if (idx >= 0) {
+        newlineIdx = position + idx;
+        break;
+      }
+      position += bytesRead;
+    }
+    if (chunks.length === 0) return null;
+    // A line that reaches the 256 KB bound without a terminator is refused
+    // (the old fixed-slab read refused it too, by failing to parse). A file
+    // whose last line simply lacks a trailing newline is still accepted.
+    if (newlineIdx < 0 && !atEof) return null;
+    // Decode ONCE over the joined bytes: a per-chunk decode would turn a
+    // multi-byte character straddling a chunk boundary into U+FFFD.
+    const joined = Buffer.concat(chunks);
+    const firstLine = (newlineIdx >= 0 ? joined.subarray(0, newlineIdx) : joined).toString('utf-8');
 
     const record = JSON.parse(firstLine.trim()) as CodexJsonlEnvelope;
     if (record.type !== 'session_meta') return null;

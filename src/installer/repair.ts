@@ -11,11 +11,15 @@
  */
 
 import { confirm, isCancel } from '@clack/prompts';
-import { getDb, RETRIEVAL_SCHEMA_DDL, PROJECT_KEY_BACKFILL_KEY } from '../db.js';
-import { dbPath } from '../paths.js';
+import { spawn } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
+import { getDb, RETRIEVAL_SCHEMA_DDL, PROJECT_KEY_BACKFILL_KEY, LEGACY_CODEX_ID_SQL } from '../db.js';
+import { dbPath, binDir } from '../paths.js';
 import { log } from '../log.js';
 import { deriveProjectKey } from '../recall/project-key.js';
 import { isUnderRemoteRoot } from '../recall/mirror-meta.js';
+import type { CodexRekeyResult } from './codex-rekey-migration.js';
 
 function db() {
   const d = getDb(dbPath());
@@ -65,6 +69,69 @@ export function repairFts(): void {
 export function repairVectors(): void {
   db().exec('DELETE FROM message_vectors;');
   log({ source: 'installer/repair', level: 'info', summary: 'message_vectors cleared — will re-embed on next sweep' });
+}
+
+/**
+ * `recall repair --rekey-codex` — attended entry point for the
+ * `codex_message_id_v2` migration (spec §5).
+ *
+ * Attended means attended: on a TTY without `--yes` it names the blast radius
+ * and asks first. The force re-ingests drop the re-keyed sessions' vectors, so
+ * a performed run MUST be followed by a drain — a detached `embed-pending.js`
+ * when one is staged, else a printed instruction to run
+ * `recall backfill --auto-embed`.
+ */
+export async function repairRekeyCodex(
+  opts: { yes?: boolean } = {},
+): Promise<CodexRekeyResult | null> {
+  if (!opts.yes && process.stdout.isTTY) {
+    const pending = countPendingCodexSessions();
+    const go = await confirm({
+      message:
+        `Re-key ${pending} Codex session(s) to full-uuid message ids? ` +
+        'Each is re-ingested from its transcript, which DROPS its embedding vectors; ' +
+        'they re-embed in a background drain afterwards.',
+      initialValue: false,
+    });
+    if (isCancel(go) || !go) {
+      console.error('recall repair --rekey-codex: cancelled — nothing was changed.');
+      return null;
+    }
+  }
+
+  const { runCodexRekeyMigration } = await import('./codex-rekey-migration.js');
+  const result = await runCodexRekeyMigration();
+
+  // Drain on ANY performed run that left work: the vectors a reclassified
+  // session dropped are just as absent as the ones a re-keyed session dropped.
+  const { getEmbeddingGapStats } = await import('../recall/message-store.js');
+  if (result.performed && (result.vectorsDropped > 0 || getEmbeddingGapStats().gapCount > 0)) {
+    const child = join(binDir(), 'embed-pending.js');
+    if (existsSync(child)) {
+      spawn(process.execPath, [child], {
+        detached: true,
+        stdio: 'ignore',
+        windowsHide: true,
+      }).unref();
+      log({ source: 'installer/repair', level: 'info', summary: 'codex re-key: detached embed-pending drain launched' });
+    } else {
+      console.log('run: recall backfill --auto-embed to re-embed the dropped vectors');
+    }
+  }
+  return result;
+}
+
+/** Sessions still holding legacy Codex ids — the confirm prompt's blast radius. */
+function countPendingCodexSessions(): number {
+  try {
+    // The codex gate is still shut here, so open through the attended door.
+    const row = getDb(dbPath(), { allowPendingMigration: true }).get(
+      `SELECT COUNT(DISTINCT session_id) AS c FROM messages WHERE ${LEGACY_CODEX_ID_SQL}`,
+    ) as { c: number } | undefined;
+    return row ? Number(row.c) : 0;
+  } catch {
+    return 0;
+  }
 }
 
 export interface RepairFullOptions { yes?: boolean }

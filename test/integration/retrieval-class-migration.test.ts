@@ -26,6 +26,7 @@ import {
 import { searchMessagesFts, readSessionMessages, getUnembeddedMessages, getEmbeddingGapStats } from '../../src/recall/message-store.js';
 import { listSessions } from '../../src/recall/memory-queries.js';
 import { repairFts, repairVectors, integrityCheck } from '../../src/installer/repair.js';
+import { runCodexRekeyMigration } from '../../src/installer/codex-rekey-migration.js';
 import { mtimeScan } from '../../src/recall/mtime-scan.js';
 import { EMBED_VERSION } from '../../src/recall/embed-config.js';
 
@@ -197,6 +198,17 @@ function allMessagesSorted(dbFile: string): Array<{ message_id: string; session_
   }
 }
 
+/** Stamp the codex-rekey marker WITHOUT re-keying: for cases that only assert
+ *  post-retrieval-migration behaviour of normal commands. */
+function markCodexRekeyComplete(): void {
+  const raw = new Database(dbPath());
+  try {
+    raw.prepare(`INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('codex_message_id_v2', 'complete')`).run();
+  } finally {
+    raw.close();
+  }
+}
+
 function schemaObjects(dbFile: string): unknown[] {
   const raw = new Database(dbFile, { readonly: true, fileMustExist: true });
   try {
@@ -244,6 +256,12 @@ describe.skipIf(platform() === 'win32')('retrieval-class migration (§8.3)', () 
     // Byte-for-byte: every message id/session/text survives exactly.
     _resetDb();
     expect(allMessagesSorted(dbPath())).toEqual(before);
+
+    // The fixture's Codex rows carry LEGACY 8-hex ids, so the (separate)
+    // codex-rekey gate now also fails closed here. This case is about the
+    // retrieval-class migration alone: satisfy that gate without re-ingesting
+    // anything, so the byte-for-byte assertion above still means what it says.
+    markCodexRekeyComplete();
 
     const d = getDb(dbPath());
     // Leaf rows are cold; roots (including the unresolvable ghost) stay hot.
@@ -524,6 +542,35 @@ describe.skipIf(platform() === 'win32')('retrieval-class migration (§8.3)', () 
       gpuDetect: async () => { throw failure; },
     })).rejects.toBe(failure);
     expect(readFileSync(settingsPath, 'utf-8')).toBe(priorSettings);
+  }, 60_000);
+
+  it('completes end to end under the codex gate, which then fails closed until the codex migration runs', async () => {
+    // The fixture's Codex rows carry legacy 8-hex ids, so BOTH gates are shut.
+    const res = await runRetrievalClassMigration();
+    expect(res.performed).toBe(true);
+    expect(retrievalMigrationPending()).toBe(false);
+
+    // Normal opens still refuse — now for the Codex re-key, not the schema.
+    _resetDb();
+    try {
+      getDb(dbPath());
+      throw new Error('expected the codex-rekey gate to fail closed');
+    } catch (e) {
+      expect(e).toBeInstanceOf(MigrationPendingError);
+      expect((e as MigrationPendingError).kind).toBe('codex-rekey');
+    }
+
+    // The attended re-key opens the door; the retrieval work is untouched.
+    _resetDb();
+    const rekey = await runCodexRekeyMigration({ log: () => {} });
+    expect(rekey.performed).toBe(true);
+    _resetDb();
+    const d = getDb(dbPath());
+    const cls = (sid: string) =>
+      (d.get(`SELECT DISTINCT retrieval_class AS c FROM messages WHERE session_id = ?`, [sid]) as { c: string } | undefined)?.c;
+    expect(cls(CODEX_CHILD)).toBe('agent');
+    expect(cls(ROOT_SESSION)).toBe('hot');
+    expect(searchMessagesFts('albatross')).toHaveLength(0);
   }, 60_000);
 
   it('repair --fts and --vectors + T1 rescans do not resurrect cold content', async () => {

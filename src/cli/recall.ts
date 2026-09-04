@@ -174,7 +174,7 @@ const FLAG_BOOLEAN = new Set([
   '--no-catchup', '--auto-embed', '--detach', '--purge-meta', '--dry-run',
   // installer subcommand flags
   '--yes', '--offline', '--json', '--purge', '--integrity',
-  '--fts', '--vectors', '--full', '--rekey-projects', '--force',
+  '--fts', '--vectors', '--full', '--rekey-codex', '--rekey-projects', '--force',
   '--no-claudemd', '--no-backfill', '--auto-backfill',
   '--statusline', '--no-statusline',
   // statusline subcommand flag
@@ -289,6 +289,15 @@ BACKFILL FLAGS (with 'recall backfill')
                    Dedicated mode: not combinable with --auto-embed/--detach
   --dry-run        With --purge-meta: open the database read-only and report
                    what a real run would delete, without a write
+
+REPAIR FLAGS (with 'recall repair')
+  --fts            Rebuild the FTS5 index from the filtered view
+  --vectors        Drop all embeddings; the next sweep re-embeds them
+  --full           Delete every indexed message and reingest from JSONL
+  --rekey-codex    Run the one-time Codex message-id migration (full UUIDs).
+                   Re-ingests the affected sessions, which drops their
+                   vectors, then launches the re-embed drain. Asks first on a
+                   terminal; pass --yes to skip the prompt
 
 WORKFLOW
   1. Search:  recall "your query"
@@ -1211,7 +1220,17 @@ async function runInstallerSubcommand(cmd: string): Promise<void> {
   }
 
   if (cmd === 'repair') {
-    const { repairFts, repairVectors, repairFull } = await import('../installer/repair.js');
+    const { repairFts, repairVectors, repairFull, repairRekeyCodex } = await import('../installer/repair.js');
+    if (hasFlag('--rekey-codex')) {
+      const r = await repairRekeyCodex({ yes: hasFlag('--yes') });
+      if (r === null) exit(1); // declined at the confirm — nothing was changed
+      console.log(
+        r!.performed
+          ? `Codex message ids re-keyed (${r!.reingested}/${r!.sessions} sessions re-ingested).`
+          : 'Codex message ids are already re-keyed — nothing to do.',
+      );
+      exit(0);
+    }
     if (hasFlag('--fts')) { repairFts(); console.log('FTS5 index rebuilt.'); exit(0); }
     if (hasFlag('--vectors')) { repairVectors(); console.log('Vectors cleared — they re-embed on the next sweep.'); exit(0); }
     if (hasFlag('--full')) { await repairFull({ yes: hasFlag('--yes') }); exit(0); }
@@ -1227,7 +1246,7 @@ async function runInstallerSubcommand(cmd: string): Promise<void> {
       }
       exit(r.markerWritten ? 0 : 1);
     }
-    console.error('recall repair: specify --fts, --vectors, --full, or --rekey-projects');
+    console.error('recall repair: specify --fts, --vectors, --full, --rekey-codex, or --rekey-projects');
     exit(1);
   }
 }

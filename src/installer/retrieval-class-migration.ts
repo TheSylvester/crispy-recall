@@ -424,7 +424,11 @@ export async function runRetrievalClassMigration(
   // ensureSchema pass reconciles the remaining generic objects (_stem helper,
   // embed_version ALTER) exactly as any fresh process would.
   _resetDb();
-  const post = getDb(dbPath());
+  // allowPendingMigration: the retrieval marker is durable NOW, but an old DB
+  // also has legacy Codex message ids, so the codex-rekey gate would refuse a
+  // normal open here. The schema is current, so ensureSchema still runs on
+  // this path; only the ROWS wait for the attended re-key (spec §5).
+  const post = getDb(dbPath(), { allowPendingMigration: true });
 
   // 11. Post-commit verification (report-only; snapshot is retained regardless).
   const integ = post.get('PRAGMA integrity_check') as Record<string, unknown> | undefined;
