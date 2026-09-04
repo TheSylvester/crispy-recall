@@ -19,7 +19,12 @@ Shared: `RECALL_E2E_LOG_DIR` (default `~/.recall/logs/e2e`), `RECALL_E2E_HUB_ADD
 `RECALL_E2E_HUB_PORT`, `RECALL_E2E_LAPTOP`, `RECALL_E2E_RECALL`, `RECALL_E2E_SSH_TIMEOUT`,
 `RECALL_E2E_WIN_TIMEOUT`. Per script: `RECALL_INT_WORKTREE` + `RECALL_E2E_BASELINE` (21),
 `RECALL_E2E_REISSUE` (30), `RECALL_E2E_TGZ` (40, 50), `RECALL_E2E_HUB_ONLY_PHRASE` (42, 51),
-`RECALL_E2E_PUSH_TIMEOUT` (43), `RECALL_E2E_SNAPSHOT_DIR` (61, 91), `RECALL_E2E_CONFIRM`
+`RECALL_E2E_PUSH_TIMEOUT` (43), `RECALL_E2E_REPAIR_TIMEOUT` (60, default 3600 s —
+the seat sets it from the measured embed rate times the snapshot's hot-message
+count: ~28 msg/s on this hub's GPU meant ~2.5 h for the 2026-09-04 snapshot; on a
+snapshot root without `run/` the repair's embed phase yields and only the
+re-ingest is timed, R-k73qa4),
+`RECALL_E2E_SNAPSHOT_DIR` (61, 91), `RECALL_E2E_CONFIRM`
 (90, 91), `RECALL_E2E_HOOK_CMD` (91, defaults to the Phase-0 hook literal). `10-parity.sh` uses `RECALL_PARITY_HOME`, `RECALL_PARITY_BASE`,
 `RECALL_MAIN_CHECKOUT`, `RECALL_BASE_WORKTREE`.
 ## Windows without an interactive login
