@@ -45,6 +45,8 @@ export type PreflightReport = {
   claude: { ok: boolean; status: string; paths: Record<string, string>; existingHooks: number; existingInstall: boolean };
   codex: { ok: boolean; status: string; paths: Record<string, string> } | null;
   runtime: { node: string; disk: string; network: string; binaryArch: string; gpu: GpuInfo };
+  /** Present only on a satellite run — the installer persists `host`. */
+  satellite?: { hubUrl: string; host: string; hubVersion: string; wire: number };
   warnings: PreflightIssue[];
   failures: PreflightIssue[];
 };
@@ -60,6 +62,9 @@ export interface PreflightOptions {
   macosProductVersion?: () => Promise<string | null>;
   /** Injectable running Node version (tests), e.g. "v22.16.0". Defaults to `process.version`. */
   nodeVersion?: string;
+  /** Satellite mode (spec §3.1): a lower Node floor, no local runtime checks,
+   *  and the hub probes in place of the HuggingFace/GitHub probes. */
+  satellite?: { hubUrl: string; token: string | null };
 }
 
 // ---------------------------------------------------------------------------
@@ -396,11 +401,15 @@ function checkDisk(): { disk: string; issue?: PreflightIssue } {
 }
 
 /**
- * Node runtime gate. Mirrors package.json `engines` (">=22.16.0 <23 || >=24.0.0")
- * and the README: recall ships prebuilt better-sqlite3 bindings only for Node 22
- * LTS (>=22.16) and Node >=24. Node 23 has no prebuilt binding, and anything below
- * 22.16 predates the ABI the bundled binding targets — both fail fast here with an
- * actionable message instead of a cryptic native-load error mid-install.
+ * Node runtime gate for a HUB install. recall ships prebuilt better-sqlite3
+ * bindings only for Node 22 LTS (>=22.16) and Node >=24. Node 23 has no
+ * prebuilt binding, and anything below 22.16 predates the ABI the bundled
+ * binding targets — both fail fast here with an actionable message instead of
+ * a cryptic native-load error mid-install.
+ *
+ * package.json `engines` is DELIBERATELY wider (">=20.0.0 <23 || >=24.0.0",
+ * S7): a satellite loads no native addon, so its floor is Node 20 and npm must
+ * not refuse the install there. The hub floor lives here, not in `engines`.
  */
 function checkNode(nodeVersion: string = process.version): { node: string; issue?: PreflightIssue } {
   const node = nodeVersion;
@@ -412,12 +421,124 @@ function checkNode(nodeVersion: string = process.version): { node: string; issue
       issue: {
         check: 'runtime.node',
         severity: 'FAIL',
-        message: `Node ${node} is unsupported — recall requires Node 22 LTS (>=22.16) or Node >=24 (package.json engines: ">=22.16.0 <23 || >=24.0.0").${major === 23 ? ' Node 23 has no prebuilt SQLite binding.' : ''}`,
+        message: `Node ${node} is unsupported — a recall hub requires Node 22 LTS (>=22.16) or Node >=24 (package.json engines is the wider satellite floor, ">=20.0.0 <23 || >=24.0.0").${major === 23 ? ' Node 23 has no prebuilt SQLite binding.' : ''}`,
         remediation: 'Install Node 22 LTS (>=22.16) or Node >=24, then re-run `recall install`.',
       },
     };
   }
   return { node };
+}
+
+/**
+ * Node gate for a SATELLITE (S7): floor 20, Node 23 still excluded so one
+ * documented exclusion covers both roles. No native addon is staged here, so
+ * the ABI reasoning that pins the hub to 22.16+ does not apply.
+ */
+function checkSatelliteNode(nodeVersion: string = process.version): { node: string; issue?: PreflightIssue } {
+  const node = nodeVersion;
+  const [major = 0] = node.replace(/^v/, '').split('.').map((n) => parseInt(n, 10) || 0);
+  if (major >= 20 && major !== 23) return { node };
+  return {
+    node,
+    issue: {
+      check: 'runtime.node',
+      severity: 'FAIL',
+      message: `Node ${node} is unsupported — a recall satellite requires Node 20+ (Node 23 excluded).`,
+      remediation: 'Install Node 20 or newer (not Node 23), then re-run `recall install --hub …`.',
+    },
+  };
+}
+
+/**
+ * Hub probes, in place of the HuggingFace/GitHub probes: a satellite downloads
+ * no binary and no model, so its only network dependency is its hub.
+ */
+async function checkHub(
+  report: PreflightReport,
+  sat: { hubUrl: string; token: string | null },
+): Promise<{ network: string }> {
+  const { hubRequest, parseJson } = await import('../satellite/hub-client.js');
+  const { HEADER_VERSION, WIRE_VERSION } = await import('../hub/protocol.js');
+
+  let health;
+  try {
+    health = await hubRequest(sat.hubUrl, { method: 'GET', path: '/v1/health', timeoutMs: 4000 });
+  } catch (e) {
+    report.failures.push({
+      check: 'hub.unreachable',
+      severity: 'FAIL',
+      message: `hub ${sat.hubUrl} unreachable: ${(e as Error).message}`,
+      remediation: 'Check the hub URL and that `recall hub serve` is running and reachable from here.',
+    });
+    return { network: `hub ${sat.hubUrl} unreachable` };
+  }
+  if (health.status !== 200) {
+    report.failures.push({
+      check: 'hub.unreachable',
+      severity: 'FAIL',
+      message: `hub ${sat.hubUrl} replied ${health.status} to /v1/health`,
+      remediation: 'Check the hub URL and that `recall hub serve` is running.',
+    });
+    return { network: `hub ${sat.hubUrl} replied ${health.status}` };
+  }
+  const healthBody = parseJson<{ version?: string; wire?: number }>(health) ?? {};
+
+  if (!sat.token) {
+    report.failures.push({
+      check: 'hub.auth',
+      severity: 'FAIL',
+      message: 'no hub token — pass --token <t>, --token -, or set RECALL_HUB_TOKEN.',
+      remediation: 'Run `recall hub token --host <name>` on the hub and pass the printed token.',
+    });
+    return { network: `hub ${sat.hubUrl} reachable (no token)` };
+  }
+
+  let probe;
+  try {
+    probe = await hubRequest(sat.hubUrl, {
+      method: 'POST',
+      path: '/v1/push/manifest',
+      token: sat.token,
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ vendor: 'claude', full: false, files: [] }),
+      timeoutMs: 4000,
+    });
+  } catch (e) {
+    report.failures.push({
+      check: 'hub.unreachable',
+      severity: 'FAIL',
+      message: `hub ${sat.hubUrl} unreachable: ${(e as Error).message}`,
+      remediation: 'Check the hub URL and that `recall hub serve` is running and reachable from here.',
+    });
+    return { network: `hub ${sat.hubUrl} unreachable` };
+  }
+  if (probe.status !== 200) {
+    // 401 = bad/revoked token; 426 = wire mismatch. Both mean this satellite
+    // cannot talk to this hub, and both name the status so the operator can
+    // tell "rotate the token" from "upgrade one side".
+    report.failures.push({
+      check: 'hub.auth',
+      severity: 'FAIL',
+      message: probe.status === 426
+        ? `hub ${sat.hubUrl} replied 426 — wire version mismatch (this satellite speaks wire ${WIRE_VERSION}).`
+        : `hub ${sat.hubUrl} replied ${probe.status} to an authenticated request.`,
+      remediation: probe.status === 426
+        ? 'Upgrade recall on the satellite or the hub so both speak the same wire version.'
+        : 'Re-issue the token with `recall hub token --host <name>` on the hub.',
+    });
+    return { network: `hub ${sat.hubUrl} auth failed (${probe.status})` };
+  }
+  const manifestBody = parseJson<{ host?: string }>(probe) ?? {};
+  const remoteVersion = typeof probe.headers[HEADER_VERSION] === 'string'
+    ? String(probe.headers[HEADER_VERSION])
+    : (healthBody.version ?? 'unknown');
+  report.satellite = {
+    hubUrl: sat.hubUrl,
+    host: manifestBody.host ?? '',
+    hubVersion: remoteVersion,
+    wire: typeof healthBody.wire === 'number' ? healthBody.wire : 0,
+  };
+  return { network: `hub ${sat.hubUrl} reachable (auth ok)` };
 }
 
 function httpReachable(url: string, timeoutMs: number): Promise<boolean> {
@@ -469,31 +590,46 @@ export async function runPreflight(opts: PreflightOptions = {}): Promise<Preflig
     failures: [],
   };
 
+  const sat = opts.satellite;
+
   checkPlatform(report, opts);
-  await checkMacosFloor(report, opts);
+  // A satellite stages no llama.cpp binary, so the macOS minos floor and the
+  // disk budget for the binary + model do not apply, and GPU detection has
+  // nothing to decide.
+  if (!sat) await checkMacosFloor(report, opts);
   checkClaude(report);
   checkCodex(report);
 
-  const node = checkNode(opts.nodeVersion);
+  const node = sat ? checkSatelliteNode(opts.nodeVersion) : checkNode(opts.nodeVersion);
   report.runtime.node = node.node;
   if (node.issue) (node.issue.severity === 'FAIL' ? report.failures : report.warnings).push(node.issue);
 
-  const disk = checkDisk();
-  report.runtime.disk = disk.disk;
-  if (disk.issue) (disk.issue.severity === 'FAIL' ? report.failures : report.warnings).push(disk.issue);
+  if (!sat) {
+    const disk = checkDisk();
+    report.runtime.disk = disk.disk;
+    if (disk.issue) (disk.issue.severity === 'FAIL' ? report.failures : report.warnings).push(disk.issue);
+  } else {
+    report.runtime.disk = 'n/a (satellite)';
+  }
 
-  const net = await checkNetwork(opts.offline ?? false);
-  report.runtime.network = net.network;
-  if (net.issue) (net.issue.severity === 'FAIL' ? report.failures : report.warnings).push(net.issue);
+  if (sat) {
+    report.runtime.network = (await checkHub(report, sat)).network;
+  } else {
+    const net = await checkNetwork(opts.offline ?? false);
+    report.runtime.network = net.network;
+    if (net.issue) (net.issue.severity === 'FAIL' ? report.failures : report.warnings).push(net.issue);
+  }
 
   report.runtime.binaryArch = `${opts.platform ?? osPlatform()}/${opts.arch ?? osArch()}`;
 
   // GPU detection (report-only — never a FAIL).
-  report.runtime.gpu = await detectGpu({
-    ...(opts.platform ? { platform: opts.platform } : {}),
-    ...(opts.arch ? { arch: opts.arch } : {}),
-    ...(opts.gpuDetect ? { detect: opts.gpuDetect } : {}),
-  });
+  report.runtime.gpu = sat
+    ? { detected: false, vendor: 'none', cudaAvailable: 'none', plannedMode: 'cpu' }
+    : await detectGpu({
+      ...(opts.platform ? { platform: opts.platform } : {}),
+      ...(opts.arch ? { arch: opts.arch } : {}),
+      ...(opts.gpuDetect ? { detect: opts.gpuDetect } : {}),
+    });
 
   // Concurrent-install detection (read-only — install.ts acquires the lock).
   // Liveness is authoritative: a live owner blocks regardless of age.

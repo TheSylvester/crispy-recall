@@ -35,11 +35,17 @@ import {
 } from './preflight.js';
 import type { RetrievalMigrationResult } from './retrieval-class-migration.js';
 import type { CodexRekeyResult } from './codex-rekey-migration.js';
-import { buildManifest, renderManifest } from './manifest.js';
+import { buildManifest, buildSatelliteManifest, renderManifest } from './manifest.js';
 import { runGpuPhase, type GpuPhaseResult, type GpuProbeArgs, type OffloadProbeResult } from './gpu.js';
-import { mergeStopHook, removeStopHook, backupFile, mergeStatusLine, removeStatusLine } from './settings-merge.js';
+import {
+  mergeStopHook, removeStopHook, backupFile, mergeStatusLine, removeStatusLine,
+  ensureCleanupPeriodDays,
+} from './settings-merge.js';
 import { detectStatusline, renderStatuslineSuggestion } from './statusline-suggest.js';
-import { writeStatuslineConfig, clearStatuslineConfig, readConfig } from './config.js';
+import {
+  writeStatuslineConfig, clearStatuslineConfig, readConfig,
+  readSatelliteConfig, writeSatelliteConfig, satelliteTokenPath,
+} from './config.js';
 import { stableNodePath } from './stable-node.js';
 import {
   classifyUpgrade, snapshotDb, handleIntegrity, backfillAlreadyRunning, migrationReportLine,
@@ -49,7 +55,11 @@ import { applyNudge } from './claudemd-nudge.js';
 import { ensureBinary, ensureModel, getBinaryPath, getModelPath } from '../recall/embedder.js';
 import { log } from '../log.js';
 
-const STAGED_BUNDLES = ['recall.js', 'stop-hook.js', 'embed-pending.js', 'statusline.js'];
+const STAGED_BUNDLES = ['recall.js', 'stop-hook.js', 'embed-pending.js', 'statusline.js', 'push-pending.js'];
+
+/** What a SATELLITE stages: no embed-pending (nothing embeds here), and — the
+ *  point of satellite mode — never `better_sqlite3.node`. */
+const SATELLITE_BUNDLES = ['recall.js', 'stop-hook.js', 'push-pending.js', 'statusline.js'];
 
 export interface InstallOptions {
   yes?: boolean;
@@ -69,6 +79,10 @@ export interface InstallOptions {
   /** Injectable GPU hooks (forwarded to the GPU phase) — for tests. */
   gpuDetect?: () => Promise<boolean>;
   gpuProbe?: (args: GpuProbeArgs) => Promise<OffloadProbeResult>;
+  /** Satellite mode (spec §3.1): the hub base URL, e.g. http://100.79.117.97:7877. */
+  hub?: string;
+  /** Bearer token for that hub. `-` reads one line from stdin. Never logged. */
+  token?: string;
 }
 
 /** In-place upgrade migration outcome, surfaced for the report + tests. */
@@ -89,6 +103,8 @@ export interface MigrationInfo {
 }
 
 export interface InstallResult {
+  /** Which install this was. A satellite creates no DB, model or native addon. */
+  mode?: 'hub' | 'satellite';
   aborted?: boolean;
   /** Human-readable reason when `aborted` — remediation for a busy/corrupt DB. */
   abortReason?: string;
@@ -403,6 +419,17 @@ export async function runInstall(opts: InstallOptions = {}): Promise<InstallResu
   };
 
   if (interactive) intro('recall install');
+
+  // ---- Satellite dispatch (spec §3.1) ----
+  // Take the satellite path when --hub was passed OR when this machine is
+  // ALREADY a satellite (the documented upgrade route is `npm install -g
+  // crispy-recall && recall install` with no flags). It RETURNS before
+  // classifyUpgrade(), so nothing below can download a runtime, stage the
+  // native binding, run the GPU phase or open a database.
+  const existingSatellite = readSatelliteConfig();
+  if (opts.hub || existingSatellite) {
+    return runSatelliteInstall(opts, interactive, say, existingSatellite);
+  }
 
   // ---- 0. Pre-flight ----
   const report = await runPreflight({
@@ -905,8 +932,225 @@ export async function runInstall(opts: InstallOptions = {}): Promise<InstallResu
   }
 
   return {
+    mode: 'hub',
     report, selected: [...selected], gpu, filesWritten, migration: migrationInfo,
     ...(backfillPid ? { backfillPid } : {}),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Satellite install (spec §3.1)
+// ---------------------------------------------------------------------------
+
+/** The GPU record a satellite always reports: it embeds nothing locally. */
+const SATELLITE_GPU: GpuPhaseResult = { mode: 'cpu', libDir: null, ngl: 0, cudaAvailable: 'none' };
+
+/**
+ * Resolve the bearer token, in precedence order: `--token <t>`, `--token -`
+ * (one line from stdin), `$RECALL_HUB_TOKEN`, then the token already on disk.
+ * Returns null when there is none.
+ *
+ * The stored token is reused ONLY for the hub it was issued for. A token reads
+ * the WHOLE hub database (D5), so re-pointing a satellite at a different
+ * `--hub` must never present the old host's credential to the new one; without
+ * a fresh token the preflight probe then FAILs `hub.auth`.
+ *
+ * The value is never echoed, never logged and never put in the report — the
+ * 0600 file is the only copy.
+ */
+function resolveHubToken(
+  opts: InstallOptions,
+  existing: { hubUrl: string; token: string | null } | null,
+  hubUrl: string,
+): string | null {
+  if (opts.token === '-') {
+    try {
+      const line = readFileSync(0, 'utf-8').split('\n')[0] ?? '';
+      const trimmed = line.trim();
+      if (trimmed) return trimmed;
+    } catch { /* no stdin → fall through */ }
+  } else if (opts.token) {
+    const trimmed = opts.token.trim();
+    if (trimmed) return trimmed;
+  }
+  const env = process.env['RECALL_HUB_TOKEN'];
+  if (env && env.trim()) return env.trim();
+  if (existing && existing.hubUrl === hubUrl) return existing.token;
+  return null;
+}
+
+/** Write the token 0600, atomically. On win32 the profile dir is the boundary. */
+function writeTokenFile(token: string): string {
+  const dest = satelliteTokenPath();
+  mkdirSync(dirname(dest), { recursive: true });
+  const tmp = `${dest}.staging-${process.pid}`;
+  writeFileSync(tmp, `${token}\n`, { mode: 0o600 });
+  try { chmodSync(tmp, 0o600); } catch { /* win32 has no POSIX mode */ }
+  renameSync(tmp, dest);
+  return dest;
+}
+
+/** Stage the four satellite bundles. NEVER the native binding. */
+function stageSatelliteBundles(distDir: string, written: string[]): void {
+  mkdirSync(binDir(), { recursive: true });
+  sweepStaleStagingFiles();
+  for (const name of SATELLITE_BUNDLES) {
+    const src = join(distDir, name);
+    if (!existsSync(src)) {
+      log({ source: 'installer/install', level: 'warn', summary: `bundle ${name} not found in ${distDir} — skipping stage` });
+      continue;
+    }
+    const dest = join(binDir(), name);
+    stageFileAtomic(src, dest);
+    written.push(dest);
+  }
+}
+
+/** Spawn `push-pending.js --full` detached; the initial mirror fill. */
+function spawnDetachedPush(): number | undefined {
+  mkdirSync(runDir(), { recursive: true });
+  mkdirSync(logsDir(), { recursive: true });
+  const logFd = openSync(join(logsDir(), 'push.log'), 'a');
+  const child = spawn(process.execPath, [join(binDir(), 'push-pending.js'), '--full'], {
+    detached: true,
+    stdio: ['ignore', logFd, logFd],
+    windowsHide: true,
+    env: { ...process.env },
+  });
+  child.unref();
+  return child.pid;
+}
+
+async function runSatelliteInstall(
+  opts: InstallOptions,
+  interactive: boolean,
+  say: (msg: string) => void,
+  existing: { hubUrl: string; host: string; token: string | null } | null,
+): Promise<InstallResult> {
+  // A stored satellite config plus a DIFFERENT --hub re-points the satellite.
+  const hubUrl = (opts.hub ?? existing?.hubUrl ?? '').replace(/\/+$/, '');
+  const token = resolveHubToken(opts, existing, hubUrl);
+
+  const report = await runPreflight({ satellite: { hubUrl, token } });
+  const bail = (): InstallResult => ({
+    mode: 'satellite', aborted: true, report, selected: [], gpu: SATELLITE_GPU, filesWritten: [],
+  });
+
+  if (!preflightPassed(report)) {
+    const msg = report.failures.map((f) => `✖ ${f.check}: ${f.message}${f.remediation ? `\n   → ${f.remediation}` : ''}`).join('\n');
+    if (interactive) note(msg, 'Pre-flight failed'); else log({ source: 'installer/install', level: 'error', summary: `pre-flight failed:\n${msg}` });
+    return bail();
+  }
+  if (report.warnings.length) {
+    const wmsg = report.warnings.map((w) => `• ${w.check}: ${w.message}`).join('\n');
+    if (interactive) {
+      note(wmsg, 'Warnings');
+      const go = await confirm({ message: 'Continue with these warnings?' });
+      if (isCancel(go) || !go) return bail();
+    } else {
+      log({ source: 'installer/install', level: 'warn', summary: `pre-flight warnings:\n${wmsg}` });
+    }
+  }
+
+  // ---- 1. Manifest ----
+  const selected = await renderManifest(buildSatelliteManifest(report), {
+    yes: opts.yes ?? false,
+    interactive,
+    logLine: (m) => log({ source: 'installer/install', level: 'info', summary: m }),
+  });
+  if (opts.noClaudemd) { selected.delete('claudemd'); selected.delete('codex-agentsmd'); }
+
+  const lock = acquireInstallLock();
+  if (!lock.ok) {
+    const msg = `Another install is running (PID ${lock.existingPid}).`;
+    if (interactive) note(msg, 'Aborting'); else log({ source: 'installer/install', level: 'error', summary: msg });
+    return { mode: 'satellite', aborted: true, report, selected: [...selected], gpu: SATELLITE_GPU, filesWritten: [] };
+  }
+  const stopLockHeartbeat = startInstallLockHeartbeat();
+
+  const filesWritten: string[] = [];
+  let pushPid: number | undefined;
+  try {
+    // ---- 2/3. Scaffold: bin, run, logs ONLY. No models/, no DB. ----
+    for (const d of [binDir(), runDir(), logsDir()]) mkdirSync(d, { recursive: true });
+    stageSatelliteBundles(opts.distDir ?? defaultDistDir(), filesWritten);
+    say(`scaffolded ${recallRoot()} (satellite: no database, model or native binding)`);
+
+    // ---- 4. Config + token ----
+    writeSatelliteConfig({
+      hubUrl,
+      host: report.satellite?.host ?? existing?.host ?? '',
+      installedAt: new Date().toISOString(),
+    });
+    filesWritten.push(join(recallRoot(), 'config.json'));
+    if (token) filesWritten.push(writeTokenFile(token));
+    say(`satellite registered with hub ${hubUrl} as host ${report.satellite?.host || 'unknown'}`);
+
+    // ---- 5. Retention: the transcript files ARE the push spool ----
+    const retention = ensureCleanupPeriodDays(claudeSettingsPath(), 999);
+    if (retention.warning) {
+      report.warnings.push({ check: 'claude.retention', severity: 'WARN', message: retention.warning });
+      log({ source: 'installer/install', level: 'warn', summary: retention.warning });
+    } else if (retention.changed) {
+      filesWritten.push(claudeSettingsPath());
+      say('claude retention: cleanupPeriodDays pinned to 999');
+    }
+
+    // ---- 6. Hooks + skill (the command string is unchanged from a hub install) ----
+    const runnable = recallBinCommand();
+    const templatePath = resolveTemplatePath(opts.templatePath);
+    const hookScript = join(binDir(), 'stop-hook.js');
+    if (selected.has('skill')) {
+      if (writeSkill(claudeRecallSkillPath(), templatePath, runnable)) filesWritten.push(claudeRecallSkillPath());
+    }
+    if (selected.has('stop-hook')) {
+      const r = mergeStopHook(claudeSettingsPath(), hookScript);
+      if (r.changed) filesWritten.push(claudeSettingsPath());
+    }
+    if (report.codex && selected.has('codex-hook')) {
+      const r = mergeStopHook(codexHooksPath(), hookScript);
+      if (r.changed) filesWritten.push(codexHooksPath());
+    }
+    if (report.codex && selected.has('codex-skill')) {
+      if (writeSkill(codexRecallSkillPath(), templatePath, runnable)) filesWritten.push(codexRecallSkillPath());
+    }
+    if (selected.has('claudemd')) {
+      const r = applyNudge(claudeMdPath());
+      if (r.changed) filesWritten.push(claudeMdPath());
+    }
+    if (report.codex && selected.has('codex-agentsmd')) {
+      const r = applyNudge(codexAgentsPath());
+      if (r.changed) filesWritten.push(codexAgentsPath());
+    }
+    if (filesWritten.length !== new Set(filesWritten).size) {
+      filesWritten.splice(0, filesWritten.length, ...new Set(filesWritten));
+    }
+    say(`wrote ${filesWritten.length} files`);
+
+    // ---- 7. Initial push (detached) ----
+    pushPid = spawnDetachedPush();
+    say(pushPid ? `initial push running in background (PID ${pushPid})` : 'initial push could not be launched');
+  } finally {
+    stopLockHeartbeat();
+    releaseInstallLock();
+  }
+
+  if (interactive) {
+    outro([
+      `Satellite of ${hubUrl} (host ${report.satellite?.host || 'unknown'})`,
+      'No database, model or native binding on this machine — queries run on the hub.',
+      `Files written/edited: ${filesWritten.length}`,
+      'Commands: recall doctor · recall status · recall push [--full] · recall uninstall',
+    ].join('\n'));
+  }
+
+  return {
+    mode: 'satellite',
+    report,
+    selected: [...selected],
+    gpu: SATELLITE_GPU,
+    filesWritten,
+    ...(pushPid ? { backfillPid: pushPid } : {}),
   };
 }
 
