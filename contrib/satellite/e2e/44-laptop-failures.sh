@@ -15,6 +15,7 @@ VARS=$E2E_LOG_DIR/41.vars
 # shellcheck disable=SC1090
 . "$VARS"
 require_hub_up
+lap 'test -f ~/.recall/satellite-token' || fail "$NAME" "the laptop is not installed in satellite mode — run 40-laptop-install.sh first"
 P='export PATH="$HOME/.local/bin:$PATH"; '
 MDIR=$(mirror_dir "$LAPTOP_HOST" claude)
 HOSTS_JSON=$HOME/.recall/run/hub-hosts.json
@@ -68,17 +69,25 @@ step "push.log $LOG0 → $LOG1 lines while the hub was down"
 step "starting recall-hub"
 systemctl --user start recall-hub || fail "$NAME" "could not start recall-hub"
 wait_until 15 'hub_health | grep -q ok' || fail "$NAME" "the hub did not come back within 15 s"
+# The satellite has NO retry timer: the transcripts on disk are the spool and the
+# CLI flushes INSIDE the query (recall.ts:1417-1418 flushBeforeQuery). So the
+# FIRST query after the restart is the reconnect that drains the queue, and the
+# SECOND is the retrieval. No sleep between the restart and the first query.
+R=$(lap "cd ~/dev/crispy && $P"'recall "HUB-DOWN-'"$N"'"') || fail "$NAME" "the drain-proving query failed"
+printf '%s\n' "$R" | head -8 | sed 's/^/    /'
+wait_until 20 '[ -n "$(hub_sql "SELECT session_id FROM messages WHERE message_text LIKE '"'"'%HUB-DOWN-'"$N"'%'"'"' LIMIT 1")" ]' \
+  || fail "$NAME" "the queued turn never reached the hub database"
 DSID=$(hub_sql "SELECT session_id FROM messages WHERE message_text LIKE '%HUB-DOWN-$N%' LIMIT 1")
 step "session carrying HUB-DOWN-$N on the hub: ${DSID:-<none>}"
 [ -n "$DSID" ] || fail "$NAME" "the queued turn never reached the hub database"
-R=$(lap "cd ~/dev/crispy && $P"'recall "HUB-DOWN-'"$N"'"') || fail "$NAME" "the drain-proving query failed"
-printf '%s\n' "$R" | head -8 | sed 's/^/    /'
+R2=$(lap "cd ~/dev/crispy && $P"'recall "HUB-DOWN-'"$N"'"') || fail "$NAME" "the retrieval query failed"
+printf '%s\n' "$R2" | head -8 | sed 's/^/    /'
 # `recall` echoes the query, so a nonce grep would pass unconditionally: match
 # the session id and the Results: line instead.
-NROWS=$(printf '%s\n' "$R" | rows)
+NROWS=$(printf '%s\n' "$R2" | rows)
 step "unique sessions returned: $NROWS"
-printf '%s\n' "$R" | grep -q "$DSID" || fail "$NAME" "one query after the restart does not return session $DSID"
-[ "$NROWS" -ge 1 ] || fail "$NAME" "the drain-proving query returned no sessions"
+printf '%s\n' "$R2" | grep -q "$DSID" || fail "$NAME" "the query after the restart does not return session $DSID"
+[ "$NROWS" -ge 1 ] || fail "$NAME" "the retrieval query returned no sessions"
 
 # --- §9.3.6b full-sweep recovery -------------------------------------------
 REL=${MFILE#"$MDIR"/}

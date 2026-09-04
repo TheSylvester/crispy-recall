@@ -20,7 +20,11 @@ step "original kept at $SNAP/wsl-backup.orig"
 
 python3 - "$BK" <<'PY' || fail "$NAME" "could not insert .recall/remote into the per-path list"
 import os,sys
-p=sys.argv[1]; lines=open(p).read().split('\n')
+# Resolve first: ~/.local/bin/wsl-backup may be a symlink, and os.replace on the
+# link path would replace the LINK with a regular file.
+p=os.path.realpath(sys.argv[1])
+if p!=sys.argv[1]: print('    resolved %s -> %s' % (sys.argv[1],p))
+lines=open(p).read().split('\n')
 if any('.recall/remote' in l for l in lines):
     print('    .recall/remote already present — no edit needed'); sys.exit(0)
 for i,l in enumerate(lines):

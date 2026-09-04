@@ -115,7 +115,8 @@ rmdir --ignore-fail-on-non-empty "$WIN_MIRROR/projects" "$WIN_MIRROR" "$HOME/.re
 step "probe mirrors removed; $WIN_HOST mirror root present: $([ -e "$HOME/.recall/remote/$WIN_HOST" ] && echo yes || echo no)"
 [ ! -e "$HOME/.recall/remote/$WIN_HOST" ] || fail "$NAME" "a $WIN_HOST mirror directory survived the cleanup"
 # DEVIATION: §9.2.5 — hub status lists a host from run/hub-hosts.json even after its mirror directory is removed (cli.ts:204); asserted mirror-root absence and 'files 0' instead of the absence of the Host block.
-BLOCK=$("$RECALL_BIN" hub status | grep -A1 "^Host $WIN_HOST:" || true)
+ST=$("$RECALL_BIN" hub status) || fail "$NAME" "hub status failed"
+BLOCK=$(printf '%s\n' "$ST" | grep -A1 "^Host $WIN_HOST:" || true)
 if [ -n "$BLOCK" ]; then
   printf '%s\n' "$BLOCK" | sed 's/^/    /'
   printf '%s\n' "$BLOCK" | grep -q 'files 0,' \

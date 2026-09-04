@@ -48,16 +48,21 @@ pass() { # $1 script name
 }
 
 # fail <script name> <reason...> — prints the ONE final line and stops the run.
-# The line always goes to stderr (a caller may have redirected stdout into a
-# command substitution, or into /dev/null inside `wait_until`) AND straight into
-# the script log, so a failure raised from a redirected sub-shell is never lost.
-# The top-level shell is signalled when `fail` runs in a sub-shell.
+# The line goes to stderr, which the script's `exec > >(tee …) 2>&1` captures
+# into both the terminal and the log — a caller may have redirected stdout into
+# a command substitution, so stdout alone is not safe. In a SUB-SHELL the line is
+# ALSO appended straight to the log, because a redirected caller (`wait_until`
+# sends its command to /dev/null) would otherwise swallow it; the top-level shell
+# is signalled so the run stops. `pass` needs none of this: it only ever runs at
+# the top level.
 fail() { # $1 script name, $2.. reason
   local n=$1; shift
   local msg="FAIL $n — $*"
-  printf '%s\n' "$msg" >> "$(log_file "$n")" 2>/dev/null
   printf '%s\n' "$msg" >&2
-  [ "${BASHPID:-$$}" != "$$" ] && kill -TERM $$ 2>/dev/null
+  if [ "${BASHPID:-$$}" != "$$" ]; then
+    printf '%s\n' "$msg" >> "$(log_file "$n")" 2>/dev/null
+    kill -TERM $$ 2>/dev/null
+  fi
   exit 1
 }
 

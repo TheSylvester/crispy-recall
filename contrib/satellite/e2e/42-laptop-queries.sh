@@ -30,7 +30,12 @@ step "hub-authored crispy sessions visible from the laptop without --all: $HITS"
 
 R2=$(lap "cd ~ && $P"'recall "SAT-LAPTOP-'"$NONCE"'" --project ~/dev/crispy') || fail "$NAME" "--project query failed"
 printf '%s\n' "$R2" | grep -q "$SID" || fail "$NAME" "--project ~/dev/crispy does not find the session from ~"
-R3=$(lap "cd ~ && $P"'recall "SAT-LAPTOP-'"$NONCE"'" --project /tmp') || true
+R3=$(lap "cd ~ && $P"'recall "SAT-LAPTOP-'"$NONCE"'" --project /tmp'); RC3=$?
+step "--project /tmp exit code: $RC3"
+# A zero row count only means something when the query actually ran: an empty
+# output would score 0 as well.
+printf '%s\n' "$R3" | grep -q '^Results: ' \
+  || fail "$NAME" "the --project /tmp query produced no Results: line"
 N3=$(printf '%s\n' "$R3" | rows)
 step "--project /tmp unique sessions: $N3"
 [ "$N3" = 0 ] || fail "$NAME" "--project /tmp returned $N3 sessions"
