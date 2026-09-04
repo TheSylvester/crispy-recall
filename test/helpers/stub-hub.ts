@@ -12,7 +12,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { randomBytes, createHash } from 'node:crypto';
 import {
   HEADER_META, HEADER_STALE, HEADER_VERSION, HEADER_WIRE, MAX_APPEND_BYTES,
-  WIRE_VERSION, decodeMeta, validateRelPath, type WireMeta,
+  WIRE_VERSION, decodeMeta, validateRelPath, type AppendMeta,
 } from '../../src/hub/protocol.js';
 
 export interface RecordedRequest {
@@ -26,7 +26,7 @@ export interface RecordedRequest {
   /** Raw body for `PUT /v1/push/append`. */
   bytes?: Buffer;
   /** Decoded `X-Recall-Meta` for `PUT /v1/push/append`. */
-  meta?: WireMeta | Error;
+  meta?: AppendMeta | Error;
   status: number;
 }
 
@@ -43,6 +43,10 @@ export interface StubHubOptions {
   query?: { stdout?: string; stderr?: string; exit?: number; stale?: boolean };
   /** Force a status on `PUT /v1/push/append` (e.g. 426) instead of serving it. */
   appendStatus?: number;
+  /** Hold each manifest reply this long (tests the caller's run budget). */
+  manifestDelayMs?: number;
+  /** Statuses to answer successive manifests with; 200 serves normally. */
+  manifestStatuses?: number[];
 }
 
 export interface StubHub {
@@ -122,6 +126,9 @@ export async function startStubHub(opts: StubHubOptions = {}): Promise<StubHub> 
         vendor?: string; full?: boolean; files?: Array<{ path: string; size: number }>;
       };
       rec.json = body;
+      if (opts.manifestDelayMs) await new Promise((r) => setTimeout(r, opts.manifestDelayMs));
+      const forced = opts.manifestStatuses?.shift();
+      if (forced !== undefined && forced !== 200) { send(forced, { error: 'forced' }); return; }
       const out = (body.files ?? []).map((f) => {
         const stored = files.get(`${body.vendor}/${f.path}`);
         const offset = stored ? stored.byteLength : 0;
@@ -137,8 +144,15 @@ export async function startStubHub(opts: StubHubOptions = {}): Promise<StubHub> 
       const offset = Number(url.searchParams.get('offset'));
       const metaHeader = String(req.headers[HEADER_META] ?? '');
       rec.meta = decodeMeta(metaHeader);
-      const len = Number(req.headers['content-length']);
-      if (!Number.isFinite(len)) { send(411, { error: 'content-length required' }); return; }
+      // §2.3: 411 when Content-Length is absent OR non-numeric. Validate the
+      // RAW header — `Number('')` is 0, so an empty header would pass a
+      // numeric check that the spec says must fail.
+      const rawLen = req.headers['content-length'];
+      if (typeof rawLen !== 'string' || !/^\d+$/.test(rawLen)) {
+        send(411, { error: 'content-length required' });
+        return;
+      }
+      const len = Number(rawLen);
       if (len > MAX_APPEND_BYTES) { send(413, { error: 'body too large' }); return; }
       const bytes = await readBody(req);
       rec.bytes = bytes;

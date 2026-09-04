@@ -68,14 +68,19 @@ export interface BindingHealth {
 
 /** Returns a process exit code (0 = healthy, 1 = problems found). */
 export async function runDoctor(opts: DoctorOptions = {}): Promise<number> {
-  if (opts.integrity) return printIntegrity(opts.json ?? false);
-
-  // A satellite has no database, no staged addon and no embedder, so
-  // checkBindingHealth and the GPU/embedder rows would all report absence as
+  // The satellite branch comes FIRST — above `--integrity`. `integrityCheck()`
+  // opens the database, which on a satellite would dlopen the addon and CREATE
+  // a `recall.db` on a machine that must never have one, and `recall.ts` wires
+  // `integrity` from the flag unconditionally.
+  //
+  // A satellite also has no staged addon and no embedder, so
+  // checkBindingHealth and the GPU/embedder rows would report absence as
   // breakage. Report what actually matters here: the hub link and the local
   // things that decide whether a transcript ever reaches it.
   const sat = readSatelliteConfig();
   if (sat) return runSatelliteDoctor(sat, opts);
+
+  if (opts.integrity) return printIntegrity(opts.json ?? false);
 
   const report = await runPreflight({ ...(opts.offline ? { offline: true } : {}) });
   const embedder = readConfig()?.embedder ?? null;
@@ -113,6 +118,8 @@ export interface SatelliteDoctorReport {
   cleanupPeriodDays: number | null;
   failingFiles: string[];
   shallowClone: boolean;
+  /** Always null: there is no local database to integrity-check. */
+  integrity: null;
   warnings: string[];
   failures: string[];
 }
@@ -192,6 +199,7 @@ async function runSatelliteDoctor(sat: SatelliteConfig, opts: DoctorOptions): Pr
     cleanupPeriodDays: cleanup,
     failingFiles: pushLog.failingFiles,
     shallowClone: shallow,
+    integrity: null,
     warnings,
     failures: report.failures.map((f) => `${f.check}: ${f.message}`),
   };
@@ -209,6 +217,7 @@ async function runSatelliteDoctor(sat: SatelliteConfig, opts: DoctorOptions): Pr
     console.log(`pending bytes:      ${out.pendingBytes === null ? 'unknown' : `${out.pendingBytes} in ${out.pendingFiles} file(s)`}`);
     console.log(`git:                ${out.git}`);
     console.log(`cleanupPeriodDays:  ${out.cleanupPeriodDays ?? 'unset'}`);
+    console.log('integrity:          no local database on a satellite');
     console.log(`Node:               ${report.runtime.node}`);
     if (out.warnings.length) {
       console.log('\nWarnings:');

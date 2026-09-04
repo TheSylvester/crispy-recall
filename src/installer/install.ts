@@ -947,13 +947,22 @@ const SATELLITE_GPU: GpuPhaseResult = { mode: 'cpu', libDir: null, ngl: 0, cudaA
 
 /**
  * Resolve the bearer token, in precedence order: `--token <t>`, `--token -`
- * (one line from stdin), `$RECALL_HUB_TOKEN`, then the token already on disk
- * (the flagless upgrade re-install). Returns null when there is none.
+ * (one line from stdin), `$RECALL_HUB_TOKEN`, then the token already on disk.
+ * Returns null when there is none.
+ *
+ * The stored token is reused ONLY for the hub it was issued for. A token reads
+ * the WHOLE hub database (D5), so re-pointing a satellite at a different
+ * `--hub` must never present the old host's credential to the new one; without
+ * a fresh token the preflight probe then FAILs `hub.auth`.
  *
  * The value is never echoed, never logged and never put in the report — the
  * 0600 file is the only copy.
  */
-function resolveHubToken(opts: InstallOptions, existing: { token: string | null } | null): string | null {
+function resolveHubToken(
+  opts: InstallOptions,
+  existing: { hubUrl: string; token: string | null } | null,
+  hubUrl: string,
+): string | null {
   if (opts.token === '-') {
     try {
       const line = readFileSync(0, 'utf-8').split('\n')[0] ?? '';
@@ -966,7 +975,8 @@ function resolveHubToken(opts: InstallOptions, existing: { token: string | null 
   }
   const env = process.env['RECALL_HUB_TOKEN'];
   if (env && env.trim()) return env.trim();
-  return existing?.token ?? null;
+  if (existing && existing.hubUrl === hubUrl) return existing.token;
+  return null;
 }
 
 /** Write the token 0600, atomically. On win32 the profile dir is the boundary. */
@@ -1019,7 +1029,7 @@ async function runSatelliteInstall(
 ): Promise<InstallResult> {
   // A stored satellite config plus a DIFFERENT --hub re-points the satellite.
   const hubUrl = (opts.hub ?? existing?.hubUrl ?? '').replace(/\/+$/, '');
-  const token = resolveHubToken(opts, existing);
+  const token = resolveHubToken(opts, existing, hubUrl);
 
   const report = await runPreflight({ satellite: { hubUrl, token } });
   const bail = (): InstallResult => ({

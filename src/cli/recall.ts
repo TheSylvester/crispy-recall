@@ -1351,12 +1351,27 @@ async function runStatuslineSubcommand(): Promise<void> {
 // Satellite mode (spec §3.4)
 // ---------------------------------------------------------------------------
 
-/** Run a push in this process (no spawn) — `recall push` and the inline flush. */
+/** `recall push [--full]` — an explicit, user-invoked push. */
 async function runPushInline(full: boolean): Promise<void> {
   const { runPush } = await import('../satellite/push.js');
   // A live holder is polled for 5 s, then we proceed anyway: a query must not
   // be held hostage by a long detached `--full` run (S6).
   await runPush({ full, lockWaitMs: 5000, proceedWithoutLock: true });
+}
+
+/**
+ * The pre-query flush (S6): bounded to ~5 s and NEVER escalated to a full
+ * sweep. The hub asks every satellite for a full manifest at least once per
+ * 24 h; answering that inside an interactive `recall` call would re-enumerate
+ * every transcript on the machine while the user waits. The detached pusher
+ * the Stop hook spawns answers it instead.
+ */
+async function flushBeforeQuery(): Promise<void> {
+  const { runPush } = await import('../satellite/push.js');
+  await runPush({
+    full: false, allowFullSweep: false, budgetMs: 5000,
+    lockWaitMs: 5000, proceedWithoutLock: true,
+  });
 }
 
 /** argv minus `--project <v>` and `--project-key <v>` — the hub is the SOLE
@@ -1381,7 +1396,7 @@ async function forwardQuery(): Promise<number> {
   const forwardArgv = stripScopeFlags(argv);
 
   // Bounded inline flush first, so a query run seconds after a turn sees it.
-  try { await runPushInline(false); } catch { /* push logs its own failures */ }
+  try { await flushBeforeQuery(); } catch { /* push logs its own failures */ }
 
   const { hubRequest, parseJson, HubTransportError } = await import('../satellite/hub-client.js');
   const { HEADER_STALE } = await import('../hub/protocol.js');

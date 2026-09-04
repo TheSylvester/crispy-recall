@@ -204,7 +204,7 @@ export function adaptClaudeEntry(raw: Record<string, unknown>): TranscriptEntry 
     // Tool result linking
     sourceToolAssistantUuid: sourceToolAssistantUUID as string | undefined,
 
-    // Vendor-specific overflow
+    // HubVendor-specific overflow
     ...(Object.keys(mergedMetadata).length > 0 && { metadata: mergedMetadata }),
   };
 }

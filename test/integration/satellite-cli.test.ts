@@ -22,7 +22,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { spawn } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
@@ -201,6 +201,33 @@ describe('satellite CLI', () => {
     expect(lines[0]).toMatch(/replied 401/);
   });
 
+  it('never escalates the pre-query flush to a full sweep, even on fullSweepDue', async () => {
+    // S15: the hub asks for a full manifest at least once per 24 h. Answering
+    // it inside an interactive query would re-enumerate every transcript; the
+    // detached pusher answers it instead (S6, §3.4 "recent set only").
+    await restartHub({ fullSweepDue: true, query: { stdout: 'OK\n', exit: 0 } });
+    const stale = seedTranscript(sandbox);
+    const ts = (Date.now() - 10 * 24 * 3600 * 1000) / 1000;
+    utimesSync(stale, ts, ts);
+    const r = await runCli(['q']);
+    expect(r.code).toBe(0);
+    expect(hub.by('/v1/query')).toHaveLength(1);
+    expect(hub.by('/v1/push/append')).toHaveLength(0);
+    for (const m of hub.by('/v1/push/manifest')) expect((m.json as { full: boolean }).full).toBe(false);
+  });
+
+  it('gives up the flush on its own budget and still forwards the query', async () => {
+    await restartHub({ manifestDelayMs: 10_000, query: { stdout: 'OK\n', exit: 0 } });
+    seedTranscript(sandbox);
+    const started = Date.now();
+    const r = await runCli(['q']);
+    const elapsed = Date.now() - started;
+    expect(r.code).toBe(0);
+    expect(r.stdout).toBe('OK\n');
+    expect(hub.by('/v1/query')).toHaveLength(1);
+    expect(elapsed).toBeLessThan(9000);
+  }, 30_000);
+
   it('prints the satellite help', async () => {
     const r = await runCli(['--help']);
     expect(r.code).toBe(0);
@@ -224,7 +251,7 @@ describe('satellite CLI', () => {
   it('works with no better_sqlite3.node anywhere under the satellite root', async () => {
     seedTranscript(sandbox);
     expect(existsSync(join(recallHome, 'bin', 'better_sqlite3.node'))).toBe(false);
-    for (const args of [['q'], ['push'], ['--help'], ['status']]) {
+    for (const args of [['q'], ['push'], ['--help'], ['status'], ['doctor', '--integrity']]) {
       const r = await runCli(args);
       expect([0, 2], `recall ${args.join(' ')}`).toContain(r.code);
     }

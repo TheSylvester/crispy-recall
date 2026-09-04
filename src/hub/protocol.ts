@@ -72,7 +72,7 @@ export const HEADER_STALE = 'x-recall-stale';
 // ---------------------------------------------------------------------------
 
 /** The `X-Recall-Meta` payload: the satellite's per-file identity evidence. */
-export interface WireMeta {
+export interface AppendMeta {
   /** Session cwd as the satellite saw it (absent when it found none). */
   cwd?: string;
   /** Project key derived on the satellite (absent when there is no cwd). */
@@ -86,7 +86,7 @@ export interface WireMeta {
 }
 
 /** Encode a meta object as base64url of its UTF-8 JSON. ASCII by construction. */
-export function encodeMeta(obj: WireMeta): string {
+export function encodeMeta(obj: AppendMeta): string {
   return Buffer.from(JSON.stringify(obj), 'utf-8').toString('base64url');
 }
 
@@ -96,7 +96,7 @@ export function encodeMeta(obj: WireMeta): string {
  * Returns an Error VALUE rather than throwing — both ends treat a malformed
  * header as a 400/skip, never as a crash.
  */
-export function decodeMeta(header: string): WireMeta | Error {
+export function decodeMeta(header: string): AppendMeta | Error {
   if (typeof header !== 'string' || header.length === 0) return new Error('meta header empty');
   if (header.length > MAX_META_BYTES) return new Error('meta header too large');
   let json: string;
@@ -132,7 +132,7 @@ export function decodeMeta(header: string): WireMeta | Error {
       return new Error('meta.hook.isSubagent must be a boolean');
     }
   }
-  return parsed as WireMeta;
+  return parsed as AppendMeta;
 }
 
 // ---------------------------------------------------------------------------
@@ -169,7 +169,7 @@ export function validateRelPath(
 // Endpoint request/response shapes
 // ---------------------------------------------------------------------------
 
-export type Vendor = 'claude' | 'codex';
+export type HubVendor = 'claude' | 'codex';
 
 /** `GET /v1/health` */
 export interface HealthResponse {
@@ -182,7 +182,7 @@ export interface HealthResponse {
 
 /** `POST /v1/push/manifest` */
 export interface ManifestRequest {
-  vendor: Vendor;
+  vendor: HubVendor;
   full: boolean;
   files: Array<{ path: string; size: number; mtime: number }>;
 }

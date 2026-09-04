@@ -256,6 +256,29 @@ describe('satellite install', () => {
     expect(readConfig()?.satellite).toMatchObject(before);
   });
 
+  it('never presents the stored token to a DIFFERENT hub', async () => {
+    await install();
+    const other = await startStubHub({ host: 'other-hub' });
+    try {
+      const res = await runInstall({ hub: other.url, yes: true, noClaudemd: true, distDir });
+      expect(res.aborted).toBe(true);
+      expect(res.report.failures.some((f) => f.check === 'hub.auth')).toBe(true);
+      expect(other.requests.filter((r) => r.headers['authorization'] !== undefined)).toHaveLength(0);
+    } finally {
+      await other.close();
+    }
+  });
+
+  it('reuses the stored token for the SAME hub', async () => {
+    await install();
+    const res = await runInstall({
+      hub: hub.url, yes: true, noClaudemd: true, distDir,
+      templatePath: join(distDir, 'SKILL.md.template'),
+    });
+    expect(res.aborted).toBeFalsy();
+    expect(res.mode).toBe('satellite');
+  });
+
   it('`--token -` reads one line from stdin (spawned CLI, own RECALL_HOME)', async () => {
     const code = await new Promise<number>((resolve, reject) => {
       const child = spawn(process.execPath, [join(REPO, 'dist', 'recall.js'), 'install', '--hub', hub.url, '--token', '-', '--yes', '--no-claudemd'], {

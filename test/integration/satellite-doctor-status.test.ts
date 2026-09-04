@@ -115,6 +115,14 @@ describe('satellite doctor / status / uninstall', () => {
     expect(existsSync(join(recallHome, 'recall.db'))).toBe(false);
   });
 
+  it('--integrity opens no database: the satellite branch runs first', async () => {
+    seedTranscript(sandbox);
+    const { code, out } = await captured(() => runDoctor({ integrity: true }));
+    expect(code).toBe(0);
+    expect(out).toContain('no local database on a satellite');
+    expect(existsSync(join(recallHome, 'recall.db'))).toBe(false);
+  });
+
   it('JSON mode carries the same fields', async () => {
     seedTranscript(sandbox);
     const { code, out } = await captured(() => runDoctor({ json: true }));

@@ -24,13 +24,13 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { spawn, spawnSync } from 'node:child_process';
 import {
-  existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync,
+  existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync,
 } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { _setTestRoot } from '../../src/paths.js';
-import { decodeMeta, type WireMeta } from '../../src/hub/protocol.js';
+import { decodeMeta, type AppendMeta } from '../../src/hub/protocol.js';
 import { startStubHub, type StubHub, type RecordedRequest } from '../helpers/stub-hub.js';
 
 const REPO = join(__dirname, '..', '..');
@@ -98,7 +98,7 @@ function codexTranscript(cwd: string): { abs: string; rel: string } {
   return { abs, rel: `sessions/2026/09/04/${name}` };
 }
 
-function metaOf(r: RecordedRequest): WireMeta {
+function metaOf(r: RecordedRequest): AppendMeta {
   const m = r.meta;
   if (!m || m instanceof Error) throw new Error(`bad meta: ${String(m)}`);
   return m;
@@ -381,6 +381,76 @@ describe('push-pending', () => {
       if (prev.c === undefined) delete process.env['CLAUDE_CONFIG_DIR']; else process.env['CLAUDE_CONFIG_DIR'] = prev.c;
       if (prev.x === undefined) delete process.env['CODEX_HOME']; else process.env['CODEX_HOME'] = prev.x;
       if (prev.r === undefined) delete process.env['RECALL_REMOTE_ROOT']; else process.env['RECALL_REMOTE_ROOT'] = prev.r;
+    }
+  });
+
+  it('batches manifests at 1000 files and keeps going after a rejected batch', async () => {
+    // Every file is seeded at full size, so nothing needs appending: the point
+    // here is the manifest batching, not the transfer.
+    const dir = join(claudeDir, 'projects', '-many');
+    mkdirSync(dir, { recursive: true });
+    const body = `${JSON.stringify({ type: 'user', cwd: '/tmp/proj', message: { role: 'user', content: 'm' } })}\n`;
+    for (let i = 0; i < 1001; i++) {
+      const id = `${String(i).padStart(4, '0')}-0000-4000-8000-000000000000`;
+      writeFileSync(join(dir, `${id}.jsonl`), body);
+      hub.seed('claude', `projects/-many/${id}.jsonl`, body);
+    }
+    const { code } = await runPushBundle();
+    expect(code).toBe(0);
+    const claudeManifests = hub.by('/v1/push/manifest')
+      .filter((m) => (m.json as { vendor: string }).vendor === 'claude');
+    expect(claudeManifests).toHaveLength(2);
+    for (const m of claudeManifests) {
+      expect((m.json as { files: unknown[] }).files.length).toBeLessThanOrEqual(1000);
+    }
+    expect(claudeManifests.reduce((n, m) => n + (m.json as { files: unknown[] }).files.length, 0)).toBe(1001);
+    expect(appends()).toHaveLength(0);
+  }, 60_000);
+
+  it('a rejected first batch does not abandon the remaining batches', async () => {
+    const other = await startStubHub({ host: 'sat-push', manifestStatuses: [400] });
+    const dir = join(claudeDir, 'projects', '-many2');
+    mkdirSync(dir, { recursive: true });
+    const body = `${JSON.stringify({ type: 'user', cwd: '/tmp/proj', message: { role: 'user', content: 'm' } })}\n`;
+    for (let i = 0; i < 1001; i++) {
+      const id = `${String(i).padStart(4, '0')}-1111-4000-8000-000000000000`;
+      writeFileSync(join(dir, `${id}.jsonl`), body);
+      other.seed('claude', `projects/-many2/${id}.jsonl`, body);
+    }
+    makeSatellite(other.url, other.token);
+    try {
+      const { code } = await runPushBundle();
+      expect(code).toBe(0);
+      const claudeManifests = other.by('/v1/push/manifest')
+        .filter((m) => (m.json as { vendor: string }).vendor === 'claude');
+      expect(claudeManifests).toHaveLength(2);
+      expect(claudeManifests[0]!.status).toBe(400);
+      expect(claudeManifests[1]!.status).toBe(200);
+      expect(pushLog()).toMatch(/manifest replied 400/);
+    } finally {
+      await other.close();
+    }
+  }, 60_000);
+
+  it('the lock heartbeat bumps the mtime and never blanks the pid', async () => {
+    const restore = _setTestRoot(recallHome);
+    const { tryAcquirePushLock, releasePushLock, startLockHeartbeat, pushLockPath } =
+      await import('../../src/satellite/push.js');
+    try {
+      expect(tryAcquirePushLock()).toBe(true);
+      const before = statSync(pushLockPath()).mtimeMs;
+      const stop = startLockHeartbeat(20);
+      try {
+        await new Promise((r) => setTimeout(r, 200));
+        expect(readFileSync(pushLockPath(), 'utf-8')).toBe(String(process.pid));
+        expect(statSync(pushLockPath()).mtimeMs).toBeGreaterThan(before);
+      } finally {
+        stop();
+      }
+      releasePushLock();
+      expect(existsSync(pushLockPath())).toBe(false);
+    } finally {
+      restore();
     }
   });
 

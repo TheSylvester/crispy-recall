@@ -15,7 +15,7 @@
 
 import {
   appendFileSync, closeSync, mkdirSync, openSync, readFileSync, readSync,
-  statSync, unlinkSync, writeFileSync,
+  statSync, unlinkSync, utimesSync, writeFileSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, relative, resolve } from 'node:path';
@@ -25,9 +25,9 @@ import { deriveProjectKey } from '../recall/project-key.js';
 import { readSatelliteConfig } from '../installer/config.js';
 import {
   MAX_APPEND_BYTES, MAX_MANIFEST_FILES, HEADER_META,
-  encodeMeta, type ManifestResponse, type Vendor, type WireMeta,
+  encodeMeta, type ManifestResponse, type HubVendor, type AppendMeta,
 } from '../hub/protocol.js';
-import { hubRequest, parseJson, HubTransportError } from './hub-client.js';
+import { hubRequest, parseJson, HubTransportError, REQUEST_TIMEOUT_MS } from './hub-client.js';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -59,6 +59,10 @@ const PRINTABLE_ASCII = /^[\x20-\x7e]*$/;
 export function pushLockPath(): string { return join(runDir(), 'push.lock'); }
 
 function pidAlive(pid: number): boolean {
+  // A non-finite pid (an empty or garbled lock file) is not a live holder, and
+  // `process.kill(NaN, 0)` THROWS ERR_OUT_OF_RANGE rather than returning —
+  // which would escape this helper and abandon the whole run.
+  if (!Number.isInteger(pid) || pid <= 0) return false;
   try { process.kill(pid, 0); return true; } catch (e) {
     return (e as NodeJS.ErrnoException).code === 'EPERM';
   }
@@ -95,14 +99,23 @@ export function releasePushLock(): void {
   } catch { /* ignore */ }
 }
 
-/** Refresh the lock's mtime so a long run is never seen as stale. Unref'd. */
-function startLockHeartbeat(): () => void {
+/**
+ * Refresh the lock's mtime so a long run is never seen as stale. Unref'd.
+ *
+ * Bumps the mtime rather than rewriting the file: a `writeFileSync` truncates
+ * first, so a racer reading in that window sees an EMPTY file, parses NaN and
+ * takes over a LIVE lock.
+ */
+export function startLockHeartbeat(intervalMs = LOCK_HEARTBEAT_MS): () => void {
   const timer = setInterval(() => {
     try {
       const held = parseInt(readFileSync(pushLockPath(), 'utf8'), 10);
-      if (held === process.pid) writeFileSync(pushLockPath(), String(process.pid));
+      if (held === process.pid) {
+        const now = new Date();
+        utimesSync(pushLockPath(), now, now);
+      }
     } catch { /* ignore */ }
-  }, LOCK_HEARTBEAT_MS);
+  }, intervalMs);
   timer.unref?.();
   return () => clearInterval(timer);
 }
@@ -124,7 +137,7 @@ function pushLog(line: string): void {
 // Enumeration
 // ---------------------------------------------------------------------------
 
-export interface VendorRoot { vendor: Vendor; root: string }
+export interface VendorRoot { vendor: HubVendor; root: string }
 
 /** The two transcript roots, honoring CLAUDE_CONFIG_DIR / CODEX_HOME. */
 export function vendorRoots(): VendorRoot[] {
@@ -209,6 +222,14 @@ export interface PushOptions {
   lockWaitMs?: number;
   /** Push even when the lock could not be taken (inline flush, spec §3.4). */
   proceedWithoutLock?: boolean;
+  /**
+   * Allow a `fullSweepDue` answer to escalate this run to a full sweep
+   * (default true). The pre-query inline flush passes false: S6 bounds it to
+   * ~5 s and §3.4 says "recent set only, never --full", so a hub asking for
+   * its ≤24 h full manifest must not re-enumerate every transcript inside the
+   * user's interactive `recall` call. The detached pusher answers it instead.
+   */
+  allowFullSweep?: boolean;
 }
 
 export interface PushResult {
@@ -236,6 +257,17 @@ interface Ctx {
 const nowIso = () => new Date().toISOString();
 
 function budgetLeft(ctx: Ctx): boolean { return Date.now() < ctx.deadline; }
+
+/**
+ * Per-request timeout, clamped to what is left of the run budget.
+ *
+ * The budget is otherwise only checked BETWEEN requests, so one slow hub reply
+ * could hold a 5 s inline flush for the full 30 s request window while the
+ * user waits on `recall`.
+ */
+function reqTimeout(ctx: Ctx): number {
+  return Math.min(REQUEST_TIMEOUT_MS, Math.max(500, ctx.deadline - Date.now()));
+}
 
 /** Assert every header value is printable ASCII before it leaves the process. */
 export function headersSafe(headers: Record<string, string>): boolean {
@@ -300,7 +332,7 @@ export async function runPush(opts: PushOptions = {}): Promise<PushResult> {
           return result;
         }
       }
-      if (sweepFull || !fullSweepDue) break;
+      if (sweepFull || !fullSweepDue || opts.allowFullSweep === false) break;
       sweepFull = true;
       ctx.deadline = Date.now() + (opts.budgetMs ?? FULL_RUN_BUDGET_MS);
     }
@@ -366,6 +398,7 @@ async function pushVendor(
           full,
           files: batch.map((f) => ({ path: f.rel, size: f.size, mtime: f.mtime })),
         }),
+        timeoutMs: reqTimeout(ctx),
       });
     } catch (e) {
       const reason = (e as HubTransportError).reason ?? (e as Error).message;
@@ -375,14 +408,19 @@ async function pushVendor(
     }
     if (res.status !== 200) {
       pushLog(`${nowIso()} push-failed host=${ctx.host} vendor=${vr.vendor} err=manifest replied ${res.status}`);
-      out.transportFailed = res.status >= 500 || res.status === 401 || res.status === 426;
-      return out;
+      // 401/426/5xx are whole-run conditions: no later batch can succeed.
+      // Anything else is this batch's problem, so the remaining batches — a
+      // different 1000 files — still get their chance.
+      if (res.status >= 500 || res.status === 401 || res.status === 426) {
+        out.transportFailed = true;
+        return out;
+      }
+      continue;
     }
     const body = parseJson<ManifestResponse>(res);
     if (!body || !Array.isArray(body.files)) {
       pushLog(`${nowIso()} push-failed host=${ctx.host} vendor=${vr.vendor} err=manifest body unparseable`);
-      out.transportFailed = true;
-      return out;
+      continue;
     }
     if (body.host && !ctx.host) ctx.host = body.host;
     if (body.fullSweepDue) out.fullSweepDue = true;
@@ -441,7 +479,7 @@ async function pushFile(
       if (read <= 0) break;
       const body = buf.subarray(0, read);
       const final = offset + read >= size;
-      const meta: WireMeta = {
+      const meta: AppendMeta = {
         ...(cwd ? { cwd } : {}),
         ...(cwd && key ? { key } : {}),
         ...(local.named && opts.hook ? { hook: opts.hook } : {}),
@@ -462,7 +500,9 @@ async function pushFile(
         `&path=${encodeURIComponent(local.rel)}&offset=${offset}`;
       let res;
       try {
-        res = await hubRequest(ctx.hubUrl, { method: 'PUT', path, token: ctx.token, headers, body });
+        res = await hubRequest(ctx.hubUrl, {
+          method: 'PUT', path, token: ctx.token, headers, body, timeoutMs: reqTimeout(ctx),
+        });
       } catch (e) {
         ctx.result.failed++;
         const reason = (e as HubTransportError).reason ?? (e as Error).message;
