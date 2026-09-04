@@ -76,7 +76,8 @@ CMD
 # stop_hook_active (:111); hook_event_name is sent for fidelity, not read.
 synthetic_flash() {
   local wcwd=$1 slug=$2 prompt=$3 u pdir hout
-  u=$(uuidgen)
+  u=$(uuidgen) || fail "$NAME" "uuidgen failed"
+  [ -n "$u" ] || fail "$NAME" "uuidgen produced an empty id"
   pdir=/mnt/c/Users/silve/.claude/projects/$slug
   mkdir -p "$pdir" || fail "$NAME" "could not create $pdir"
   python3 - "$pdir/$u.jsonl" "$u" "$wcwd" "$prompt" <<'PY' || fail "$NAME" "could not write the synthetic Windows transcript"
@@ -110,6 +111,8 @@ CMD
   printf '%s\n' "$hout" | sed 's/^/    /'
   rm -f "$WIN_DIR/payload-52d.json"
   step "synthetic Stop-hook invoked for session $u in $wcwd"
+  step "LEFT-CHANGED: synthetic Windows session $u at C:\\Users\\silve\\.claude\\projects\\$slug\\$u.jsonl"
+  printf '%s\n' "$pdir/$u.jsonl" >> "$E2E_LOG_DIR/win-synthetic.paths"
 }
 
 BEFORE=$(count_conhost 52c-before | tr -dc '0-9')
@@ -141,5 +144,7 @@ else
   step "the count changed; a lingering console may exist — record it in the results file (not a gate)"
 fi
 SUFFIX=''
-[ "$SYNTHETIC_USED" = 1 ] && SUFFIX=' (synthetic hook: Windows Claude auth unavailable)'
+if [ "$SYNTHETIC_USED" = 1 ]; then
+  SUFFIX=' (synthetic hook: Windows Claude auth unavailable)'
+fi
 pass "$NAME$SUFFIX"

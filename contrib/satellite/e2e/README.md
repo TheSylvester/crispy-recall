@@ -28,9 +28,12 @@ check) lets 51 and 52 continue when Windows Claude Code cannot authenticate: the
 script writes a two-entry transcript where Claude Code would have written one and
 pipes the Stop payload into the STAGED `C:\Users\silve\.recall\bin\stop-hook.js`.
 That proves the staged hook, the push, the mirror layout, the path and git key
-derivation and the vectorisation on Windows. It does NOT prove that Claude Code
-itself fires the hook on Windows, and 52's console-flash observation becomes
-"not observable in synthetic mode". The final line then reads
+derivation and the vectorisation on Windows. It leaves a real transcript in the
+owner's Windows project directory: each one is printed as `LEFT-CHANGED:`,
+listed in `$RECALL_E2E_LOG_DIR/win-synthetic.paths`, and removed file by file by
+`90-teardown.sh`. It does NOT prove that Claude Code itself fires the hook on
+Windows, and 52's console-flash observation becomes "not observable in synthetic
+mode". The final line then reads
 `PASS <script> (synthetic hook: Windows Claude auth unavailable)`.
 
 ## Tokens

@@ -132,20 +132,31 @@ hub_sql_file() { # $1 SQL file
   sqlite3 -readonly "$HOME/.recall/recall.db" < "$1"
 }
 
-# path_list <NUL-delimited input> <line-delimited output> — validates and
-# converts. A path holding a newline or a quote would desynchronise the line
-# readers AND the SQL IN-list at once, so anything outside [A-Za-z0-9._/-] is a
-# hard error. Prints the count.
-path_list() {
-  python3 - "$1" "$2" <<'PY'
-import re,sys
-data=open(sys.argv[1],'rb').read()
-paths=[p.decode('utf-8','surrogateescape') for p in data.split(b'\0') if p]
-bad=[p for p in paths if not re.fullmatch(r'[A-Za-z0-9._/-]+', p)]
-if bad:
-    print('unsafe path: %r' % bad[0], file=sys.stderr)
-    sys.exit(1)
-open(sys.argv[2],'w').write(''.join(p+'\n' for p in paths))
+# scan_list <NUL-delimited "<size>|<path>" records> <paths out> <path|size out>
+# One atomic `find … -printf '%s|%p\0'` pass gives identity AND size together, so
+# no file can change between the two reads. Writes the sorted path list and the
+# path|size map, and prints the count.
+#
+# Validator limit, not a hub rule: the hub accepts any non-control, non-`?`
+# character in a rel segment (protocol.ts:227-236). Only what would desynchronise
+# a line reader is rejected here — a newline, a carriage return or leading and
+# trailing whitespace. in_list's quote doubling makes every other character safe
+# in SQL, and `path|size` is split at the LAST `|`, so a path may hold one.
+scan_list() {
+  python3 - "$1" "$2" "$3" <<'PY'
+import sys
+recs=[r for r in open(sys.argv[1],'rb').read().split(b'\0') if r]
+paths=[]
+for r in recs:
+    size,_,path = r.decode('utf-8','surrogateescape').partition('|')
+    if any(c in path for c in ('\n','\r')) or path != path.strip():
+        print('unsafe path (validator limit — a newline, CR or edge whitespace '
+              'breaks the line readers): %r' % path, file=sys.stderr)
+        sys.exit(1)
+    paths.append((path,int(size)))
+paths.sort()
+open(sys.argv[2],'w').write(''.join(p+'\n' for p,_ in paths))
+open(sys.argv[3],'w').write(''.join('%s|%d\n' % (p,s) for p,s in paths))
 print(len(paths))
 PY
 }

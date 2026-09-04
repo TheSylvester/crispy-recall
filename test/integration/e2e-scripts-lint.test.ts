@@ -36,7 +36,7 @@ const STATE_CHANGING = ['33-hub-hardening.sh', '44-laptop-failures.sh', '50-win-
 const HELPERS = [
   'pass', 'fail', 'step', 'load_tokens', 'nonce', 'hub_sql', 'lap', 'lap_put', 'lap_stdin',
   'win_cmd', 'wait_until', 'hub_health', 'require_hub_up', 'mirror_dir', 'log_file', 'write_token_file',
-  'rows', 'hub_sql_file', 'path_list', 'in_list',
+  'rows', 'hub_sql_file', 'scan_list', 'in_list',
 ];
 
 const text = (f: string) => readFileSync(join(DIR, f), 'utf8');

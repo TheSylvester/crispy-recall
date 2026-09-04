@@ -56,11 +56,11 @@ step "run 1: push.log +$GAIN1 lines; laptop $LOCAL0 → $LOCAL1 transcripts; hub
 [ "$MIRROR1" -ge "$LOCAL0" ] || fail "$NAME" "the hub mirrors $MIRROR1 files, fewer than the $LOCAL0 the laptop held before run 1"
 step "mirror $MIRROR1 vs laptop now $LOCAL1 (information only — the mirror is never pruned)"
 
-find "$MROOT" -name '*.jsonl' ! -name '*.superseded-*' -print0 2>/dev/null | sort -z > "$WORK/set1.z"
-COUNT1=$(path_list "$WORK/set1.z" "$WORK/set1") || fail "$NAME" "a mirror path is unsafe for line and SQL use"
+# Identity AND size in ONE find pass: a second `stat` pass would fork per file
+# and widen the window in which the satellite can append to a frozen file.
+find "$MROOT" -name '*.jsonl' ! -name '*.superseded-*' -printf '%s|%p\0' 2>/dev/null > "$WORK/scan1.z"
+COUNT1=$(scan_list "$WORK/scan1.z" "$WORK/set1" "$WORK/sizes1") || fail "$NAME" "a mirror path cannot be handled by this script"
 [ "${COUNT1:-0}" -ge 1 ] || fail "$NAME" "run 1 mirrored no files under $MROOT"
-# Frozen SIZES: `pushed … from=<n>` is an offset against the hub's on-disk size.
-while IFS= read -r f; do printf '%s|%s\n' "$f" "$(stat -c %s "$f")"; done < "$WORK/set1" > "$WORK/sizes1"
 step "frozen set: $COUNT1 mirror files with their run-1 sizes"
 
 IN=$(in_list "$WORK/set1")
@@ -118,7 +118,7 @@ for l in open(sys.argv[2]):
     p,_,s=l.rstrip("\n").rpartition("|")
     if p: sizes[p]=int(s)
 root=sys.argv[3]
-bad=[]; new=[]; other=[]; unchanged=0; appended=[]
+bad=[]; new=[]; other=[]; unchanged=0; appended=[]; seen=[]; ahead=0
 for l in lines:
     v=re.search(r' vendor=(\S+)', l)
     p=re.search(r' path=(.+?)(?: (?:offset==size|from=|err=)|$)', l)
@@ -128,15 +128,21 @@ for l in lines:
     if mp not in sizes:
         new.append(l); continue
     if "offset==size" in l:
-        unchanged += 1; continue
+        unchanged += 1; seen.append(mp); continue
     m=re.search(r' from=(\d+) to=(\d+)', l)
-    # A strict append: run 2 re-sent no byte the hub already held at run 1.
-    if m and int(m.group(1)) == sizes[mp]:
-        appended.append(mp); continue
+    # A strict append: run 2 re-sent no byte the hub already held. `>=`, not
+    # `==`: a live Stop-hook push between the freeze and run 2 legitimately
+    # advances the hub's on-disk size, and the manifest offset is that size
+    # (server.ts:256-258). Only a SMALLER offset would re-send mirrored bytes.
+    if m and int(m.group(1)) >= sizes[mp]:
+        if int(m.group(1)) > sizes[mp]: ahead += 1
+        appended.append(mp); seen.append(mp); continue
     bad.append(l)
 print("UNCHANGED %d" % unchanged)
 print("APPENDED %d" % len(appended))
+print("AHEAD %d" % ahead)
 for p in sorted(set(appended)): print("APPENDEDPATH %s" % p)
+for p in sorted(set(seen)): print("SEENPATH %s" % p)
 print("NEWFILES %d" % len(new))
 for l in new[:5]: print("NEWLINE %s" % l)
 print("OTHER %d" % len(other))
@@ -150,12 +156,47 @@ UNCHANGED=$(awk '/^UNCHANGED /{print $2}' "$WORK/verdict")
 APPENDED=$(awk '/^APPENDED /{print $2}' "$WORK/verdict")
 NEWFILES=$(awk '/^NEWFILES /{print $2}' "$WORK/verdict")
 OTHERFAILED=$(awk '/^OTHERFAILED /{print $2}' "$WORK/verdict")
+AHEAD=$(awk '/^AHEAD /{print $2}' "$WORK/verdict")
 BAD=$(awk '/^BAD /{print $2}' "$WORK/verdict")
-step "run 2 over the frozen set: $UNCHANGED unchanged, $APPENDED strict appends, $BAD re-sending mirrored bytes; $NEWFILES line(s) for new transcripts; $OTHERFAILED path-less push-failed line(s)"
+step "run 2 over the frozen set: $UNCHANGED unchanged, $APPENDED strict appends ($AHEAD of them from an offset the live hook had already advanced), $BAD re-sending mirrored bytes; $NEWFILES line(s) for new transcripts; $OTHERFAILED path-less push-failed line(s)"
 [ "$BAD" = 0 ] || fail "$NAME" "$BAD run-2 line(s) re-sent bytes the hub already held; every frozen-set line must be 'offset==size' or a strict append"
 [ "$OTHERFAILED" = 0 ] || fail "$NAME" "run 2 logged $OTHERFAILED path-less push-failed line(s) (transport or manifest failure)"
 [ $((UNCHANGED+APPENDED)) -ge 1 ] || fail "$NAME" "run 2 accounted for no frozen-set file"
-awk '/^APPENDEDPATH /{print substr($0, 14)}' "$WORK/verdict" | sort -u > "$WORK/appended"
+awk '/^APPENDEDPATH /{print substr($0, 14)}' "$WORK/verdict" | sort -u > "$WORK/appended-log"
+awk '/^SEENPATH /{print substr($0, 10)}' "$WORK/verdict" | sort -u > "$WORK/seen"
+
+# A frozen file can also GROW out of band: the laptop's Stop hook may deliver its
+# tail between the freeze and run 2, in which case run 2 finds nothing to send
+# and logs `offset==size` — yet its watermark and rows have moved. Identity is
+# not enough; re-scan the sizes and let the disk decide what was appended to.
+find "$MROOT" -name '*.jsonl' ! -name '*.superseded-*' -printf '%s|%p\0' 2>/dev/null > "$WORK/scan2.z"
+scan_list "$WORK/scan2.z" "$WORK/set2" "$WORK/sizes2" > /dev/null || fail "$NAME" "a mirror path cannot be handled by this script"
+python3 - "$WORK/sizes1" "$WORK/sizes2" "$WORK/grown" <<'PY' || fail "$NAME" "a frozen mirror file shrank between the two runs"
+import sys
+def load(f):
+    d={}
+    for l in open(f):
+        p,_,s=l.rstrip("\n").rpartition("|")
+        if p: d[p]=int(s)
+    return d
+a=load(sys.argv[1]); b=load(sys.argv[2])
+grown=[p for p,s in a.items() if p in b and b[p] > s]
+shrank=[p for p,s in a.items() if p in b and b[p] < s]
+open(sys.argv[3],'w').write(''.join(p+'\n' for p in sorted(grown)))
+for p in shrank[:5]: print("    %s shrank %d -> %d" % (p,a[p],b[p]))
+print("    frozen files that grew on disk during the run: %d" % len(grown))
+sys.exit(1 if shrank else 0)
+PY
+sort -u "$WORK/appended-log" "$WORK/grown" > "$WORK/appended"
+step "APPENDED set: $(wc -l < "$WORK/appended-log") from the log, $(wc -l < "$WORK/grown") from the disk, $(wc -l < "$WORK/appended") in union"
+# A file that grew but which run 2 logged as neither an append nor an
+# `offset==size` is the genuine idempotency violation: run 2 never accounted
+# for it at all.
+comm -23 "$WORK/grown" "$WORK/seen" > "$WORK/unaccounted"
+if [ -s "$WORK/unaccounted" ]; then
+  head -5 "$WORK/unaccounted" | sed 's/^/    /'
+  fail "$NAME" "$(wc -l < "$WORK/unaccounted") frozen mirror file(s) grew during the run and run 2 logged no line for them"
+fi
 
 hub_sql_file "$WORK/wm.sql" > "$WORK/wmset2" || fail "$NAME" "the watermark query failed after run 2"
 [ -s "$WORK/wmset2" ] || fail "$NAME" "the watermark query returned nothing after run 2"

@@ -11,7 +11,8 @@ PLAN="  hub:     systemctl --user disable --now recall-hub; rm the unit file; da
   laptop:  recall uninstall --yes; npm uninstall -g --prefix ~/.local crispy-recall;
            restore ~/.claude/settings.json from settings.json.pre-e2e;
            rm -rf ~/.claude/projects/-tmp-recall-torn
-  windows: recall uninstall --purge --yes; npm uninstall -g crispy-recall; rm the recall-e2e Temp dir
+  windows: recall uninstall --purge --yes; npm uninstall -g crispy-recall; rm the recall-e2e Temp dir;
+           rm -f each synthetic transcript listed in $E2E_LOG_DIR/win-synthetic.paths
   local:   rm -f $TOKEN_FILE"
 if [ "${RECALL_E2E_CONFIRM:-}" != teardown ]; then
   printf 'teardown plan (set RECALL_E2E_CONFIRM=teardown to run it):\n%s\n' "$PLAN"
@@ -45,12 +46,31 @@ CMD
 rm -rf "$WIN_DIR"
 step "windows: removed $WIN_DIR"
 
+# Synthetic mode (51/52) writes real .jsonl files into the owner's REAL Windows
+# Claude Code project directories. Remove exactly those files, by path, and
+# never the project directory itself.
+SYNTH_PATHS=$E2E_LOG_DIR/win-synthetic.paths
+if [ -f "$SYNTH_PATHS" ]; then
+  N=0
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    case "$f" in
+      /mnt/c/Users/silve/.claude/projects/*/*.jsonl) rm -f "$f"; step "removed synthetic transcript $f"; N=$((N+1));;
+      *) step "SKIPPING an unexpected synthetic path: $f";;
+    esac
+  done < "$SYNTH_PATHS"
+  rm -f "$SYNTH_PATHS"
+  step "windows: removed $N synthetic transcript(s); the project directories are untouched"
+else
+  step "windows: no synthetic transcripts were recorded"
+fi
+
 step "local: removing the token file"
 if [ -f "$TOKEN_FILE" ]; then
   shred -u "$TOKEN_FILE" 2>/dev/null || rm -f "$TOKEN_FILE"
 fi
 step "token file present: $([ -f "$TOKEN_FILE" ] && echo yes || echo no)"
 [ ! -f "$HOME/.config/systemd/user/recall-hub.service" ] || fail "$NAME" "the recall-hub unit file survived the teardown"
-step "REMOVED: the systemd unit, both hub tokens, the laptop and Windows installs, the token file"
+step "REMOVED: the systemd unit, both hub tokens, the laptop and Windows installs, the token file, every synthetic Windows transcript"
 step "KEPT (by design): every mirror under ~/.recall/remote and every row ingested from it"
 pass "$NAME"

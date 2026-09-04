@@ -49,7 +49,8 @@ vector_gate() { # $1 session id
 # hook_event_name is sent for fidelity and is not read.
 synthetic_turn() {
   local tag=$1 wcwd=$2 slug=$3 prompt=$4 u pdir
-  u=$(uuidgen)
+  u=$(uuidgen) || fail "$NAME" "uuidgen failed"
+  [ -n "$u" ] || fail "$NAME" "uuidgen produced an empty id"
   pdir=/mnt/c/Users/silve/.claude/projects/$slug
   mkdir -p "$pdir" || fail "$NAME" "could not create $pdir"
   python3 - "$pdir/$u.jsonl" "$u" "$wcwd" "$prompt" <<'PY' || fail "$NAME" "could not write the synthetic Windows transcript"
@@ -84,6 +85,8 @@ CMD
   printf '%s\n' "$hout" | sed 's/^/    /'
   rm -f "$WIN_DIR/payload-$tag.json"
   step "synthetic Stop-hook invoked for session $u in $wcwd"
+  step "LEFT-CHANGED: synthetic Windows session $u at C:\\Users\\silve\\.claude\\projects\\$slug\\$u.jsonl"
+  printf '%s\n' "$pdir/$u.jsonl" >> "$E2E_LOG_DIR/win-synthetic.paths"
 }
 
 # win_claude_turn <tag> <windows cwd> <project slug> <prompt text>
@@ -154,9 +157,11 @@ HOSTROW=$("$RECALL_BIN" doctor 2>&1 | grep "^Host $WIN_HOST:")
 step "doctor → ${HOSTROW:-<no host row>}"
 printf '%s' "$HOSTROW" | grep -q 'daemon alive yes' || fail "$NAME" "doctor prints no live host row for $WIN_HOST"
 
-printf 'WIN_NONCE=%s\nWIN_SID_PATH=%s\nWIN_SID_GIT=%s\nWIN_SYNTHETIC=%s\n' \
-  "$N" "$SIDA" "$SIDB" "$SYNTHETIC_USED" > "$E2E_LOG_DIR/51.vars"
+printf 'WIN_NONCE=%s\nWIN_SID_PATH=%s\nWIN_SID_GIT=%s\nWIN_SYNTHETIC=%s\nWIN_SYNTHETIC_PATHS=%s\n' \
+  "$N" "$SIDA" "$SIDB" "$SYNTHETIC_USED" "$E2E_LOG_DIR/win-synthetic.paths" > "$E2E_LOG_DIR/51.vars"
 step "wrote $E2E_LOG_DIR/51.vars (WIN_NONCE=$N, WIN_SYNTHETIC=$SYNTHETIC_USED)"
 SUFFIX=''
-[ "$SYNTHETIC_USED" = 1 ] && SUFFIX=' (synthetic hook: Windows Claude auth unavailable)'
+if [ "$SYNTHETIC_USED" = 1 ]; then
+  SUFFIX=' (synthetic hook: Windows Claude auth unavailable)'
+fi
 pass "$NAME$SUFFIX"

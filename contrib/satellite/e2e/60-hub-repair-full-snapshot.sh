@@ -13,11 +13,14 @@
 # never failed on.
 #
 # `repair --full` reads the LIVE mirror through RECALL_REMOTE_ROOT, so it
-# re-ingests every file that arrived while it ran. Only the frozen set can carry
-# a gate: the histogram compares the same laptop-mirror paths before and after,
-# and the watermark gate asserts PRESENCE — exactly one row per frozen path,
-# which is the spec's real claim that repair --full re-ingests every mirrored
-# file. It never asserts last_size.
+# re-ingests every file that arrived while it ran, at whatever size it then has.
+# A per-key ROW COUNT therefore cannot be equal on a live satellite — an appended
+# frozen file re-ingests larger, and bytes mirrored but not yet ingested when the
+# VACUUM INTO ran add rows too. The gate is what §9.5.2 actually claims: repair
+# re-ingests the frozen files and does NOT RE-KEY them. So the SET of
+# project_keys must be identical before and after (none lost, none added), every
+# key's count must be non-decreasing, and no key may be a mirror-path key. The
+# watermark gate asserts PRESENCE — one row per frozen path — never last_size.
 source "$(dirname "$0")/lib.sh"
 set -u
 NAME=60-hub-repair-full-snapshot
@@ -50,8 +53,8 @@ ln -s "$HOME/.recall/models" "$S/models"
 cp "$HOME/.recall/config.json" "$S/"
 # Frozen the instant the snapshot is taken: a push landing mid-run adds mirror
 # files the snapshot's watermark table cannot be asked about.
-find "$HOME/.recall/remote" -name '*.jsonl' ! -name '*.superseded-*' -print0 | sort -z > "$WORK/pre.z"
-FILES_PRE=$(path_list "$WORK/pre.z" "$WORK/pre") || fail "$NAME" "a mirror path is unsafe for line and SQL use"
+find "$HOME/.recall/remote" -name '*.jsonl' ! -name '*.superseded-*' -printf '%s|%p\0' > "$WORK/pre.z"
+FILES_PRE=$(scan_list "$WORK/pre.z" "$WORK/pre" "$WORK/pre-sizes") || fail "$NAME" "a mirror path cannot be handled by this script"
 [ "${FILES_PRE:-0}" -ge 1 ] || fail "$NAME" "the mirror holds no transcripts — run 41/43/51 first"
 grep "/remote/$LAPTOP_HOST/" "$WORK/pre" > "$WORK/pre-laptop" || true
 LAP_PRE=$(wc -l < "$WORK/pre-laptop")
@@ -79,10 +82,34 @@ timeout 3600 env RECALL_HOME="$S" RECALL_REMOTE_ROOT="$HOME/.recall/remote" \
   || fail "$NAME" "repair --full exited nonzero or timed out (see $E2E_LOG_DIR/60-repair.log)"
 tail -15 "$E2E_LOG_DIR/60-repair.log" | sed 's/^/    /'
 
-A=$(snap_sql "$WORK/hist.sql") || fail "$NAME" "the histogram query failed after the repair"
-printf '%s\n' "$A" | sed 's/^/    after:  /'
-[ "$A" = "$B" ] || fail "$NAME" "the laptop-mirror project_key histogram changed across repair --full"
-printf '%s\n' "$A" | grep -qE '^path:/home/sylvester|^path:c:/' \
+snap_sql "$WORK/hist.sql" > "$WORK/hist2" || fail "$NAME" "the histogram query failed after the repair"
+sed 's/^/    after:  /' "$WORK/hist2"
+printf '%s\n' "$B" > "$WORK/hist1"
+python3 - "$WORK/hist1" "$WORK/hist2" <<'PY' || fail "$NAME" "the laptop-mirror project_key histogram did not hold across repair --full"
+import sys
+def load(f):
+    d={}
+    for l in open(f):
+        l=l.rstrip("\n")
+        if not l: continue
+        k,_,c=l.rpartition("|")
+        d[k or '<NULL project_key>']=int(c)  # a NULL key prints as an empty field
+    return d
+a=load(sys.argv[1]); b=load(sys.argv[2])
+bad=[]
+for k in sorted(set(a) | set(b)):
+    before, after = a.get(k), b.get(k)
+    if before is None: bad.append("key %s APPEARED (%d rows)" % (k, after))
+    elif after is None: bad.append("key %s DISAPPEARED (%d rows)" % (k, before))
+    else:
+        print("    delta %s: %d -> %d (%+d)" % (k, before, after, after - before))
+        if after < before: bad.append("key %s lost rows: %d -> %d" % (k, before, after))
+for l in bad[:10]: print("    %s" % l)
+print("    %d key(s) before, %d after, %d violation(s)" % (len(a), len(b), len(bad)))
+sys.exit(1 if bad else 0)
+PY
+step "the project_key SET is unchanged and no key lost rows (counts may grow: repair re-ingests the live mirror)"
+grep -qE '^path:/home/sylvester|^path:c:/' "$WORK/hist2" \
   && fail "$NAME" "a laptop-mirror row was re-keyed from the mirror path"
 step "no laptop-mirror row carries a path: key (the Windows host's path:c:/ rows are by design and are not in this query)"
 
