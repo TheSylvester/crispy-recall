@@ -7,7 +7,7 @@
  * Key principles:
  * - Claude's field names and structures are canonical
  * - Tool inputs/outputs match the official Agent SDK types
- * - HubVendor-specific extensions go in `metadata` bags
+ * - Vendor-specific extensions go in `metadata` bags
  *
  * @see https://platform.claude.com/docs/en/agent-sdk/typescript
  * @module transcript
@@ -76,14 +76,14 @@ import type {
 } from '@anthropic-ai/claude-agent-sdk/sdk-tools.js';
 
 // ============================================================================
-// HubVendor
+// Vendor
 // ============================================================================
 
 /** Native vendors with compile-time exhaustive checks. */
 export type NativeVendor = 'claude' | 'codex' | 'gemini' | 'opencode';
 
-/** HubVendor identifier. Native vendors are literals; dynamic providers are arbitrary slugs. */
-export type HubVendor = NativeVendor | (string & {});
+/** Vendor identifier. Native vendors are literals; dynamic providers are arbitrary slugs. */
+export type Vendor = NativeVendor | (string & {});
 
 /** Runtime set of native vendor slugs. */
 export const NATIVE_VENDORS = new Set<string>(['claude', 'codex', 'gemini', 'opencode']);
@@ -121,8 +121,8 @@ export interface TranscriptEntry {
   sessionId?: string;
   timestamp?: string;
 
-  // HubVendor
-  vendor?: HubVendor;
+  // Vendor
+  vendor?: Vendor;
 
   // Message content
   message?: TranscriptMessage;
@@ -150,7 +150,7 @@ export interface TranscriptEntry {
   // Tool result linking (Claude-specific, others use parentUuid traversal)
   sourceToolAssistantUuid?: string;
 
-  // HubVendor-specific extensions
+  // Vendor-specific extensions
   metadata?: Record<string, unknown>;
 }
 
@@ -466,7 +466,7 @@ export const CLAUDE_TOOL_CATEGORIES: Record<string, ToolCategory> = {
  */
 export function resolveToolCategory(
   toolName: string,
-  vendor: HubVendor = 'claude'
+  vendor: Vendor = 'claude'
 ): ToolCategory {
   // MCP tools are prefixed with 'mcp__'
   if (toolName.startsWith('mcp__')) {
@@ -520,7 +520,7 @@ export interface ContextUsage {
 // ============================================================================
 
 export interface TranscriptAdapter {
-  readonly vendor: HubVendor;
+  readonly vendor: Vendor;
   loadEntries(sessionPath: string): Promise<TranscriptEntry[]>;
 }
 

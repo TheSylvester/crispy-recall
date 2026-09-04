@@ -432,6 +432,22 @@ describe('push-pending', () => {
     }
   }, 60_000);
 
+  it('treats an unparseable 200 manifest body as a transport failure', async () => {
+    const other = await startStubHub({ host: 'sat-push', manifestGarbage: 'not json at all' });
+    claudeTranscript('-garbage', '/tmp/proj');
+    makeSatellite(other.url, other.token);
+    try {
+      const { code } = await runPushBundle();
+      expect(code).toBe(0);
+      expect(other.by('/v1/push/append')).toHaveLength(0);
+      expect(pushLog()).toMatch(/push-failed .*manifest body unparseable/);
+      // Fatal, so the run stops instead of moving on to the next vendor.
+      expect(other.by('/v1/push/manifest')).toHaveLength(1);
+    } finally {
+      await other.close();
+    }
+  });
+
   it('the lock heartbeat bumps the mtime and never blanks the pid', async () => {
     const restore = _setTestRoot(recallHome);
     const { tryAcquirePushLock, releasePushLock, startLockHeartbeat, pushLockPath } =

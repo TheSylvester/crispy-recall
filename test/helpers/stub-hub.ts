@@ -47,6 +47,8 @@ export interface StubHubOptions {
   manifestDelayMs?: number;
   /** Statuses to answer successive manifests with; 200 serves normally. */
   manifestStatuses?: number[];
+  /** Answer every manifest 200 with this raw (non-JSON) body. */
+  manifestGarbage?: string;
 }
 
 export interface StubHub {
@@ -129,6 +131,12 @@ export async function startStubHub(opts: StubHubOptions = {}): Promise<StubHub> 
       if (opts.manifestDelayMs) await new Promise((r) => setTimeout(r, opts.manifestDelayMs));
       const forced = opts.manifestStatuses?.shift();
       if (forced !== undefined && forced !== 200) { send(forced, { error: 'forced' }); return; }
+      if (opts.manifestGarbage !== undefined) {
+        rec.status = 200;
+        res.writeHead(200, { 'content-type': 'application/json', [HEADER_VERSION]: version });
+        res.end(opts.manifestGarbage);
+        return;
+      }
       const out = (body.files ?? []).map((f) => {
         const stored = files.get(`${body.vendor}/${f.path}`);
         const offset = stored ? stored.byteLength : 0;

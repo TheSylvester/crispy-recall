@@ -184,7 +184,7 @@ function entriesCwd(entries: TranscriptEntry[]): string | undefined {
  *
  * @param sessionId       The session ID to ingest.
  * @param transcriptPath  Absolute path to the vendor JSONL file.
- * @param vendor          HubVendor format of the transcript ('claude' | 'codex').
+ * @param vendor          Vendor format of the transcript ('claude' | 'codex').
  * @param options         Processing options (force, verbose, projectId).
  * @returns               Result with session ID, message count, and skip/error status.
  */

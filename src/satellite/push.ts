@@ -419,8 +419,12 @@ async function pushVendor(
     }
     const body = parseJson<ManifestResponse>(res);
     if (!body || !Array.isArray(body.files)) {
+      // Fatal, unlike a per-batch status rejection: a hub that answers 200
+      // with a body we cannot read is not a hub we can talk to at all, and a
+      // silent exit 0 would report a healthy push that never happened.
       pushLog(`${nowIso()} push-failed host=${ctx.host} vendor=${vr.vendor} err=manifest body unparseable`);
-      continue;
+      out.transportFailed = true;
+      return out;
     }
     if (body.host && !ctx.host) ctx.host = body.host;
     if (body.fullSweepDue) out.fullSweepDue = true;
