@@ -126,9 +126,21 @@ export function parseCodexJsonlFile(filepath: string): CodexJsonlEnvelope[] {
  * @returns Absolute path to the JSONL file, or null if not found
  */
 export function findCodexSessionFile(sessionId: string): string | null {
+  return listCodexSessionFiles().get(sessionId) ?? null;
+}
+
+/**
+ * Walk the Codex sessions tree ONCE and map every session UUID to its rollout.
+ *
+ * `findCodexSessionFile` is built on this: resolving N sessions one at a time
+ * re-walked the whole tree N times (the re-key migration resolves thousands).
+ * First match wins, exactly as the per-session walk did.
+ */
+export function listCodexSessionFiles(): Map<string, string> {
+  const found = new Map<string, string>();
   try {
     const sessionsDir = codexSessionsDir();
-    if (!fs.existsSync(sessionsDir)) return null;
+    if (!fs.existsSync(sessionsDir)) return found;
 
     // Walk YYYY/MM/DD directory tree
     for (const year of readdirSafe(sessionsDir)) {
@@ -146,18 +158,17 @@ export function findCodexSessionFile(sessionId: string): string | null {
           for (const file of readdirSafe(dayPath)) {
             if (!file.endsWith('.jsonl')) continue;
             const match = file.match(SESSION_ID_RE);
-            if (match && match[1] === sessionId) {
-              return path.join(dayPath, file);
+            if (match && match[1] && !found.has(match[1])) {
+              found.set(match[1], path.join(dayPath, file));
             }
           }
         }
       }
     }
-
-    return null;
   } catch {
-    return null;
+    return found;
   }
+  return found;
 }
 
 /**

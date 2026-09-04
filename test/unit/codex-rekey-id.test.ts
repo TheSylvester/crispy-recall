@@ -14,12 +14,47 @@
  * CODEX_HOME: <tmp>/codex }`; a child that inherits the parent env resolves
  * `recallRoot()` to the live `~/.recall` (paths.ts:35-40).
  */
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { mkdirSync, readFileSync, rmSync } from 'node:fs';
+import { join, resolve } from 'node:path';
+import { tmpdir } from 'node:os';
+import { randomUUID } from 'node:crypto';
 import Database from 'better-sqlite3';
+import { _setTestRoot, dbPath } from '../../src/paths.js';
+import { _resetDb } from '../../src/db.js';
 import { adaptCodexJsonlRecords } from '../../src/adapters/codex/codex-jsonl-adapter.js';
 import { LEGACY_CODEX_ID_SQL } from '../../src/installer/codex-rekey-migration.js';
 
 const SID = '019c3ae2-9a7f-7f30-9717-d3ccfb7bac63';
+
+// This suite touches no recall database (a pure adapter call and an in-memory
+// SQLite handle), but it carries the isolation block anyway so a future edit
+// cannot silently reach the owner's live ~/.recall.
+let recallHome: string;
+let restoreRoot: (() => void) | undefined;
+const prevEnv: Record<string, string | undefined> = {};
+
+beforeEach(() => {
+  recallHome = join(tmpdir(), `recall-rekey-id-${randomUUID()}`);
+  mkdirSync(recallHome, { recursive: true });
+  restoreRoot = _setTestRoot(recallHome);
+  for (const k of ['RECALL_HOME', 'RECALL_REMOTE_ROOT', 'CLAUDE_CONFIG_DIR', 'CODEX_HOME']) prevEnv[k] = process.env[k];
+  process.env['RECALL_HOME'] = recallHome;
+  process.env['RECALL_REMOTE_ROOT'] = join(recallHome, 'remote');
+  process.env['CLAUDE_CONFIG_DIR'] = join(recallHome, 'claude');
+  process.env['CODEX_HOME'] = join(recallHome, 'codex');
+  _resetDb();
+});
+
+afterEach(() => {
+  restoreRoot?.();
+  _resetDb();
+  for (const [k, v] of Object.entries(prevEnv)) {
+    if (v === undefined) delete process.env[k];
+    else process.env[k] = v;
+  }
+  rmSync(recallHome, { recursive: true, force: true });
+});
 
 function rollout(): Array<Record<string, unknown>> {
   return [
@@ -31,6 +66,11 @@ function rollout(): Array<Record<string, unknown>> {
 }
 
 describe('codex re-key: synthesized message ids', () => {
+  it('is isolated: dbPath() points inside the temp root, never the live ~/.recall', () => {
+    expect(resolve(dbPath()).startsWith(resolve(tmpdir()))).toBe(true);
+    expect(resolve(dbPath()).startsWith(resolve(recallHome))).toBe(true);
+  });
+
   it('every synthesized id carries the FULL session uuid', () => {
     const entries = adaptCodexJsonlRecords(rollout() as never, SID) as Array<{ uuid?: string }>;
     const synthesized = entries
@@ -44,6 +84,13 @@ describe('codex re-key: synthesized message ids', () => {
     }
     // No id may keep the 8-hex prefix shape.
     expect(synthesized.some((id) => id === `codex-jsonl-${SID.slice(0, 8)}-0`)).toBe(false);
+  });
+
+  it('doctor reads the id constants from the db leaf, never from the migration module', () => {
+    const doctorSrc = readFileSync(join(__dirname, '..', '..', 'src', 'installer', 'doctor.ts'), 'utf-8');
+    // doctor must not pull in the migration's ingest/glob module graph.
+    expect(doctorSrc).not.toMatch(/from '\.\/codex-rekey-migration\.js'/);
+    expect(doctorSrc).toMatch(/LEGACY_CODEX_ID_SQL.*from '\.\.\/db\.js'/);
   });
 
   it('LEGACY_CODEX_ID_SQL selects legacy ids only — proven through SQLite', () => {

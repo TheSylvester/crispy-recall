@@ -14,8 +14,8 @@
  * `recallRoot()` to the live `~/.recall` (paths.ts:35-40).
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { copyFileSync, existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 import { platform, tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
@@ -109,6 +109,10 @@ beforeEach(() => {
   remoteRoot = join(recallHome, 'remote');
   mkdirSync(recallHome, { recursive: true });
   mkdirSync(claudeDir, { recursive: true });
+  // The bundle carries no node_modules: the WAL-safe snapshot opens the DB
+  // through the STAGED binding, exactly as an installed recall does.
+  mkdirSync(join(recallHome, 'bin'), { recursive: true });
+  copyFileSync(join(ROOT, 'dist', 'better_sqlite3.node'), join(recallHome, 'bin', 'better_sqlite3.node'));
   restoreRoot = _setTestRoot(recallHome);
   for (const k of ['RECALL_HOME', 'RECALL_REMOTE_ROOT', 'CLAUDE_CONFIG_DIR', 'CODEX_HOME']) prevEnv[k] = process.env[k];
   process.env['RECALL_HOME'] = recallHome;
@@ -130,14 +134,19 @@ afterEach(() => {
 });
 
 describe.skipIf(platform() === 'win32')('recall repair --rekey-codex (CLI)', () => {
+  it('is isolated: dbPath() points inside the temp root, never the live ~/.recall', () => {
+    expect(resolve(dbPath()).startsWith(resolve(tmpdir()))).toBe(true);
+    expect(resolve(dbPath()).startsWith(resolve(recallHome))).toBe(true);
+  });
+
   it('runs the migration, prints the summary, writes the marker, and asks for a drain', () => {
     if (!existsSync(CLI_BUNDLE)) throw new Error('dist/recall.js missing — run `npm run build` first');
-    const r = spawnSync(process.execPath, [CLI_BUNDLE, 'repair', '--rekey-codex'], {
+    const r = spawnSync(process.execPath, [CLI_BUNDLE, 'repair', '--rekey-codex', '--yes'], {
       env: childEnv(), encoding: 'utf-8', timeout: 60_000,
     });
-    expect(r.status).toBe(0);
+    expect(r.status, `stderr: ${r.stderr}\nstdout: ${r.stdout}`).toBe(0);
     expect(r.stdout).toMatch(
-      /codex re-key: 2 sessions, 1 re-ingested, 1 transcripts gone, \d+ vectors dropped/,
+      /codex re-key: 2 sessions, 1 re-ingested, 1 transcripts gone, 0 empty transcripts skipped, \d+ vectors dropped/,
     );
     // No embed-pending.js is staged under <RECALL_HOME>/bin → instruction, not a spawn.
     expect(r.stdout).toMatch(/run: recall backfill --auto-embed to re-embed the dropped vectors/);

@@ -710,7 +710,8 @@ export async function runInstall(opts: InstallOptions = {}): Promise<InstallResu
         if (codexRekey.performed) {
           say(
             `codex re-key: ${codexRekey.sessions} sessions, ${codexRekey.reingested} re-ingested, ` +
-            `${codexRekey.fileGone} transcripts gone, ${codexRekey.vectorsDropped} vectors dropped ` +
+            `${codexRekey.fileGone} transcripts gone, ${codexRekey.emptied} empty transcripts skipped, ` +
+            `${codexRekey.vectorsDropped} vectors dropped (snapshot ${codexRekey.snapshotPath}) ` +
             '— the background drain below re-embeds them',
           );
         }

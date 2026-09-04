@@ -15,11 +15,10 @@ import { runPreflight, claudeSettingsPath, type PreflightReport } from './prefli
 import { readConfig } from './config.js';
 import { integrityCheck } from './repair.js';
 import { detectStatusline } from './statusline-suggest.js';
-import { isBindingLoadError } from '../db.js';
+import { isBindingLoadError, CODEX_REKEY_MIGRATION_KEY, LEGACY_CODEX_ID_SQL } from '../db.js';
 import { binDir, dbPath, statuslineScript } from '../paths.js';
 import { EMBED_VERSION } from '../recall/embed-config.js';
 import { META_RESIDUE_SQL } from '../recall/purge-meta.js';
-import { CODEX_REKEY_KEY, LEGACY_CODEX_ID_SQL } from './codex-rekey-migration.js';
 
 export interface DoctorOptions {
   json?: boolean;
@@ -51,8 +50,9 @@ export interface BindingHealth {
    *  True → normal commands fail closed until `recall install` or
    *  `recall repair --rekey-codex` runs it. */
   codexRekeyPending: boolean | null;
-  /** Sessions still carrying legacy 8-hex Codex ids AFTER the migration —
-   *  their transcripts are gone. Informational, never a problem. */
+  /** Sessions still carrying legacy 8-hex Codex ids AFTER the migration: the
+   *  transcript was missing, unreadable, emptied, or the session reclassified
+   *  to another canonical id. Informational, never a problem. */
   legacyCodexSessions: number | null;
   /** Hot messages with no vector at all (null if DB absent / pre-migration
    *  schema). embedCoverage cannot serve: its denominator counts only rows
@@ -245,7 +245,7 @@ export function checkBindingHealth(): BindingHealth {
           let codexComplete = false;
           try {
             const marker = raw
-              .prepare(`SELECT value FROM schema_meta WHERE key='${CODEX_REKEY_KEY}'`)
+              .prepare(`SELECT value FROM schema_meta WHERE key='${CODEX_REKEY_MIGRATION_KEY}'`)
               .get() as { value?: string } | undefined;
             codexComplete = marker?.value === 'complete';
           } catch {
@@ -337,7 +337,10 @@ function printBinding(b: BindingHealth): void {
     );
   }
   if (b.legacyCodexSessions !== null && b.legacyCodexSessions > 0) {
-    console.log(`Legacy codex ids: ${b.legacyCodexSessions} sessions (transcripts gone)`);
+    console.log(
+      `Legacy codex ids: ${b.legacyCodexSessions} sessions not re-keyed ` +
+      '(transcript missing, unreadable, emptied, or reclassified)',
+    );
   }
   if (b.embedGap !== null && b.embedGap > 0) {
     console.log(`Embed gap:      ${b.embedGap} messages awaiting vectors — run: recall backfill --auto-embed`);

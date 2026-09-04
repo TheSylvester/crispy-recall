@@ -16,16 +16,21 @@
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { extractCodexSessionMeta } from '../../src/adapters/codex/codex-jsonl-reader.js';
 import { classifySession } from '../../src/recall/session-classifier.js';
+import { _setTestRoot, dbPath } from '../../src/paths.js';
+import { _resetDb } from '../../src/db.js';
 
 const PARENT = '22222222-3333-4444-5555-666666666666';
 const CHILD = '11111111-2222-3333-4444-555555555555';
 
 let dir: string;
+let recallHome: string;
+let restoreRoot: (() => void) | undefined;
+const prevEnv: Record<string, string | undefined> = {};
 
 /** A session_meta line padded to at least `bytes` by growing the git object. */
 function metaLine(payload: Record<string, unknown>, bytes: number): string {
@@ -45,15 +50,36 @@ function writeRollout(name: string, first: string, rest: string[] = []): string 
 }
 
 beforeEach(() => {
-  dir = join(tmpdir(), `recall-metacap-${randomUUID()}`);
+  // classifySession is NOT pure: lookupStoredProvenance opens getDb(dbPath()).
+  // Without this block dbPath() resolves to the owner's live ~/.recall.
+  recallHome = join(tmpdir(), `recall-metacap-${randomUUID()}`);
+  dir = join(recallHome, 'rollouts');
   mkdirSync(dir, { recursive: true });
+  restoreRoot = _setTestRoot(recallHome);
+  for (const k of ['RECALL_HOME', 'RECALL_REMOTE_ROOT', 'CLAUDE_CONFIG_DIR', 'CODEX_HOME']) prevEnv[k] = process.env[k];
+  process.env['RECALL_HOME'] = recallHome;
+  process.env['RECALL_REMOTE_ROOT'] = join(recallHome, 'remote');
+  process.env['CLAUDE_CONFIG_DIR'] = join(recallHome, 'claude');
+  process.env['CODEX_HOME'] = join(recallHome, 'codex');
+  _resetDb();
 });
 
 afterEach(() => {
-  rmSync(dir, { recursive: true, force: true });
+  restoreRoot?.();
+  _resetDb();
+  for (const [k, v] of Object.entries(prevEnv)) {
+    if (v === undefined) delete process.env[k];
+    else process.env[k] = v;
+  }
+  rmSync(recallHome, { recursive: true, force: true });
 });
 
 describe('codex session_meta read cap', () => {
+  it('is isolated: dbPath() points inside the temp root, never the live ~/.recall', () => {
+    expect(resolve(dbPath()).startsWith(resolve(tmpdir()))).toBe(true);
+    expect(resolve(dbPath()).startsWith(resolve(recallHome))).toBe(true);
+  });
+
   it('parses a ~40 KB session_meta and exposes git.repository_url', () => {
     const line = metaLine({
       id: PARENT,

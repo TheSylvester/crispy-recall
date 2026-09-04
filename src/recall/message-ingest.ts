@@ -116,6 +116,42 @@ export function loadTranscriptEntries(
 }
 
 /**
+ * How many rows `ingestSessionMessages` WOULD insert for this transcript.
+ *
+ * Mirrors its steps 2/4/5 exactly (load → stripToolContent → drop sub-agent
+ * and meta entries → require a uuid and non-empty text) WITHOUT touching the
+ * database. Callers that pass `force: true` use this as a pre-flight: a force
+ * ingest that yields zero records DELETES the session's existing rows and
+ * vectors (message-store.ts:119-128), so a rotated, unreadable or
+ * now-all-boilerplate transcript would silently purge history.
+ *
+ * Never throws: an unreadable transcript counts as 0, which callers treat as
+ * "do not touch this session".
+ */
+export function countIndexableRecords(
+  transcriptPath: string,
+  vendor: 'claude' | 'codex',
+  canonicalSessionId: string,
+): number {
+  let rawEntries: TranscriptEntry[];
+  try {
+    rawEntries = loadTranscriptEntries(transcriptPath, vendor, canonicalSessionId);
+  } catch {
+    return 0;
+  }
+  if (rawEntries.length === 0) return 0;
+  const topLevel = stripToolContent(rawEntries)
+    .filter((e) => !e.parentToolUseID && !shouldDropAsMeta(e));
+  let n = 0;
+  for (const entry of topLevel) {
+    if (!entry.uuid) continue;
+    if (!extractEntryText(entry)) continue;
+    n++;
+  }
+  return n;
+}
+
+/**
  * Find the working directory recorded on a session's transcript entries.
  *
  * Claude and Codex both stamp `cwd` on their entries; it's constant for a

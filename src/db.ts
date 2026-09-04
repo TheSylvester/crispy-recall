@@ -244,6 +244,19 @@ export function isRetrievalMigrationPending(d: RecallDb): boolean {
 export const CODEX_REKEY_MIGRATION_KEY = 'codex_message_id_v2';
 
 /**
+ * WHERE fragment selecting LEGACY Codex ids only.
+ *
+ * A full-uuid id is `codex-jsonl-` + 8-4-4-4-12 + `-<counter>`; SQLite's `_`
+ * wildcard matches exactly one character, so the NOT LIKE excludes precisely
+ * the new shape and keeps every 8-hex row. It lives HERE, on a leaf every
+ * reader already imports, so `doctor` can report the residue without pulling
+ * in the migration's ingest/glob module graph.
+ */
+export const LEGACY_CODEX_ID_SQL =
+  `message_id LIKE 'codex-jsonl-%' AND ` +
+  `message_id NOT LIKE 'codex-jsonl-________-____-____-____-____________-%'`;
+
+/**
  * Pending iff a `messages` table already exists but the durable
  * `codex_message_id_v2` marker does not say 'complete'. A fresh DB is never
  * pending (ensureSchema writes the marker with the fresh DDL). Read-only —

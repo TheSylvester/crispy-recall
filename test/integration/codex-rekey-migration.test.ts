@@ -19,11 +19,11 @@
  * CODEX_HOME: <tmp>/codex }`; a child that inherits the parent env resolves
  * `recallRoot()` to the live `~/.recall` (paths.ts:35-40).
  */
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync,
 } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { platform, tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
@@ -33,6 +33,7 @@ import { _resetDb, getDb, MigrationPendingError, RETRIEVAL_SCHEMA_DDL } from '..
 import {
   runCodexRekeyMigration, LEGACY_CODEX_ID_SQL, CODEX_REKEY_KEY,
 } from '../../src/installer/codex-rekey-migration.js';
+import { repairRekeyCodex } from '../../src/installer/repair.js';
 import { getEmbeddingGapStats, getEmbedVersionStats } from '../../src/recall/message-store.js';
 import { EMBED_VERSION } from '../../src/recall/embed-config.js';
 
@@ -46,6 +47,7 @@ const C = '22222222-3333-4444-5555-666666666666'; // hub mirror only
 const D = '33333333-4444-5555-6666-777777777777'; // transcript gone
 const E_FILE = '44444444-5555-6666-7777-888888888888'; // filename uuid
 const E_META = '55555555-6666-7777-8888-999999999999'; // >8 KB session_meta id
+const F = '66666666-7777-8888-9999-aaaaaaaaaaaa'; // rollout yields 0 indexable rows
 const HOST = 'sylvester-laptop';
 
 const PAD = ' padded out well beyond the fifty character minimum embedding floor.';
@@ -105,6 +107,24 @@ function pathC(): string {
   return join(dir, `rollout-2026-09-04T00-02-00-${C}.jsonl`);
 }
 function pathE(): string { return codexRollout(E_FILE, `rollout-2026-09-04T00-03-00-${E_FILE}.jsonl`); }
+function pathF(): string { return codexRollout(F, `rollout-2026-09-04T00-05-00-${F}.jsonl`); }
+
+/** Session F: legacy rows whose rollout holds ONLY a session_meta line, so a
+ *  force re-ingest would insert nothing and DELETE the existing rows. */
+function addSessionF(): void {
+  writeFileSync(pathF(), JSON.stringify({
+    timestamp: '2026-09-04T00:05:00.000Z', type: 'session_meta', payload: { id: F, cwd: '/proj' },
+  }) + '\n');
+  const raw = new Database(dbPath());
+  try {
+    raw.prepare(
+      `INSERT INTO messages (message_id, session_id, message_seq, message_text, project_id, created_at, message_role, retrieval_class)
+       VALUES (?, ?, 0, ?, '/proj', 1006, 'assistant', 'hot')`,
+    ).run(legacyId(F, 0), F, `foxtrot merlin answer${PAD}`);
+  } finally {
+    raw.close();
+  }
+}
 
 /** A 0.3.1-generation DB: current DDL + retrieval marker, NO codex marker. */
 function buildFixture(): void {
@@ -276,6 +296,11 @@ afterEach(() => {
 });
 
 describe.skipIf(platform() === 'win32')('codex re-key migration (§5)', () => {
+  it('is isolated: dbPath() points inside the temp root, never the live ~/.recall', () => {
+    expect(resolve(dbPath()).startsWith(resolve(tmpdir()))).toBe(true);
+    expect(resolve(dbPath()).startsWith(resolve(recallHome))).toBe(true);
+  });
+
   it('fails closed: getDb throws, the CLI exits 1, the Stop hook exits 0 and inserts nothing', () => {
     if (!existsSync(CLI_BUNDLE) || !existsSync(HOOK_BUNDLE)) {
       throw new Error('dist bundles missing — run `npm run build` first');
@@ -333,13 +358,27 @@ describe.skipIf(platform() === 'win32')('codex re-key migration (§5)', () => {
     expect(res.sessions).toBe(4);
     expect(res.reingested).toBe(3); // A (provenance), B (codex tree), C (mirror)
     expect(res.fileGone).toBe(1);   // D
+    expect(res.emptied).toBe(0);
     expect(res.legacyRemaining).toBe(1);
     expect(res.fileGone).toBe(res.legacyRemaining);
     expect(res.vectorsDropped).toBe(2); // A's two vectors
     expect(lines.join('\n')).toMatch(/vectors dropped: 2/);
     expect(lines.join('\n')).toMatch(
-      /codex re-key: 4 sessions, 3 re-ingested, 1 transcripts gone, 2 vectors dropped/,
+      /codex re-key: 4 sessions, 3 re-ingested, 1 transcripts gone, 0 empty transcripts skipped, 2 vectors dropped/,
     );
+
+    // Rollback insurance: a WAL-safe snapshot taken BEFORE the first rewrite.
+    expect(res.snapshotPath).toBeTruthy();
+    expect(existsSync(res.snapshotPath!)).toBe(true);
+    const snap = new Database(res.snapshotPath!, { readonly: true, fileMustExist: true });
+    try {
+      const legacyInSnapshot = (snap.prepare(
+        `SELECT COUNT(*) AS c FROM messages WHERE ${LEGACY_CODEX_ID_SQL}`,
+      ).get() as { c: number }).c;
+      expect(legacyInSnapshot).toBe(5); // every pre-migration legacy row
+    } finally {
+      snap.close();
+    }
     expect(markerValue()).toBe('complete');
 
     // A/B/C carry full-uuid ids only; D is untouched.
@@ -383,6 +422,54 @@ describe.skipIf(platform() === 'win32')('codex re-key migration (§5)', () => {
     expect(markerValue()).toBe('complete');
   }, 60_000);
 
+  it('never purges a session whose transcript yields zero indexable rows', async () => {
+    addSessionF();
+    _resetDb();
+
+    const lines: string[] = [];
+    const res = await runCodexRekeyMigration({ log: (l) => lines.push(l) });
+    expect(res.sessions).toBe(5);
+    expect(res.reingested).toBe(3); // A, B, C — F skipped, D gone
+    expect(res.emptied).toBe(1);
+    expect(res.fileGone).toBe(1);
+    expect(res.legacyRemaining).toBe(2); // D + F
+    expect(lines.join('\n')).toMatch(
+      new RegExp(`codex-rekey: ${F} — .*yielded 0 indexable entries; legacy ids KEPT`),
+    );
+    // F's history survives untouched — the owner declined a meta purge.
+    expect(ids(F)).toEqual([legacyId(F, 0)]);
+  }, 60_000);
+
+  it('drains even when the dropped vectors sit on a reclassified session', async () => {
+    // E is the ONLY session carrying vectors, and E reclassifies: the ingest
+    // layer still dropped them, so the drain decision must fire.
+    addSessionE();
+    const raw = new Database(dbPath());
+    try {
+      raw.prepare(`DELETE FROM message_vectors`).run();
+      raw.prepare(
+        `INSERT INTO message_vectors (message_id, embedding_q8, norm, quant_scale, embed_version) VALUES (?, ?, 1.0, 1.0, ?)`,
+      ).run(legacyId(E_FILE, 0), Buffer.alloc(768, 1), EMBED_VERSION);
+    } finally {
+      raw.close();
+    }
+    _resetDb();
+
+    const printed: string[] = [];
+    const spy = vi.spyOn(console, 'log').mockImplementation((...a: unknown[]) => { printed.push(a.join(' ')); });
+    let res: Awaited<ReturnType<typeof repairRekeyCodex>>;
+    try {
+      res = await repairRekeyCodex({ yes: true });
+    } finally {
+      spy.mockRestore();
+    }
+    expect(res).not.toBeNull();
+    expect(res!.reingested).toBe(3);
+    expect(res!.vectorsDropped).toBeGreaterThan(0); // E's vector, on the reclassified branch
+    // No embed-pending.js is staged here, so the drain surfaces as the hint.
+    expect(printed.join('\n')).toMatch(/run: recall backfill --auto-embed/);
+  }, 60_000);
+
   it('is idempotent: a second run performs nothing', async () => {
     const first = await runCodexRekeyMigration({ log: () => {} });
     expect(first.performed).toBe(true);
@@ -391,7 +478,8 @@ describe.skipIf(platform() === 'win32')('codex re-key migration (§5)', () => {
 
     const second = await runCodexRekeyMigration({ log: () => {} });
     expect(second).toEqual({
-      performed: false, sessions: 0, reingested: 0, fileGone: 0, vectorsDropped: 0, legacyRemaining: 0,
+      performed: false, sessions: 0, reingested: 0, fileGone: 0, emptied: 0,
+      vectorsDropped: 0, legacyRemaining: 0, snapshotPath: null,
     });
     _resetDb();
     expect(ids(A)).toEqual(rows);

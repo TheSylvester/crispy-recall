@@ -258,7 +258,8 @@ REPAIR FLAGS (with 'recall repair')
   --full           Delete every indexed message and reingest from JSONL
   --rekey-codex    Run the one-time Codex message-id migration (full UUIDs).
                    Re-ingests the affected sessions, which drops their
-                   vectors, then launches the re-embed drain
+                   vectors, then launches the re-embed drain. Asks first on a
+                   terminal; pass --yes to skip the prompt
 
 WORKFLOW
   1. Search:  recall "your query"
@@ -1178,10 +1179,11 @@ async function runInstallerSubcommand(cmd: string): Promise<void> {
   if (cmd === 'repair') {
     const { repairFts, repairVectors, repairFull, repairRekeyCodex } = await import('../installer/repair.js');
     if (hasFlag('--rekey-codex')) {
-      const r = await repairRekeyCodex();
+      const r = await repairRekeyCodex({ yes: hasFlag('--yes') });
+      if (r === null) exit(1); // declined at the confirm — nothing was changed
       console.log(
-        r.performed
-          ? `Codex message ids re-keyed (${r.reingested}/${r.sessions} sessions re-ingested).`
+        r!.performed
+          ? `Codex message ids re-keyed (${r!.reingested}/${r!.sessions} sessions re-ingested).`
           : 'Codex message ids are already re-keyed — nothing to do.',
       );
       exit(0);

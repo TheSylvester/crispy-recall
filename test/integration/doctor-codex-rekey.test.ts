@@ -15,7 +15,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { platform, tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import Database from 'better-sqlite3';
@@ -118,6 +118,11 @@ afterEach(() => {
 });
 
 describe.skipIf(platform() === 'win32')('doctor: codex re-key + drain gap', () => {
+  it('is isolated: dbPath() points inside the temp root, never the live ~/.recall', () => {
+    expect(resolve(dbPath()).startsWith(resolve(tmpdir()))).toBe(true);
+    expect(resolve(dbPath()).startsWith(resolve(recallHome))).toBe(true);
+  });
+
   it('reports the pending migration, then the residue and the drain gap it opened', async () => {
     const before = checkBindingHealth();
     expect(before.codexRekeyPending).toBe(true);
@@ -147,7 +152,7 @@ describe.skipIf(platform() === 'win32')('doctor: codex re-key + drain gap', () =
       spy.mockRestore();
     }
     const out = printed.join('\n');
-    expect(out).toMatch(/Legacy codex ids: 1 sessions/);
+    expect(out).toMatch(/Legacy codex ids: 1 sessions not re-keyed \(transcript missing, unreadable, emptied, or reclassified\)/);
     expect(out).toMatch(/Embed gap:\s+\d+ messages awaiting vectors — run: recall backfill --auto-embed/);
 
     // One drain closes the gap again.
