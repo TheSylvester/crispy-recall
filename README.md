@@ -6,7 +6,7 @@ Each conversation with your agent lands in a transcript on disk, waiting for Cla
 
 **Local session memory for Claude Code, with Codex support.** Hybrid text and semantic search. Verbatim conversation history.
 
-No daemon, no cron, no cloud. A Stop hook and a SQLite file.
+No daemon, no cron, no cloud on a single machine — a Stop hook and a SQLite file. (Multi-machine satellite mode adds one optional hub daemon on your own private network.)
 
 ## Quick start
 
@@ -18,6 +18,26 @@ recall install
 ```
 
 recall downloads a local embedding runtime and model, sets up a `Stop` hook in Claude Code, installs the recall Agent Skill, and starts indexing the session history still on disk. If Codex is detected, recall sets up the same integration there.
+
+### More than one machine (satellite mode)
+
+A **hub** is the machine that keeps the database and runs the embedding model. A **satellite** is a machine that only pushes its transcripts to the hub and forwards its queries there; it needs no database, no model and no native addon, and it runs on Node.js 20+.
+
+Install the hub first with the route above, then start its daemon and issue one token per satellite:
+
+```bash
+recall hub serve --bind <tailnet-address>   # listens on 127.0.0.1 by default
+recall hub token --host <name>              # prints the token once
+```
+
+`recall hub install-service` registers a systemd user unit on Linux so the daemon survives a logout or a reboot. On each satellite, install recall in that environment too and register it against the hub:
+
+```bash
+npm install -g crispy-recall
+recall install --hub http://<hub-address>:7877 --token -
+```
+
+`--token -` reads the token from stdin, so it never reaches your shell history; `RECALL_HUB_TOKEN` is honored as well. The hub speaks plain HTTP and never binds a public address on its own: put it on a private network. Tailscale is one such network, and the deployment choice is yours — recall itself has no Tailscale awareness.
 
 ## How to use recall
 
@@ -151,7 +171,7 @@ Under the hood, recall is deliberately boring:
 4. A small skill teaches your agent to search first when prior work is likely to matter.
 5. Search results enter the context only when the agent asks for them.
 
-There's no resident daemon, and recall makes no LLM calls of its own. Indexing and search don't consume model tokens; retrieved text costs context tokens only when your agent reads it, like any other local file.
+On a single machine there's no resident daemon (the optional hub daemon runs only in satellite mode), and recall makes no LLM calls of its own. Indexing and search don't consume model tokens; retrieved text costs context tokens only when your agent reads it, like any other local file.
 
 Install-time backfill indexes the Claude Code and Codex sessions still present on disk, so recall is useful on day one rather than only after day one.
 
@@ -159,7 +179,8 @@ Install-time backfill indexes the Claude Code and Codex sessions still present o
 
 ### Requirements
 
-- Node.js 22 LTS (`>=22.16`) or Node.js 24+
+- Node.js 22 LTS (`>=22.16`) or Node.js 24+ on a hub — the machine that keeps the database and runs the embedding model. This is the default install.
+- Node.js 20+ on a satellite — a machine that only pushes transcripts and forwards queries. It stages no database, model or native addon.
 - Claude Code (required); Codex session indexing and search are also configured when Codex is detected
 - Linux x64/arm64, macOS x64/arm64, or Windows x64
 - macOS 14+ on Apple Silicon or macOS 13.7+ on Intel
@@ -197,6 +218,7 @@ recall install
 
 - **From 0.1.x**, the installer migrates the wasm database to native SQLite/WAL (writing a `~/.recall/recall.db.pre-upgrade-<stamp>` snapshot) and checks integrity, then runs the retrieval-class migration below.
 - **From 0.2.x**, the installer runs the retrieval-class migration: it reclassifies any subagent (agent-leaf) messages as durable-but-excluded-from-default-search, rebuilds the FTS index, and re-embeds affected rows in the background.
+- **From 0.3.x on a hub**, `recall install` also runs the attended Codex message-id migration, which re-ingests and re-embeds your Codex history in the background — semantic recall over Codex sessions is degraded until `recall doctor` reports the embedding gap at 0 — and it offers `recall repair --rekey-projects` to fill the new project key on existing rows.
 
 Before it changes anything, the retrieval-class migration writes a `~/.recall/recall.db.pre-retrieval-<stamp>` snapshot; a 0.1.x upgrade therefore keeps two retained snapshots (pre-upgrade and pre-retrieval). Keep free disk roughly equal to the current database size — twice that when upgrading from 0.1.x — and delete the snapshots only after you're satisfied.
 
@@ -221,6 +243,15 @@ Migration works from `recall.db`, not the source transcripts, so indexed history
 | `recall status` | Show database size, message counts, embedding gap/migration progress, and active backfill state. |
 | `recall doctor [--integrity]` | Run read-only install and database checks. |
 | `recall repair --fts \| --vectors \| --full` | Rebuild FTS5, clear vectors for re-embedding, or fully reingest on-disk transcripts. |
+| `recall repair --rekey-codex` | Run the one-time Codex message-id migration to full session UUIDs (hub only). |
+| `recall repair --rekey-projects [--force]` | Fill `project_key` on existing rows; `--force` also re-keys already-keyed rows (hub only). |
+| `recall "<query>" --project-key K` | Scope by an already-derived repo key (`git:`/`origin:`/`path:`), skipping derivation. |
+| `recall hub serve [--bind <addr>] [--port <n>] [--detach]` | Run the hub daemon: mirror satellite transcripts and answer their queries (hub only). |
+| `recall hub token --host <name> \| --revoke <name>` | Issue (or rotate) a satellite's bearer token, or revoke one without a restart (hub only). |
+| `recall hub status` | Show the daemon, the resolved address, and per-host mirror and push/query state (hub only). |
+| `recall hub install-service` | Register the systemd user unit so the daemon starts at login (hub only). |
+| `recall install --hub <url> --token <t>\|-` | Register this machine as a satellite of that hub; `-` reads the token from stdin (satellite only). |
+| `recall push [--full]` | Push pending transcripts to the hub now; `--full` re-offers every transcript (satellite only). |
 | `recall statusline [--suggest]` | Print the session-id chip or integration guidance. |
 | `recall uninstall [--purge]` | Remove the integration; `--purge` also deletes recall's data. |
 
@@ -236,7 +267,7 @@ It is off by default: accepting the installer defaults, using `--yes` or a non-i
 
 The installed statusline never opens the database. Its only I/O is one guarded `git status` call with a 400 ms timeout; failure simply drops the git segment, and any segment whose input is missing is omitted. For composition with your own statusline, `recall statusline` prints only the bare, uncolored session-id chip. Uninstall removes the line only if recall still owns it, and doctor reports statusline problems as warnings.
 
-> **Warning:** `recall repair --full` is destructive: it replaces the index contents from the transcripts still on disk. If older source transcripts have already been cleaned up, their indexed history cannot be rebuilt. Prefer `--fts` or `--vectors` unless a full reingest is truly necessary.
+> **Warning:** `recall repair --full` is destructive: it replaces the index contents from the transcripts still on disk. If older source transcripts have already been cleaned up, their indexed history cannot be rebuilt. Prefer `--fts` or `--vectors` unless a full reingest is truly necessary. On a hub it also re-ingests the satellite mirror under `~/.recall/remote/`, and it refuses to run when that directory exists but enumerates no hosts — a satellite's history would otherwise be deleted and not rebuilt.
 
 ## Privacy and data
 
@@ -250,6 +281,8 @@ The installed statusline never opens the database. Its only I/O is one guarded `
 
 The installed integration is inspectable too: Claude's skill and hook live under `~/.claude/skills/recall/` and `~/.claude/settings.json`. When Codex is detected, recall also uses `~/.codex/skills/recall/` and `~/.codex/hooks.json`.
 
+In satellite mode, each satellite pushes its transcript **bytes** to the hub over plain HTTP. There is no TLS in v1, so put the hub port on a private network. The hub stores those bytes under `~/.recall/remote/<host>/` and indexes them beside its own sessions. Authorization is coarse: a hub token grants read of the whole hub index, and write only to that host's mirror. Tokens are stored hashed in `~/.recall/hub-tokens.json` on the hub and in plain text in `~/.recall/satellite-token` (mode 0600) on the satellite; `recall hub token --revoke <name>` takes effect immediately, with no daemon restart.
+
 The index deliberately outlives source-transcript cleanup. recall doesn't encrypt `recall.db`; treat `~/.recall/` with the same care as your original Claude Code and Codex histories.
 
 ## Limitations
@@ -260,6 +293,8 @@ The index deliberately outlives source-transcript cleanup. recall doesn't encryp
 - It doesn't preserve tool output, hidden thinking, or images in the searchable conversation.
 - It doesn't yet offer per-session deletion; forgetting is database-level today.
 - Subagent transcripts (Claude Task leaves, Codex child rollouts) are stored durable and readable by explicit ID, but are excluded from default search, lists, and semantic vectors — the parent thread's narration is the canonical memory. There is no search mode that includes them yet.
+- On a satellite, `recall --commit` and `recall --blame` see local sessions only. They read local git and local transcripts, never the hub index.
+- A repo that is keyed `git:<root-commit>` on one machine and `origin:<url>` on another — a shallow clone, for instance — does not unify until both machines agree on the key. Run `git fetch --unshallow`, then `recall repair --rekey-projects --force` on the hub.
 
 ## Project status
 

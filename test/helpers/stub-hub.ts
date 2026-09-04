@@ -10,6 +10,7 @@
  */
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { randomBytes, createHash } from 'node:crypto';
+import { getVersion } from '../../src/version.js';
 import {
   HEADER_META, HEADER_STALE, HEADER_VERSION, HEADER_WIRE, MAX_APPEND_BYTES,
   MAX_MANIFEST_BODY, WIRE_VERSION, decodeMeta, parseVendor, validateRelPath, type AppendMeta,
@@ -85,7 +86,9 @@ export async function startStubHub(opts: StubHubOptions = {}): Promise<StubHub> 
   const requests: RecordedRequest[] = [];
   const files = new Map<string, Buffer>();
   const wire = opts.wire ?? WIRE_VERSION;
-  const version = opts.version ?? '0.3.1';
+  // Track package.json, never a literal: a version bump would otherwise make
+  // every stub response trip the satellite's mismatch warning (§6).
+  const version = opts.version ?? getVersion();
 
   const server = createServer((req, res) => { void handle(req, res); });
 

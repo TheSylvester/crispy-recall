@@ -15,9 +15,8 @@
 
 import { request as httpRequest, type IncomingHttpHeaders } from 'node:http';
 import { request as httpsRequest } from 'node:https';
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
 import { HEADER_VERSION, HEADER_WIRE, WIRE_VERSION } from '../hub/protocol.js';
+import { getVersion as packageVersion } from '../version.js';
 
 /** Default socket-connect budget. */
 export const CONNECT_TIMEOUT_MS = 3000;
@@ -46,14 +45,11 @@ export interface HubRequestOptions {
   timeoutMs?: number;
 }
 
-/** Package version, or `unknown` from a staged bundle (U4 lands the define). */
+/** Package version — the build-time define, else a package.json fallback (§6).
+ *  A staged satellite bundle now reports a real version, so `maybeWarnVersion`
+ *  is no longer silenced by an `unknown` local side. */
 export function localVersion(): string {
-  try {
-    const pkg = JSON.parse(readFileSync(join(__dirname, '..', 'package.json'), 'utf8')) as { version?: string };
-    return pkg.version ?? 'unknown';
-  } catch {
-    return 'unknown';
-  }
+  return packageVersion();
 }
 
 /** Join a hub base URL with an absolute path, tolerating a trailing slash. */

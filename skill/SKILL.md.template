@@ -22,7 +22,7 @@ matched message ID; then `recall <session-id> <message-id>` reads centered on th
 (footer shows `--offset` to continue). Don't re-read sessions from the top.
 
 - Dates go in flags, never query text: `--since`/`--until YYYY-MM-DD`; `--recent` for "lately".
-- Search is scoped to this repo; thin or off-target results → retry with `--all`
+- Search is scoped to this repo (any clone or worktree); thin or off-target results → retry with `--all`
   (or `--project PATH`). Semantic fill returns plausible rows for ANY query — judge
   relevance yourself.
 - A read's header says `Session:`. If it says `Query:`, the ref fell back to search
@@ -31,9 +31,10 @@ matched message ID; then `recall <session-id> <message-id>` reads centered on th
 - Transcripts record what was believed, not what is — verify claimed state against
   git/disk before repeating it.
 - `recall --commit <hash>` / `recall --blame path:line` → the sessions that produced a
-  commit / the code at HEAD (structural match, includes rationale + rejected approaches).
+  commit / the code at HEAD (structural match, includes rationale + rejected approaches) (local sessions only on a satellite).
 - `recall --list --since D --until D` browses a day. IDs are opaque; paste back exactly.
-- Just-finished sessions index a few seconds after the turn ends.
+- Just-finished sessions index a few seconds after the turn ends; on a
+  satellite, after the push lands (seconds).
 - `recall --help` for everything else.
 
 **Deep research → sub-agent.** For multi-search timelines, delegate. The sub-agent can't
