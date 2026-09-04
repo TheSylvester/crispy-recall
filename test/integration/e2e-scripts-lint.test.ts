@@ -78,6 +78,15 @@ describe('contrib/satellite/e2e — script lint', () => {
     }
   });
 
+  // Every `pass` call names $NAME first, so the single printed PASS line always
+  // starts `PASS <script>` — a suffix like " (synthetic hook: …)" is allowed.
+  // (A script may hold more than one exit path; 61 has an early --run-less one.)
+  it.each(NEEDS_LIB)('%s passes on $NAME, optional suffix', (f) => {
+    const calls = [...text(f).matchAll(/(?:^|[\s;&|])pass "([^"]*)"/g)].map((m) => m[1]);
+    expect(calls.length).toBeGreaterThanOrEqual(1);
+    for (const c of calls) expect(c).toMatch(/^\$NAME/);
+  });
+
   // Rule 10: no token literal may ever be committed.
   it.each(SCRIPTS)('%s carries no 64-hex literal', (f) => {
     const hit = lines(f).findIndex((l) => /[0-9a-f]{64}/.test(l));
