@@ -15,7 +15,7 @@ import { getDb } from '../db.js';
 import { dbPath } from '../paths.js';
 import { readClaudeTurnContent, type TurnContent } from '../adapters/claude/jsonl-reader.js';
 import { readCodexTurnContent } from '../adapters/codex/codex-jsonl-reader.js';
-import { searchMessagesFtsMeta, getMessageByUuid, getAdjacentMessages, getSessionMessageCount, grepMessages, readSessionMessages, inferRole } from './message-store.js';
+import { projectScopeSql, searchMessagesFtsMeta, getMessageByUuid, getAdjacentMessages, getSessionMessageCount, grepMessages, readSessionMessages, inferRole } from './message-store.js';
 import type { MessageRecord, MessageSearchResult, MessageSearchMeta, GrepMatch, SessionPage } from './message-store.js';
 import { dualPathSearch } from './vector-search.js';
 import type { DualPathSearchResult } from './vector-search.js';
@@ -62,6 +62,7 @@ export function listSessions(
   excludeSessionId?: string,
   projectId?: string,
   until?: string,
+  projectKey?: string,
 ): ListResult[] {
   const db = getDb(dbPath);
   const params: (string | number)[] = [];
@@ -84,10 +85,8 @@ export function listSessions(
     conditions.push('m.session_id != ?');
     params.push(excludeSessionId);
   }
-  if (projectId) {
-    conditions.push('m.project_id = ?');
-    params.push(projectId);
-  }
+  const scope = projectScopeSql('m', projectId, projectKey, params);
+  if (scope) conditions.push(scope);
 
   const whereClause = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';
   params.push(limit);
@@ -145,8 +144,9 @@ export async function searchTranscript(
   projectId?: string,
   sessionId?: string,
   excludeSessionId?: string,
+  projectKey?: string,
 ): Promise<DualPathSearchResult> {
-  return dualPathSearch(query, { limit, projectId, sessionId, excludeSessionId });
+  return dualPathSearch(query, { limit, projectId, sessionId, excludeSessionId, ...(projectKey ? { projectKey } : {}) });
 }
 
 /**
@@ -157,8 +157,9 @@ export function searchTranscriptMeta(
   projectId?: string,
   sessionId?: string,
   excludeSessionId?: string,
+  projectKey?: string,
 ): MessageSearchMeta {
-  return searchMessagesFtsMeta(query, projectId, sessionId, excludeSessionId);
+  return searchMessagesFtsMeta(query, projectId, sessionId, excludeSessionId, projectKey);
 }
 
 /** Single turn in a context window. */

@@ -34,6 +34,8 @@ import { log } from '../log.js';
 export interface DualPathSearchOptions {
   limit?: number;
   projectId?: string;
+  /** Repo-derived project key (spec §4). Matched BESIDE projectId, never instead. */
+  projectKey?: string;
   sessionId?: string;
   /** Session ID to exclude from results (caller's own session). */
   excludeSessionId?: string;
@@ -147,12 +149,13 @@ export async function dualPathSearch(
   }
 
   // Run both paths (both are synchronous SQLite operations)
-  const ftsResults = searchMessagesFts(query, fetchLimit, opts?.projectId, opts?.sessionId, opts?.excludeSessionId, opts?.skipIdf);
+  const ftsResults = searchMessagesFts(query, fetchLimit, opts?.projectId, opts?.sessionId, opts?.excludeSessionId, opts?.skipIdf, opts?.projectKey);
 
   const semanticResults = queryQ8 && queryNorm > 0
     ? searchMessagesSemantic(queryQ8, queryNorm, queryScale, {
         limit: fetchLimit,
         projectId: opts?.projectId,
+        projectKey: opts?.projectKey,
         sessionId: opts?.sessionId,
         excludeSessionId: opts?.excludeSessionId,
         tolerant,

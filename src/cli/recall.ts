@@ -27,6 +27,7 @@ import { getDb, closeDb } from '../db.js';
 import { getDbPath, listSessions } from '../recall/memory-queries.js';
 import { readSessionMessages, getMessageByUuid } from '../recall/message-store.js';
 import { normalizePath } from '../url-path-resolver.js';
+import { deriveProjectKey } from '../recall/project-key.js';
 import { mtimeScan } from '../recall/mtime-scan.js';
 import {
   startRecallCatchup,
@@ -130,19 +131,51 @@ function exit(code: number): never {
 }
 
 // Project scoping: default to CWD (inherited from parent session's projectPath),
-// --project overrides, --all disables scoping entirely.
-const effectiveProject = allProjects ? undefined : normalizePath(projectFlag ?? process.cwd());
+// --project overrides, --all disables scoping entirely. Beside the path, the
+// scope carries the repo-derived key (spec §4.4) so worktrees, clones and
+// subdirectories of one repository resolve to one project.
+//
+// Resolved LAZILY — at module scope every `--version`, `--help`, `install`,
+// `statusline`, `backfill`, `--commit` and `--blame` run would spawn git.
+interface ProjectScope { projectId?: string; projectKey?: string }
+let scopeCache: ProjectScope | undefined;
+
+function projectScope(): ProjectScope {
+  if (scopeCache) return scopeCache;
+  scopeCache = resolveProjectScope();
+  return scopeCache;
+}
+
+function resolveProjectScope(): ProjectScope {
+  // 1. --all: no scope at all.
+  if (allProjects) return {};
+  const keyFlag = flagValue('--project-key');
+  // 2. An explicit key (the hub appends one to every proxied query) is
+  //    authoritative — never re-derive, the hub's cwd does not exist here.
+  if (keyFlag) {
+    return { projectKey: keyFlag, projectId: normalizePath(projectFlag ?? process.cwd()) };
+  }
+  // 3/4. Derive once from --project, else from the cwd.
+  const path = projectFlag ?? process.cwd();
+  const derived = deriveProjectKey(path);
+  if (derived.transientFailure) {
+    console.error('recall: project key unavailable (git did not answer) — scoping by path only');
+    return { projectId: normalizePath(path) };
+  }
+  return { projectId: normalizePath(path), ...(derived.key ? { projectKey: derived.key } : {}) };
+}
 
 // Collect positional args (skip flags and their values)
 // --commit / --blame consume positionals separately below.
-const FLAG_WITH_VALUE = new Set(['--limit', '--offset', '--since', '--until', '--project', '--vendor', '--commit']);
+const FLAG_WITH_VALUE = new Set(['--limit', '--offset', '--since', '--until', '--project', '--project-key', '--vendor', '--commit']);
 const FLAG_BOOLEAN = new Set([
   '--raw', '--raw-messages', '--no-idf',
   '--help', '-h', '--version', '-v', '--list', '--all', '--reverse', '--recent', '--blame',
   '--no-catchup', '--auto-embed', '--detach', '--purge-meta', '--dry-run',
   // installer subcommand flags
   '--yes', '--offline', '--json', '--purge', '--integrity',
-  '--fts', '--vectors', '--full', '--no-claudemd', '--no-backfill', '--auto-backfill',
+  '--fts', '--vectors', '--full', '--rekey-projects', '--force',
+  '--no-claudemd', '--no-backfill', '--auto-backfill',
   '--statusline', '--no-statusline',
   // statusline subcommand flag
   '--suggest',
@@ -191,6 +224,9 @@ USAGE
   recall --blame <path>[:<line>[-<line>]]...  Sessions responsible for a file
                                      or a specific line/range (via git blame)
   recall backfill [flags]            Catch up FTS5 + embeddings against transcript files
+  recall repair --rekey-projects [--force]
+                                     Fill messages.project_key for existing rows
+                                     (attended; --force also re-keys keyed rows)
   recall statusline [--suggest]      Print the session-id chip for the Claude Code
                                      statusline (or, with --suggest, detect your
                                      current statusline and show how to add it)
@@ -214,6 +250,8 @@ FLAGS
   --since DATE     Only sessions after this date (list and search modes, ISO-8601)
   --until DATE     Only sessions before this date (inclusive of the day, ISO-8601)
   --project PATH   Scope to a specific project path (default: CWD)
+  --project-key K  Scope by an already-derived repo key (git:/origin:/path:);
+                   skips derivation. Used by the hub for proxied queries.
   --all            Search across all projects (disables project scoping)
   --recent         Strongly boost recent sessions in search ranking
   --reverse        Read session messages newest-first (default: oldest-first)
@@ -421,7 +459,10 @@ function resolveMessageRef(sessionId: string, ref: string): string {
 function runList() {
   initDb();
   const effectiveLimit = limit > 0 ? limit : 50;
-  const sessions = listSessions(getDbPath(), effectiveLimit, since, undefined, effectiveProject, until);
+  const scope = projectScope();
+  const sessions = listSessions(
+    getDbPath(), effectiveLimit, since, undefined, scope.projectId, until, scope.projectKey,
+  );
 
   if (raw) {
     console.log(JSON.stringify(sessions, null, 2));
@@ -648,9 +689,11 @@ function runReadTurn(sessionId: string, messageId: string) {
 async function runSearch(query: string) {
   initDb();
   const ceiling = limit > 0 ? limit : 200;
+  const scope = projectScope();
   const r = await dualPathSearch(query, {
     limit: ceiling,
-    projectId: effectiveProject,
+    ...(scope.projectId ? { projectId: scope.projectId } : {}),
+    ...(scope.projectKey ? { projectKey: scope.projectKey } : {}),
     ...(noIdf ? { skipIdf: true } : {}),
     ...(recent ? { recencyDecay: 0.10 } : {}), // default is off; --recent opts into absolute age decay
   });
@@ -1172,7 +1215,19 @@ async function runInstallerSubcommand(cmd: string): Promise<void> {
     if (hasFlag('--fts')) { repairFts(); console.log('FTS5 index rebuilt.'); exit(0); }
     if (hasFlag('--vectors')) { repairVectors(); console.log('Vectors cleared — they re-embed on the next sweep.'); exit(0); }
     if (hasFlag('--full')) { await repairFull({ yes: hasFlag('--yes') }); exit(0); }
-    console.error('recall repair: specify --fts, --vectors, or --full');
+    if (hasFlag('--rekey-projects')) {
+      const { repairRekeyProjects } = await import('../installer/repair.js');
+      const r = repairRekeyProjects({ force: hasFlag('--force') });
+      console.log(
+        `project keys: ${r.projectIds} project_ids, ${r.updated} rows updated, ` +
+        `${r.skippedMirror} mirror-only skipped, ${r.transient} transient (left NULL)`,
+      );
+      if (!r.markerWritten) {
+        console.error('recall repair --rekey-projects: incomplete — re-run when git is responsive.');
+      }
+      exit(r.markerWritten ? 0 : 1);
+    }
+    console.error('recall repair: specify --fts, --vectors, --full, or --rekey-projects');
     exit(1);
   }
 }
