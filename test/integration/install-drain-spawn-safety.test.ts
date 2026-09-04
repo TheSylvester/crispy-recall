@@ -98,12 +98,45 @@ function buildFixture(): void {
   raw.close();
 }
 
-/** Kill whatever detached drain the install left behind. */
+/** The live command line of `pid`, or null when it cannot be read. */
+function cmdlineOf(pid: number): string | null {
+  if (process.platform === 'linux') {
+    try {
+      return readFileSync(`/proc/${pid}/cmdline`, 'utf-8').replace(/\0/g, ' ');
+    } catch {
+      return null;
+    }
+  }
+  // macOS and the other BSDs carry no /proc: ask ps for the same string.
+  const r = spawnSync('ps', ['-o', 'command=', '-p', String(pid)], { encoding: 'utf-8' });
+  if (r.error || r.status !== 0 || !r.stdout) return null;
+  return r.stdout;
+}
+
+/**
+ * Kill the detached drain the install left behind — and ONLY that.
+ *
+ * A recorded pid outlives its process, and the number could have been reused
+ * by then. Probe with signal 0 first, then confirm the live command line still
+ * names a recall bundle under THIS temp root before signalling.
+ */
 function killDrain(): void {
+  let pid: number;
   try {
-    const pid = Number(readFileSync(join(recallHome, 'run', 'backfill.pid'), 'utf-8').trim());
-    if (Number.isInteger(pid) && pid > 0) process.kill(pid, 'SIGKILL');
-  } catch { /* no drain, or already gone */ }
+    pid = Number(readFileSync(join(recallHome, 'run', 'backfill.pid'), 'utf-8').trim());
+  } catch {
+    return; // no drain was ever recorded
+  }
+  if (!Number.isInteger(pid) || pid <= 0) return;
+  try {
+    process.kill(pid, 0); // alive?
+  } catch {
+    return; // already gone
+  }
+  const cmdline = cmdlineOf(pid);
+  if (cmdline === null) return; // cannot confirm identity → never signal
+  if (!cmdline.includes('recall.js') || !cmdline.includes(recallHome)) return;
+  try { process.kill(pid, 'SIGKILL'); } catch { /* raced with its own exit */ }
 }
 
 beforeEach(() => {

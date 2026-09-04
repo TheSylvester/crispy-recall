@@ -20,7 +20,7 @@
 import { existsSync, copyFileSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import Database from 'better-sqlite3';
-import { getDb, _resetDb } from '../db.js';
+import { getDb, _resetDb, resolveNativeBindingPath } from '../db.js';
 import { dbPath, binDir, runDir } from '../paths.js';
 import { EMBED_VERSION } from '../recall/embed-config.js';
 import { backupStamp } from './settings-merge.js';
@@ -45,18 +45,22 @@ export interface UpgradeClassification {
 /**
  * Open the live DB read-only without flipping its journal mode. A readonly
  * connection can never write, so it never converts a delete-mode DB — the same
- * discipline `recall doctor` uses. Mirrors the staged-binding-first resolution
- * (bundled runtime has no node_modules) and degrades to null on any failure so
+ * discipline `recall doctor` uses. Loads the SAME binding getDb loaded
+ * (`db.ts resolveNativeBindingPath`) and degrades to null on any failure so
  * the caller can safely assume `needs-migration`.
  */
 function openReadonly(dbFile: string): Database.Database | null {
-  const staged = join(binDir(), 'better_sqlite3.node');
+  // The SAME binding getDb loaded: a second copy of the addon would be a
+  // second SQLite instance, and closing this handle would then drop the
+  // process's POSIX locks out from under the shared connection (db.ts
+  // resolveNativeBindingPath).
+  const binding = resolveNativeBindingPath();
   try {
-    return existsSync(staged)
-      ? new Database(dbFile, { readonly: true, fileMustExist: true, nativeBinding: staged })
+    return binding
+      ? new Database(dbFile, { readonly: true, fileMustExist: true, nativeBinding: binding })
       : new Database(dbFile, { readonly: true, fileMustExist: true });
   } catch {
-    // Staged binding may be ABI-stale/absent — try default resolution once (dev/test).
+    // The resolved binding may be ABI-stale/absent — try default resolution once.
     try {
       return new Database(dbFile, { readonly: true, fileMustExist: true });
     } catch {

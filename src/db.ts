@@ -348,8 +348,12 @@ export function openReadonlyDb(dbPath: string): RecallDb {
  * Close the database connection and release the singleton.
  */
 export function closeDb(): void {
-  if (db) {
+  if (!db) return;
+  try {
     db.close();
+  } finally {
+    // Null the singleton even when close() throws: a half-closed handle left
+    // in the cache would be handed to the next caller by getDb.
     db = null;
     currentDbPath = null;
   }
@@ -362,32 +366,49 @@ export function _resetDb(): void {
   closeDb();
 }
 
-/**
- * Release the shared connection BEFORE spawning a child that opens the same
- * database, and never touch the database again in this process afterwards.
- *
- * In WAL mode SQLite keeps the wal-index (`<db>-shm`) `mmap`'d. A newly
- * attaching connection may RESET that index — `ftruncate(<shm fd>, 3)` — and a
- * process that still maps the old 32 KB region then dies with SIGBUS
- * (BUS_ADRERR) the next time it reads the index. Measured on the 0.3.1 → codex
- * re-key upgrade: the installer kept its connection open across
- * `spawnDetachedBackfill()`, the detached `recall backfill` child truncated the
- * shm, and the installer's next query (the final coverage read) took SIGBUS
- * after every phase had already succeeded.
- *
- * `getDb` re-opens lazily, so a later caller in a long-lived process (the hub
- * daemon) is unaffected — it simply gets a fresh connection and a fresh map.
- */
 /** Test seam: is a shared connection currently open? (No I/O.) */
 export function _isDbOpen(): boolean {
   return db !== null;
 }
 
+/**
+ * Release the shared connection BEFORE an ATTENDED migration spawns a child
+ * that opens the same database, and do not touch the database again first.
+ *
+ * In WAL mode SQLite keeps the wal-index (`<db>-shm`) `mmap`'d. An attaching
+ * connection RESETS that index — `ftruncate(<shm fd>, 3)` — and a process that
+ * still maps the old region then dies with SIGBUS (BUS_ADRERR) on its next
+ * read. SQLite normally makes that impossible: the reset needs the EXCLUSIVE
+ * DMS lock, and every live connection holds a SHARED DMS lock that denies it.
+ * So only a process that has LOST its lock while KEEPING its mapping is
+ * exposed.
+ *
+ * The installer is exactly that process. Beside the shared connection it opens
+ * second raw handles (`retrieval-class-migration.ts openRaw`,
+ * `upgrade-migrate.ts openReadonly`); closing one of those drops the process's
+ * POSIX locks on that inode, so the shared connection keeps its map without
+ * its lock. Measured on the 0.3.1 → codex re-key upgrade: the installer held
+ * its connection across `spawnDetachedBackfill()`, the detached child reset
+ * the shm, and the installer's next query took SIGBUS after every phase had
+ * already succeeded.
+ *
+ * Hot paths do NOT need this and must not pay for it: the Stop hook, the hub
+ * daemon and `backfill --detach` each spawn their child while holding a live,
+ * lock-holding connection, so no child can reset the index under them. A close
+ * there would add a WAL checkpoint and a re-open to every turn end.
+ *
+ * `getDb` re-opens lazily, so a later caller simply gets a fresh connection.
+ */
 export function closeDbBeforeChildSpawn(): void {
   try {
     closeDb();
-  } catch {
+  } catch (e) {
     // A failed close must never block the child: the spawn is the point.
+    log({
+      source: 'db',
+      level: 'warn',
+      summary: `DB: could not close before spawning a child: ${(e as Error).message}`,
+    });
   }
 }
 
@@ -423,6 +444,21 @@ function openDatabase(dbPath: string): RawDatabase {
     if (isBindingLoadError(e)) throw new BindingLoadError(dbPath, e as Error);
     throw e;
   }
+}
+
+/**
+ * The ONE native binding path this process may load.
+ *
+ * Every opener must use it. Two different `.node` files in one process are two
+ * dlopen'd copies of SQLite with independent unix-VFS state, and a `close()`
+ * in either copy drops the PROCESS's POSIX locks on that inode — including the
+ * shared DMS lock the other copy's live connection depends on. That is how the
+ * installer lost its lock while keeping its wal-index map (see
+ * `closeDbBeforeChildSpawn`). `installer/upgrade-migrate.ts openReadonly` and
+ * `installer/retrieval-class-migration.ts openRaw` call this for that reason.
+ */
+export function resolveNativeBindingPath(): string | null {
+  return resolveNativeBinding();
 }
 
 /**
