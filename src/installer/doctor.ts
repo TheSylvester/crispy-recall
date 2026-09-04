@@ -16,7 +16,7 @@ import { readConfig } from './config.js';
 import { integrityCheck } from './repair.js';
 import { detectStatusline } from './statusline-suggest.js';
 import { isBindingLoadError, CODEX_REKEY_MIGRATION_KEY, LEGACY_CODEX_ID_SQL } from '../db.js';
-import { binDir, dbPath, remoteRoot, statuslineScript } from '../paths.js';
+import { binDir, dbPath, logsDir, remoteRoot, statuslineScript } from '../paths.js';
 import { EMBED_VERSION } from '../recall/embed-config.js';
 import { META_RESIDUE_SQL } from '../recall/purge-meta.js';
 import { mirrorHostSummary, mirrorHosts } from '../hub/mirror.js';
@@ -152,6 +152,34 @@ export interface HubHostHealth {
   sidecarless: number;
 }
 
+/**
+ * Cross-host session-id collisions (spec S11, §2.5).
+ *
+ * The spec's `SELECT session_id, COUNT(DISTINCT transcript_path) … GROUP BY
+ * session_id HAVING c > 1` can never return a row: `session_provenance`
+ * declares `session_id` as the PRIMARY KEY (db.ts), so one id owns exactly
+ * one path by construction. A refused push, by design, writes NO provenance
+ * at all — the collision leaves no trace in that table.
+ *
+ * The evidence that DOES exist is what the daemon records when it refuses:
+ * the per-host `refusedCollisions` counter in `run/hub-hosts.json` and the
+ * `session-id collision …` lines in `logs/hub.log`. This report is built
+ * from those, plus an optional DB cross-check for the case where the log
+ * was rotated away.
+ */
+export interface HubCollisionReport {
+  /** Hosts with a non-zero refusal counter. */
+  refusedByHost: Array<{ host: string; count: number }>;
+  /** `session-id collision …` lines currently in hub.log. */
+  logLines: number;
+  /** The last 5 `sid=` values from those lines, oldest first. */
+  recentSessionIds: string[];
+  /** A watermark path for a session whose stored provenance names a DIFFERENT
+   *  path — the residue a refused push leaves if it ever reached a watermark.
+   *  Only computed on a hub that has satellite hosts. */
+  crossCheck: Array<{ sessionId: string; provenancePath: string; watermarkPath: string }>;
+}
+
 export interface HubHealth {
   /** Configured bind (null = no hub record in config.json). */
   bind: string | null;
@@ -159,9 +187,34 @@ export interface HubHealth {
   daemonAlive: boolean;
   daemonPid: number | null;
   hosts: HubHostHealth[];
-  /** `agent` sessions whose provenance names more than one transcript path. */
-  collisions: Array<{ sessionId: string; paths: string[] }>;
+  /** Cross-host session-id collision evidence (never a DB GROUP BY — see above). */
+  collisions: HubCollisionReport;
   warnings: string[];
+}
+
+const COLLISION_LINE = /session-id collision host=(\S+) sid=(\S+)/;
+
+/** Read the refusal evidence the daemon persists. Never throws. */
+export function readCollisionEvidence(): Pick<HubCollisionReport, 'refusedByHost' | 'logLines' | 'recentSessionIds'> {
+  const refusedByHost = Object.entries(readHostRecords())
+    .filter(([, r]) => (r.refusedCollisions ?? 0) > 0)
+    .map(([host, r]) => ({ host, count: r.refusedCollisions }))
+    .sort((a, b) => a.host.localeCompare(b.host));
+  let lines: string[] = [];
+  try {
+    lines = readFileSync(join(logsDir(), 'hub.log'), 'utf-8').split('\n').filter((l) => COLLISION_LINE.test(l));
+  } catch { /* no log yet */ }
+  const ids: string[] = [];
+  for (const l of lines) {
+    const m = COLLISION_LINE.exec(l);
+    if (m?.[2] && !ids.includes(m[2])) ids.push(m[2]);
+  }
+  return { refusedByHost, logLines: lines.length, recentSessionIds: ids.slice(-5) };
+}
+
+/** True when there is anything to report — printHub stays silent otherwise. */
+export function hasCollisionEvidence(c: HubCollisionReport): boolean {
+  return c.refusedByHost.length > 0 || c.logLines > 0 || c.crossCheck.length > 0;
 }
 
 /**
@@ -192,9 +245,13 @@ export function checkHubHealth(): HubHealth {
     if (h.sidecarless > 0) warnings.push(`host ${h.host}: ${h.sidecarless} mirror file(s) without a sidecar (project key will be NULL for them)`);
   }
 
-  const collisions: Array<{ sessionId: string; paths: string[] }> = [];
+  const evidence = readCollisionEvidence();
+  const crossCheck: HubCollisionReport['crossCheck'] = [];
   const dbFile = dbPath();
-  if (existsSync(dbFile)) {
+  // Gated on `hosts.length > 0`: the join is a scan, and a machine with no
+  // satellites can have no cross-host collision. This keeps `recall doctor`
+  // on a non-hub box exactly as cheap — and as quiet — as it was.
+  if (hosts.length > 0 && existsSync(dbFile)) {
     try {
       const localBinding = stagedBindingPath();
       const raw = existsSync(localBinding)
@@ -202,35 +259,52 @@ export function checkHubHealth(): HubHealth {
         : new Database(dbFile, { readonly: true, fileMustExist: true });
       try {
         const rows = raw.prepare(
-          `SELECT session_id, COUNT(DISTINCT transcript_path) c FROM session_provenance
-           WHERE kind='agent' GROUP BY session_id HAVING c > 1`,
-        ).all() as Array<{ session_id: string; c: number }>;
+          `SELECT p.session_id AS sid, p.transcript_path AS ppath, w.transcript_path AS wpath
+           FROM session_provenance p
+           JOIN ingest_watermark w
+             ON w.transcript_path != p.transcript_path
+            AND w.transcript_path LIKE '%/' || p.session_id || '.jsonl'`,
+        ).all() as Array<{ sid: string; ppath: string | null; wpath: string }>;
         for (const r of rows) {
-          const paths = (raw.prepare(
-            `SELECT DISTINCT transcript_path p FROM session_provenance WHERE session_id = ?`,
-          ).all(r.session_id) as Array<{ p: string | null }>).map((x) => x.p ?? '(null)');
-          collisions.push({ sessionId: r.session_id, paths });
+          crossCheck.push({ sessionId: r.sid, provenancePath: r.ppath ?? '(null)', watermarkPath: r.wpath });
         }
       } finally {
         raw.close();
       }
     } catch { /* pre-migration schema or unreadable DB — the binding section reports that */ }
   }
-  for (const c of collisions) {
-    warnings.push(`session-id collision: ${c.sessionId} → ${c.paths.join(' | ')}`);
+  const collisions: HubCollisionReport = { ...evidence, crossCheck };
+
+  for (const r of collisions.refusedByHost) {
+    warnings.push(
+      `host ${r.host}: ${r.count} push(es) refused as session-id collisions — those sessions are NOT indexed` +
+      (collisions.recentSessionIds.length ? ` (recent ids: ${collisions.recentSessionIds.join(', ')})` : ''),
+    );
+  }
+  if (collisions.refusedByHost.length === 0 && collisions.logLines > 0) {
+    warnings.push(
+      `${collisions.logLines} session-id collision line(s) in hub.log — those pushes were refused and are NOT indexed` +
+      (collisions.recentSessionIds.length ? ` (recent ids: ${collisions.recentSessionIds.join(', ')})` : ''),
+    );
+  }
+  for (const c of collisions.crossCheck) {
+    warnings.push(`session-id collision: ${c.sessionId} indexed from ${c.provenancePath}, also mirrored at ${c.watermarkPath}`);
   }
 
   return { bind, bindIsAny, daemonAlive: alive, daemonPid: record?.pid ?? null, hosts, collisions, warnings };
 }
 
-function printHub(h: HubHealth): void {
-  if (h.bind === null && h.hosts.length === 0 && !h.daemonAlive && h.collisions.length === 0) return;
+export function printHub(h: HubHealth): void {
+  if (h.bind === null && h.hosts.length === 0 && !h.daemonAlive && !hasCollisionEvidence(h.collisions)) return;
   console.log('\nHub (satellite mode)');
   console.log('--------------------');
   console.log(`Bind:           ${h.bind === null ? 'not configured' : (h.bind === '' ? "'' (ANY)" : h.bind)}${h.bindIsAny ? '  [ANY]' : ''}`);
   console.log(`Daemon:         ${h.daemonAlive ? `alive (pid ${h.daemonPid})` : 'not running'}`);
   for (const host of h.hosts) {
     console.log(`Host ${host.host}: files ${host.files}, last push ${host.lastPush ?? 'never'}, sidecar-less ${host.sidecarless}, daemon alive ${h.daemonAlive ? 'yes' : 'no'}`);
+  }
+  if (hasCollisionEvidence(h.collisions)) {
+    console.log(`Collisions:     ${h.collisions.logLines} logged, ${h.collisions.refusedByHost.reduce((n, r) => n + r.count, 0)} refused push(es)`);
   }
   for (const w of h.warnings) console.log(`  ⚠ ${w}`);
 }

@@ -15,6 +15,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { request as httpRequest, type IncomingHttpHeaders } from 'node:http';
+import { connect } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import Database from 'better-sqlite3';
@@ -201,13 +202,14 @@ export function req(url: string, o: ReqOptions): Promise<Resp> {
     }
     if (o.declareLength !== undefined) {
       // Deliberate early end: send what we have, then drop the socket. The
-      // server answers before the drop (413 from the header) or sees the
-      // truncation (400); a reset on our side is the expected outcome, never
-      // a rejection.
+      // server is expected to answer BEFORE the drop (413 from the header).
+      // The fallback status is -1, never a synthetic 400: a test that asserts
+      // a status here must be reading a real server response, not our own
+      // socket teardown. (For the half-close truncation case use `rawPut`.)
       let settled = false;
       const settle = (r2: Resp): void => { if (!settled) { settled = true; resolve(r2); } };
-      r.on('error', () => settle({ status: 400, headers: {}, text: '', json: () => ({} as never) }));
-      r.on('close', () => settle({ status: 400, headers: {}, text: '', json: () => ({} as never) }));
+      r.on('error', () => settle({ status: -1, headers: {}, text: '', json: () => ({} as never) }));
+      r.on('close', () => settle({ status: -1, headers: {}, text: '', json: () => ({} as never) }));
       r.on('response', (res) => {
         const chunks: Buffer[] = [];
         res.on('data', (c: Buffer) => chunks.push(c));
@@ -223,6 +225,42 @@ export function req(url: string, o: ReqOptions): Promise<Resp> {
     r.on('error', reject);
     if (body !== undefined) r.write(body);
     r.end();
+  });
+}
+
+/**
+ * Raw-socket PUT with a Content-Length the body deliberately does not reach,
+ * then a HALF-CLOSE (`end()`, never `destroy()`), so the server sees the
+ * truncation and its answer is still deliverable on the socket. Returns the
+ * raw response bytes (empty string when the server answered nothing).
+ */
+export function rawPutShortBody(
+  port: number,
+  path: string,
+  headers: Record<string, string>,
+  declaredLength: number,
+  partial: string,
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const socket = connect({ host: '127.0.0.1', port });
+    let raw = '';
+    socket.setEncoding('utf8');
+    socket.on('data', (c: string) => { raw += c; });
+    socket.on('error', reject);
+    socket.on('close', () => resolve(raw));
+    socket.on('connect', () => {
+      const lines = [
+        `PUT ${path} HTTP/1.1`,
+        'host: 127.0.0.1',
+        ...Object.entries(headers).map(([k, v]) => `${k}: ${v}`),
+        `content-length: ${declaredLength}`,
+        '', '',
+      ];
+      socket.write(lines.join('\r\n'));
+      socket.write(partial);
+      socket.end(); // half-close: FIN only, the response can still arrive
+    });
+    setTimeout(() => { socket.destroy(); resolve(raw); }, 10_000).unref();
   });
 }
 

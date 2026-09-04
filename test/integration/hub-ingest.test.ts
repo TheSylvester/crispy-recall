@@ -13,7 +13,7 @@
  * CODEX_HOME: <tmp>/codex }; a child that inherits the parent env resolves
  * `recallRoot()` to the live ~/.recall (paths.ts:35-40).
  */
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir, platform } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -29,7 +29,7 @@ import { runMirrorSweep } from '../../src/hub/sweep.js';
 import { startHubServer } from '../../src/hub/server.js';
 import { issueHubToken } from '../../src/hub/tokens.js';
 import { repairFull } from '../../src/installer/repair.js';
-import { checkHubHealth } from '../../src/installer/doctor.js';
+import { checkHubHealth, hasCollisionEvidence, printHub } from '../../src/installer/doctor.js';
 import { writeHubConfig } from '../../src/installer/config.js';
 import { appendPath, authHeaders, claudeEntry, codexRollout, metaHeader, req } from './helpers/hub-harness.js';
 
@@ -58,6 +58,13 @@ function stageMirror(host: string, rel: string, body: string, meta: PushIngestJo
   writeSidecar(abs, { host, ...(meta.cwd !== undefined ? { cwd: meta.cwd } : {}), ...(meta.key !== undefined ? { key: meta.key } : {}), ...(meta.hook ? { hook: meta.hook } : {}), updatedAt: new Date().toISOString(), v: 1 });
   const st = statSync(abs);
   return { host, vendor, rel, abs, mtimeInt: Math.floor(st.mtimeMs), size: st.size, meta, reset: false };
+}
+
+function capture(fn: () => void): string {
+  const lines: string[] = [];
+  const spy = vi.spyOn(console, 'log').mockImplementation((...a: unknown[]) => { lines.push(a.join(' ')); });
+  try { fn(); } finally { spy.mockRestore(); }
+  return lines.join('\n');
 }
 
 function snapshot(): string {
@@ -175,16 +182,23 @@ describe.skipIf(win32)('runPushIngest (§2.4)', () => {
     expect(d.embeds).toEqual([]);
     // The sweep applies the same guard: the refused file is never merged.
     const sweep = await runMirrorSweep();
-    expect(sweep.failed).toBeGreaterThanOrEqual(1);
+    // A refusal is PERMANENT, so it is counted apart from `failed` (retry me).
+    expect(sweep.refused).toBe(1);
+    expect(sweep.failed).toBe(0);
     expect(JSON.stringify({
       m: db.all('SELECT * FROM messages WHERE session_id = ? ORDER BY message_id', [sid]),
       p: db.all('SELECT * FROM session_provenance WHERE session_id = ?', [sid]),
     })).toBe(before);
     expect(db.get('SELECT 1 AS x FROM ingest_watermark WHERE transcript_path = ?', [job.abs])).toBeUndefined();
-    const logged = readFileSync(join(recallRoot(), 'logs', 'hub.log'), 'utf-8').split('\n').filter((l) => l.includes(`sid=${sid}`) && l.includes('source=scan'));
-    expect(logged).toHaveLength(1);
-    await runMirrorSweep();
-    expect(readFileSync(join(recallRoot(), 'logs', 'hub.log'), 'utf-8').split('\n').filter((l) => l.includes(`sid=${sid}`) && l.includes('source=scan'))).toHaveLength(1);
+    const collisionLine = () => readFileSync(join(recallRoot(), 'logs', 'hub.log'), 'utf-8')
+      .split('\n').filter((l) => l.includes(`sid=${sid}`) && l.includes('source=scan'));
+    expect(collisionLine()).toHaveLength(1);
+    // A second sweep reports the same refusal and adds NO new log line: a
+    // permanent refusal must not spam hub.log every five minutes.
+    const second = await runMirrorSweep();
+    expect(second.refused).toBe(1);
+    expect(second.failed).toBe(0);
+    expect(collisionLine()).toHaveLength(1);
   });
 
   it('a same-host re-push of a known session is not a collision', async () => {
@@ -326,15 +340,10 @@ describe.skipIf(win32)('in-process daemon: collision through the wire increments
 });
 
 describe.skipIf(win32)('doctor hub section', () => {
-  it('warns on a mirror with no live daemon, on an ANY bind, and lists agent collisions', () => {
+  it('warns on a mirror with no live daemon and on an ANY bind', () => {
     mkdirSync(transcriptGlob(remoteRoot(), 'sat9', 'claude', 'projects', 'p'), { recursive: true });
     writeFileSync(transcriptGlob(remoteRoot(), 'sat9', 'claude', 'projects', 'p', 'no-sidecar.jsonl'), 'x\n');
     writeHubConfig({ bind: '', port: 7877, installedAt: 'x' });
-    const db = getDb(dbPath());
-    const now = Date.now();
-    db.run(`INSERT OR REPLACE INTO session_provenance (session_id, vendor, kind, transcript_path, updated_at) VALUES ('agent-dup0001','claude','agent','/a/one.jsonl',?)`, [now]);
-    // A second path for the same agent id can only come from a different provenance row shape; simulate via a
-    // distinct session row sharing the id is impossible (PK), so use the aliases-free path: two rows differ by case.
     _resetDb();
     const h = checkHubHealth();
     expect(h.daemonAlive).toBe(false);
@@ -342,6 +351,31 @@ describe.skipIf(win32)('doctor hub section', () => {
     expect(h.hosts.find((x) => x.host === 'sat9')).toMatchObject({ files: 1, sidecarless: 1 });
     expect(h.warnings.some((w) => w.includes('recall hub serve'))).toBe(true);
     expect(h.warnings.some((w) => w.includes('every interface'))).toBe(true);
-    expect(Array.isArray(h.collisions)).toBe(true);
+  });
+
+  it('reports collisions from the refusal evidence the daemon persists, naming the host and the ids', () => {
+    // The earlier suites in this file left both artifacts behind: the
+    // in-process daemon incremented `refusedCollisions` for `wirehost`, and
+    // the sweep guard wrote `session-id collision … source=scan` to hub.log.
+    const hosts = JSON.parse(readFileSync(join(recallRoot(), 'run', 'hub-hosts.json'), 'utf-8')) as Record<string, { refusedCollisions: number }>;
+    expect(hosts['wirehost']!.refusedCollisions).toBe(1);
+    const logIds = readFileSync(join(recallRoot(), 'logs', 'hub.log'), 'utf-8')
+      .split('\n').filter((l) => /session-id collision host=/.test(l))
+      .map((l) => /sid=(\S+)/.exec(l)![1]!);
+    expect(logIds.length).toBeGreaterThan(0);
+
+    const h = checkHubHealth();
+    expect(h.collisions.refusedByHost).toEqual([{ host: 'wirehost', count: 1 }]);
+    expect(h.collisions.logLines).toBe(logIds.length);
+    expect(h.collisions.recentSessionIds).toEqual(logIds.slice(-5));
+    expect(hasCollisionEvidence(h.collisions)).toBe(true);
+    const warning = h.warnings.find((w) => w.includes('refused as session-id collisions'));
+    expect(warning).toBeDefined();
+    expect(warning).toContain('wirehost');
+    expect(warning).toContain(logIds[logIds.length - 1]!);
+    // The printed section names the evidence too.
+    const printed = capture(() => printHub(h));
+    expect(printed).toContain('Collisions:');
+    expect(printed).toContain('wirehost');
   });
 });

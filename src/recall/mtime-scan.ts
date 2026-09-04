@@ -39,6 +39,10 @@ export interface ScanResult {
   scanned: number;
   unchanged: number;
   ingested: number;
+  /** Files a `guard` vetoed (the hub's cross-host collision refusal). A
+   *  refusal is PERMANENT until the operator acts, so it is counted apart
+   *  from `failed`, which means "retry me on the next sweep". */
+  refused: number;
   failed: number;
 }
 
@@ -82,7 +86,7 @@ export async function mtimeScan(opts?: MtimeScanOptions): Promise<ScanResult> {
     watermarks.set(row.transcript_path, row);
   }
 
-  const result: ScanResult = { scanned: 0, unchanged: 0, ingested: 0, failed: 0 };
+  const result: ScanResult = { scanned: 0, unchanged: 0, ingested: 0, refused: 0, failed: 0 };
 
   for (const [pattern, vendor] of patterns) {
     const files = await glob(pattern, { nodir: true });
@@ -101,9 +105,12 @@ export async function mtimeScan(opts?: MtimeScanOptions): Promise<ScanResult> {
         let refusal: string | null = null;
         try { refusal = opts.guard(file, vendor); } catch (e) { refusal = (e as Error).message; }
         if (refusal !== null) {
-          result.failed++;
+          result.refused++;
+          // DEBUG, not warn: a refusal is permanent, so every sweep would
+          // re-log it forever. The durable record is the guard's own
+          // once-per-path `session-id collision … source=scan` hub.log line.
           log({
-            level: 'warn',
+            level: 'debug',
             source: 'recall:mtime-scan',
             summary: `Ingest refused, watermark not advanced: ${file}`,
             data: { path: file, vendor, reason: refusal },

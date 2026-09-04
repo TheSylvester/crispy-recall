@@ -10,7 +10,7 @@
  * CODEX_HOME: <tmp>/codex }; a child that inherits the parent env resolves
  * `recallRoot()` to the live ~/.recall (paths.ts:35-40).
  */
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir, platform } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -55,6 +55,23 @@ describe('sandbox guard', () => {
   it('recallRoot() and remoteRoot() sit under tmpdir before any write', () => {
     expect(resolve(recallRoot()).startsWith(resolve(tmpdir()))).toBe(true);
     expect(resolve(remoteRoot()).startsWith(resolve(tmpdir()))).toBe(true);
+  });
+});
+
+describe('doctor hub section on a machine with no mirror', () => {
+  it('stays byte-identical to a hub-free doctor: no evidence, no warnings, no printed section', async () => {
+    const { checkHubHealth, hasCollisionEvidence, printHub } = await import('../../src/installer/doctor.js');
+    const h = checkHubHealth();
+    expect(h.hosts).toEqual([]);
+    expect(h.bind).toBeNull();
+    expect(h.daemonAlive).toBe(false);
+    expect(h.collisions).toEqual({ refusedByHost: [], logLines: 0, recentSessionIds: [], crossCheck: [] });
+    expect(hasCollisionEvidence(h.collisions)).toBe(false);
+    expect(h.warnings).toEqual([]);
+    const lines: string[] = [];
+    const spy = vi.spyOn(console, 'log').mockImplementation((...a: unknown[]) => { lines.push(a.join(' ')); });
+    try { printHub(h); } finally { spy.mockRestore(); }
+    expect(lines).toEqual([]); // the section prints NOTHING — same bytes as before the hub existed
   });
 });
 

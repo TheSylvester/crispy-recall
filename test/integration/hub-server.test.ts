@@ -20,8 +20,8 @@ import { randomUUID } from 'node:crypto';
 
 import {
   CLI_BUNDLE, NODE, appendPath, authHeaders, claudeEntry, cli, createDb, dbRows, hostRecords, hubLogLines,
-  issueToken, makeSandbox, metaHeader, readHubJson, req, sleep, stageFakeBackend, stagePlaceholders,
-  startDaemon, waitFor, type Daemon, type Sandbox,
+  issueToken, makeSandbox, metaHeader, rawPutShortBody, readHubJson, req, sleep, stageFakeBackend,
+  stagePlaceholders, startDaemon, waitFor, type Daemon, type Sandbox,
 } from './helpers/hub-harness.js';
 
 const win32 = platform() === 'win32';
@@ -105,16 +105,52 @@ describe.skipIf(win32)('hub daemon — push endpoints', () => {
     expect(() => process.kill(pidBefore, 0)).not.toThrow();
   });
 
-  it('append: 411 without Content-Length, 413 above 8 MiB (from the header), 400 on early end', async () => {
+  it('append: 411 without Content-Length, 413 above 8 MiB (from the header)', async () => {
     const path = appendPath('claude', `projects/-p/${randomUUID()}.jsonl`, 0);
     const h = authHeaders(token, { 'x-recall-meta': metaHeader({ cwd: '/home/x/proj' }) });
     expect((await req(d.url, { method: 'PUT', path, headers: h, body: 'x', chunked: true })).status).toBe(411);
     const big = await req(d.url, { method: 'PUT', path, headers: h, body: 'x', declareLength: 8 * 1024 * 1024 + 1 });
-    expect(big.status).toBe(413);
-    const short = await req(d.url, { method: 'PUT', path, headers: h, body: 'abc', declareLength: 100 });
-    expect(short.status).toBe(400);
-    // The file was never created by any of the three.
+    expect(big.status).toBe(413); // answered from the header, before any byte was read
     expect(existsSync(join(sb.remote, 'sat1', 'claude', 'projects', '-p'))).toBe(false);
+  });
+
+  it('append: a body that ends before Content-Length gets a real 400 on the wire', async () => {
+    // Asserted at the socket, not through the client helper: a helper that
+    // settles its own status on `close` would pass whether or not the daemon
+    // ever answered. Half-close (FIN), never destroy, so the response is
+    // still deliverable.
+    const rel = `projects/-short/${randomUUID()}.jsonl`;
+    const raw = await rawPutShortBody(
+      d.port,
+      appendPath('claude', rel, 0),
+      authHeaders(token, { 'x-recall-meta': metaHeader({ cwd: '/home/x/proj' }) }),
+      100,
+      'abc',
+    );
+    // A real 400 from the daemon's socket, whichever layer produced it: node's
+    // own parser answers the truncated message first here, and the handler's
+    // `body ended before Content-Length bytes` covers the case where it does
+    // not. What matters is that SOMETHING answered — the client helper's
+    // fallback is -1, so it can no longer masquerade as this.
+    expect(raw.startsWith('HTTP/1.1 400')).toBe(true);
+    expect(raw.length).toBeGreaterThan(0);
+    expect(existsSync(join(sb.remote, 'sat1', 'claude', 'projects', '-short'))).toBe(false);
+  });
+
+  it('an oversize X-Recall-Meta is answered 400 by decodeMeta, never 431 by the header budget', async () => {
+    const rel = `projects/-meta/${randomUUID()}.jsonl`;
+    // Just over the 16 KiB DECODED cap → ~22 KiB on the wire, past node's
+    // 16 KiB default header budget (which would answer 431 with no body).
+    const over = metaHeader({ cwd: '/home/x/proj', key: `path:/${'p'.repeat(16 * 1024)}` });
+    expect(over.length).toBeGreaterThan(16 * 1024);
+    const r = await req(d.url, { method: 'PUT', path: appendPath('claude', rel, 0), headers: authHeaders(token, { 'x-recall-meta': over }), body: 'x\n' });
+    expect(r.status).toBe(400);
+    expect(r.json().error).toContain('16384 bytes decoded');
+    // Well under the cap still succeeds, proving the budget was raised and not just the error path.
+    const under = metaHeader({ cwd: '/home/x/proj', key: `path:/${'p'.repeat(8 * 1024)}` });
+    expect(under.length).toBeGreaterThan(8 * 1024);
+    const ok = await req(d.url, { method: 'PUT', path: appendPath('claude', rel, 0), headers: authHeaders(token, { 'x-recall-meta': under }), body: 'x\n' });
+    expect(ok.status).toBe(200);
   });
 
   it('append: 400 on every path rule, bad meta, bad offset, bad vendor', async () => {
@@ -368,6 +404,83 @@ describe.skipIf(win32)('hub daemon — scope proof with a recording CLI stub', (
     const noKey = await spawned({ argv: ['walrus'], cwd: '/home/x/proj' });
     expect(noKey.argv).toEqual(['walrus', '--project', '/home/x/proj', '--no-catchup']);
   });
+});
+
+/** Sandbox + in-process daemon with the process root pointed at it. */
+async function withInProcessHub(
+  prefix: string,
+  make: (sb: Sandbox) => Promise<{ handle: Awaited<ReturnType<typeof import('../../src/hub/server.js')['startHubServer']>>; token: string }>,
+  body: (ctx: { url: string; token: string; sb: Sandbox; handle: Awaited<ReturnType<typeof import('../../src/hub/server.js')['startHubServer']>> }) => Promise<void>,
+): Promise<void> {
+  const { _setTestRoot } = await import('../../src/paths.js');
+  const sb = makeSandbox(prefix);
+  const restore = _setTestRoot(sb.recallHome);
+  const prev: Record<string, string | undefined> = {};
+  for (const k of ['CLAUDE_CONFIG_DIR', 'CODEX_HOME', 'RECALL_REMOTE_ROOT']) prev[k] = process.env[k];
+  process.env['CLAUDE_CONFIG_DIR'] = sb.claude;
+  process.env['CODEX_HOME'] = sb.codex;
+  process.env['RECALL_REMOTE_ROOT'] = sb.remote;
+  try {
+    const { handle, token } = await make(sb);
+    try {
+      await body({ url: `http://127.0.0.1:${handle.port}`, token, sb, handle });
+    } finally {
+      await handle.stop();
+    }
+  } finally {
+    restore();
+    for (const [k, v] of Object.entries(prev)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+    sb.cleanup();
+  }
+}
+
+describe.skipIf(win32)('hub daemon — query concurrency limits (in-process seam)', () => {
+  it('503 once the wait queue is full', async () => {
+    const { startHubServer } = await import('../../src/hub/server.js');
+    const { QueryRunner } = await import('../../src/hub/query.js');
+    const { issueHubToken } = await import('../../src/hub/tokens.js');
+    await withInProcessHub('recall-hub-503-', async (sb) => {
+      const stub = join(sb.tmp, 'slow.js');
+      writeFileSync(stub, "setTimeout(() => process.stdout.write('done'), 800);\n");
+      const handle = await startHubServer({
+        bind: '127.0.0.1', port: 0, sweepMs: null, startupSweep: false,
+        queryRunner: new QueryRunner({ concurrency: 1, depth: 1, cli: () => stub }),
+      });
+      return { handle, token: issueHubToken('busy') };
+    }, async ({ url, token }) => {
+      const fire = () => req(url, { method: 'POST', path: '/v1/query', headers: authHeaders(token), body: JSON.stringify({ argv: ['q'], cwd: '/p' }) });
+      // 1 runs, 2 waits (depth 1 filled), 3 has nowhere to wait.
+      const [a, b, c] = await Promise.all([fire(), sleep(80).then(fire), sleep(160).then(fire)]);
+      const statuses = [a.status, b.status, c.status].sort();
+      expect(statuses).toEqual([200, 200, 503]);
+      expect(c.status).toBe(503);
+      expect(c.json().error).toContain('queue full');
+    });
+  }, 30_000);
+
+  it('504 after the timeout, and the spawned child is killed', async () => {
+    const { startHubServer } = await import('../../src/hub/server.js');
+    const { QueryRunner } = await import('../../src/hub/query.js');
+    const { issueHubToken } = await import('../../src/hub/tokens.js');
+    await withInProcessHub('recall-hub-504-', async (sb) => {
+      const pidFile = join(sb.tmp, 'child.pid');
+      const stub = join(sb.tmp, 'hang.js');
+      writeFileSync(stub, `require('fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));\nsetInterval(() => {}, 1000);\n`);
+      const handle = await startHubServer({
+        bind: '127.0.0.1', port: 0, sweepMs: null, startupSweep: false,
+        queryRunner: new QueryRunner({ timeoutMs: 300, cli: () => stub }),
+      });
+      return { handle, token: issueHubToken('hang') };
+    }, async ({ url, token, sb }) => {
+      const r = await req(url, { method: 'POST', path: '/v1/query', headers: authHeaders(token), body: JSON.stringify({ argv: ['q'], cwd: '/p' }) });
+      expect(r.status).toBe(504);
+      expect(r.json().error).toContain('timed out');
+      const pid = Number(readFileSync(join(sb.tmp, 'child.pid'), 'utf-8'));
+      expect(pid).toBeGreaterThan(0);
+      expect(await waitFor(() => { try { process.kill(pid, 0); return false; } catch { return true; } })).toBe(true);
+      expect(hubLogLines(sb).some((l) => l.includes('query host=hang timeout'))).toBe(true);
+    });
+  }, 30_000);
 });
 
 describe.skipIf(win32)('hub daemon — queue drain and X-Recall-Stale (in-process seam)', () => {

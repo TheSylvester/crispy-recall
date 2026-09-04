@@ -374,7 +374,11 @@ export async function startHubServer(opts: HubServerOptions): Promise<HubHandle>
     return handleQuery(req, res, host);
   }
 
-  const server = createServer((req, res) => {
+  // 64 KiB header budget: an oversize `X-Recall-Meta` must reach the handler
+  // and be answered 400 by `decodeMeta`, not cut off by node's 16 KiB default
+  // as a 431 (base64url inflates the 16 KiB decoded cap to ~21.8 KiB on the
+  // wire).
+  const server = createServer({ maxHeaderSize: 64 * 1024 }, (req, res) => {
     handle(req, res).catch((e) => {
       hubLog(`request-error ${(e as Error).message}`);
       try { sendJson(res, 500, { error: 'internal error' }); } catch { /* socket gone */ }
@@ -393,11 +397,11 @@ export async function startHubServer(opts: HubServerOptions): Promise<HubHandle>
       queue.enqueue(null, async () => {
         try {
           const r = await runMirrorSweep();
-          hubLog(`sweep reason=${reason} scanned=${r.scanned} unchanged=${r.unchanged} ingested=${r.ingested} failed=${r.failed}`);
+          hubLog(`sweep reason=${reason} scanned=${r.scanned} unchanged=${r.unchanged} ingested=${r.ingested} refused=${r.refused} failed=${r.failed}`);
           resolve(r);
         } catch (e) {
           hubLog(`sweep-failed reason=${reason} err=${(e as Error).message}`);
-          resolve({ scanned: 0, unchanged: 0, ingested: 0, failed: 1 });
+          resolve({ scanned: 0, unchanged: 0, ingested: 0, refused: 0, failed: 1 });
         }
       });
     });
