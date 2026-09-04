@@ -172,6 +172,57 @@ export function mergeStopHook(filePath: string, hookScriptPath: string): MergeRe
 }
 
 /**
+ * Pin Claude Code's transcript retention (spec §3.1, Retention).
+ *
+ * A satellite's hard loss window IS its transcript retention: the files on
+ * disk are the push spool, so anything Claude Code deletes can never reach the
+ * hub. Raise `cleanupPeriodDays` to `floor` (999) when it is absent or lower.
+ *
+ * Table:
+ *   absent          → set, backup taken
+ *   numeric < floor → set, backup taken
+ *   numeric ≥ floor → unchanged, NO backup (the user chose a longer window)
+ *   non-numeric     → UNTOUCHED, `warning` set (never rewrite a value we did
+ *                     not author; the operator decides)
+ *   unparseable file→ UNTOUCHED, `warning` set
+ */
+export interface RetentionResult extends MergeResult { warning?: string }
+
+export function ensureCleanupPeriodDays(filePath: string, floor = 999): RetentionResult {
+  const exists = existsSync(filePath);
+  const raw = exists ? readFileSync(filePath, 'utf-8') : null;
+  let obj: SettingsShape;
+  if (raw && raw.trim().length > 0) {
+    try {
+      obj = parseTolerant(raw);
+    } catch {
+      return { changed: false, warning: `${filePath} is not parseable JSON — left cleanupPeriodDays alone` };
+    }
+    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) {
+      return { changed: false, warning: `${filePath} is not a JSON object — left cleanupPeriodDays alone` };
+    }
+  } else {
+    obj = {};
+  }
+
+  const current = obj['cleanupPeriodDays'];
+  if (current !== undefined && typeof current !== 'number') {
+    return {
+      changed: false,
+      warning: `cleanupPeriodDays in ${filePath} is not a number (${JSON.stringify(current)}) — left it alone; ` +
+        `set it to ${floor} yourself so transcripts survive long enough to reach the hub`,
+    };
+  }
+  if (typeof current === 'number' && current >= floor) return { changed: false };
+
+  obj['cleanupPeriodDays'] = floor;
+  let backup: string | undefined;
+  if (exists) backup = backupFile(filePath);
+  writeFileAtomic(filePath, serialize(obj, raw));
+  return backup ? { changed: true, backup } : { changed: true };
+}
+
+/**
  * Remove recall Stop + SubagentStop entries from `filePath` (path-independent).
  * Drops a now-empty Stop/SubagentStop key. Leaves everything else alone.
  */

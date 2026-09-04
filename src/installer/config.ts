@@ -48,11 +48,26 @@ export interface RecallConfig {
     priorStatusLine: { type?: string; command?: string } | null;
     installedAt: string; // ISO
   };
+  /** Satellite-mode record (spec §3.1). Present ⇒ this machine has NO local
+   *  database: every query is forwarded to `hubUrl` and every transcript is
+   *  pushed there. The bearer token is NEVER stored here — it lives only in
+   *  `~/.recall/satellite-token` (0600). */
+  satellite?: {
+    hubUrl: string;
+    /** Host name the hub derived from the token and returned on the manifest. */
+    host: string;
+    installedAt: string; // ISO
+  };
 }
 
 /** Absolute path to ~/.recall/config.json. */
 export function configPath(): string {
   return join(recallRoot(), 'config.json');
+}
+
+/** Absolute path to ~/.recall/satellite-token (mode 0600; the ONLY copy). */
+export function satelliteTokenPath(): string {
+  return join(recallRoot(), 'satellite-token');
 }
 
 /** Read the full config, or null if absent/unparseable. */
@@ -121,6 +136,51 @@ export function clearStatuslineConfig(): void {
     level: 'info',
     summary: 'config.json statusline record cleared',
   });
+}
+
+/** What a satellite needs to talk to its hub. `token` is null when the token
+ *  file is missing — doctor reports that; the CLI still forwards and gets 401. */
+export interface SatelliteConfig {
+  hubUrl: string;
+  host: string;
+  token: string | null;
+}
+
+/**
+ * Read the satellite record, or null when this machine is a hub.
+ *
+ * THE satellite-mode predicate: `recall.js`, the Stop hook, `doctor`, `status`
+ * and `push-pending` all branch on a non-null return. Cheap and synchronous
+ * (one config read plus one token read) so the Stop hook can call it before
+ * anything else.
+ */
+export function readSatelliteConfig(): SatelliteConfig | null {
+  const sat = readConfig()?.satellite;
+  if (!sat || typeof sat.hubUrl !== 'string' || sat.hubUrl.length === 0) return null;
+  let token: string | null = null;
+  try {
+    const raw = readFileSync(satelliteTokenPath(), 'utf-8').trim();
+    if (raw.length > 0) token = raw;
+  } catch { /* absent/unreadable → null, doctor reports it */ }
+  return { hubUrl: sat.hubUrl, host: typeof sat.host === 'string' ? sat.host : '', token };
+}
+
+/**
+ * Write the satellite record, merging over any existing config. Mirrors
+ * writeStatuslineConfig. Never writes the token.
+ */
+export function writeSatelliteConfig(satellite: NonNullable<RecallConfig['satellite']>): RecallConfig {
+  const p = configPath();
+  mkdirSync(dirname(p), { recursive: true });
+  const existing = readConfig() ?? {};
+  const merged: RecallConfig = { ...existing, satellite };
+  writeFileAtomic(p, JSON.stringify(merged, null, 2) + '\n');
+  log({
+    source: 'installer/config',
+    level: 'info',
+    summary: `config.json written (satellite.hubUrl=${satellite.hubUrl}, host=${satellite.host})`,
+  });
+  return merged;
 }
 
 /**

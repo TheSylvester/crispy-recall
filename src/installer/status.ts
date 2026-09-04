@@ -14,9 +14,23 @@ import { dbPath, runDir } from '../paths.js';
 import { getEmbeddingGapStats, getEmbedVersionStats } from '../recall/message-store.js';
 import type { EmbedVersionStats } from '../recall/message-store.js';
 import { EMBED_VERSION } from '../recall/embed-config.js';
-import { readEmbedderConfig } from './config.js';
+import { readEmbedderConfig, readSatelliteConfig } from './config.js';
+import { summarizePushLog } from '../satellite/push.js';
+import { logsDir } from '../paths.js';
+
+/** What `recall status` prints on a satellite: everything resolvable LOCALLY,
+ *  so `getStatus()` stays synchronous (printStatus calls it synchronously and
+ *  `pending bytes` needs a hub round-trip — that is a doctor line). */
+export interface SatelliteStatusReport {
+  mode: 'satellite';
+  hubUrl: string;
+  host: string;
+  tokenPresent: boolean;
+  lastPush: string | null;
+}
 
 export interface StatusReport {
+  mode?: 'hub';
   dbPath: string;
   dbSizeBytes: number;
   /** HOT (canonical, searchable) messages — the retrieval/embedding denominator. */
@@ -33,7 +47,24 @@ export interface StatusReport {
   embedder: 'gpu' | 'cpu';
 }
 
-export function getStatus(): StatusReport {
+export function getStatus(): StatusReport | SatelliteStatusReport {
+  // BEFORE getDb: opening the database here would CREATE one on a machine that
+  // must never have one (spec §3.1).
+  const sat = readSatelliteConfig();
+  if (sat) {
+    let lastPush: string | null = null;
+    try {
+      lastPush = summarizePushLog(readFileSync(join(logsDir(), 'push.log'), 'utf-8')).lastPush;
+    } catch { /* no pushes yet */ }
+    return {
+      mode: 'satellite',
+      hubUrl: sat.hubUrl,
+      host: sat.host,
+      tokenPresent: sat.token !== null,
+      lastPush,
+    };
+  }
+
   const d = getDb(dbPath());
   const counts = d.get(
     `SELECT
@@ -61,6 +92,7 @@ export function getStatus(): StatusReport {
   }
 
   return {
+    mode: 'hub',
     dbPath: dbPath(),
     dbSizeBytes,
     messageCount,
@@ -78,6 +110,16 @@ export function printStatus(json: boolean): void {
   const s = getStatus();
   if (json) {
     console.log(JSON.stringify(s, null, 2));
+    return;
+  }
+  if (s.mode === 'satellite') {
+    console.log('recall status (satellite)');
+    console.log('-------------------------');
+    console.log(`Hub:           ${s.hubUrl}`);
+    console.log(`Host:          ${s.host || 'unknown'}`);
+    console.log(`Token:         ${s.tokenPresent ? 'present' : 'MISSING — run `recall install --hub … --token …`'}`);
+    console.log(`Last push:     ${s.lastPush ?? 'never'}`);
+    console.log('No local database — queries run on the hub.');
     return;
   }
   const mb = (s.dbSizeBytes / (1024 * 1024)).toFixed(1);

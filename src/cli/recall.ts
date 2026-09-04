@@ -42,6 +42,7 @@ import {
   type SessionMatch,
 } from '../git-attribution.js';
 import { renderStatuslineSegment, type StatuslineInput } from '../recall/statusline-segment.js';
+import { readSatelliteConfig, type SatelliteConfig } from '../installer/config.js';
 import { mkdirSync, openSync, writeFileSync, readFileSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { join } from 'node:path';
@@ -167,7 +168,11 @@ function resolveProjectScope(): ProjectScope {
 
 // Collect positional args (skip flags and their values)
 // --commit / --blame consume positionals separately below.
-const FLAG_WITH_VALUE = new Set(['--limit', '--offset', '--since', '--until', '--project', '--project-key', '--vendor', '--commit']);
+const FLAG_WITH_VALUE = new Set([
+  '--limit', '--offset', '--since', '--until', '--project', '--project-key', '--vendor', '--commit',
+  // satellite mode (spec §3.4)
+  '--hub', '--token', '--named',
+]);
 const FLAG_BOOLEAN = new Set([
   '--raw', '--raw-messages', '--no-idf',
   '--help', '-h', '--version', '-v', '--list', '--all', '--reverse', '--recent', '--blame',
@@ -205,7 +210,66 @@ function getVersion(): string {
   }
 }
 
+/** Satellite record, resolved at most ONCE per process (spec §3.4). */
+let satelliteCache: SatelliteConfig | null | undefined;
+function satellite(): SatelliteConfig | null {
+  if (satelliteCache === undefined) satelliteCache = readSatelliteConfig();
+  return satelliteCache;
+}
+
+/** Help for a satellite: no local index, so no backfill/repair/runtime flags. */
+function printSatelliteHelp(sat: SatelliteConfig) {
+  console.log(`
+recall — satellite of ${sat.hubUrl} (host ${sat.host || 'unknown'}).
+
+This machine keeps no index. Transcripts are pushed to the hub and every
+query runs there; output and exit codes are relayed unchanged.
+
+USAGE
+  recall "query"                     Search sessions on the hub
+  recall search <terms…>             Search explicitly
+  recall <session-id> [<message-id>] Read messages from a session
+  recall read <session-ref> [<message-ref>]
+  recall --list                      List recent sessions
+  recall --commit <hash>             Sessions that produced a commit (LOCAL sessions only)
+  recall --blame <path>[:<line>[-<line>]]…   (LOCAL sessions only)
+  recall push [--full]               Push pending transcripts to the hub now
+  recall install --hub <url> --token <t>     (Re)register this satellite
+  recall doctor                      Hub reachability, auth, retention, pending bytes
+  recall status                      Satellite summary
+  recall uninstall [--purge]         Remove hooks, skill and the hub token
+
+FLAGS
+  --limit N        Max results for search/list modes
+  --offset N       Continue reading from this message sequence number
+  --since DATE     Only sessions after this date (ISO-8601)
+  --until DATE     Only sessions before this date (ISO-8601)
+  --project PATH   Scope to a specific project path (default: CWD)
+  --all            Search across all projects
+  --recent         Strongly boost recent sessions in search ranking
+  --reverse        Read session messages newest-first
+  --raw            Output raw JSON instead of formatted tables
+  --raw-messages   Output the FULL pre-shaping per-message ranked list as JSON
+  --no-idf         Bypass the FTS5 IDF high-frequency-term filter
+  --list           List sessions mode
+  --help, -h       Show this help
+  --version, -v    Print the recall version
+
+INSTALL FLAGS (with 'recall install')
+  --hub URL        Hub base URL, e.g. http://100.79.117.97:7877
+  --token T        Bearer token for that hub ('-' reads one line from stdin;
+                   RECALL_HUB_TOKEN is also honored). Stored 0600 in
+                   ~/.recall/satellite-token and never printed.
+  --yes            Accept the manifest without prompting
+
+NOT AVAILABLE HERE
+  recall backfill, recall repair, recall hub — there is no local database.
+`);
+}
+
 function printHelp() {
+  const sat = satellite();
+  if (sat) { printSatelliteHelp(sat); return; }
   console.log(`
 recall — Unified CLI — session transcript memory.
 
@@ -1194,6 +1258,8 @@ async function runInstallerSubcommand(cmd: string): Promise<void> {
       noBackfill: hasFlag('--no-backfill'),
       autoBackfill: hasFlag('--auto-backfill'),
       json,
+      ...(flagValue('--hub') ? { hub: flagValue('--hub')! } : {}),
+      ...(flagValue('--token') ? { token: flagValue('--token')! } : {}),
     });
     if (json) console.log(JSON.stringify(res, null, 2));
     exit(res.aborted ? 1 : 0);
@@ -1281,6 +1347,82 @@ async function runStatuslineSubcommand(): Promise<void> {
   exit(0);
 }
 
+// ---------------------------------------------------------------------------
+// Satellite mode (spec §3.4)
+// ---------------------------------------------------------------------------
+
+/** Run a push in this process (no spawn) — `recall push` and the inline flush. */
+async function runPushInline(full: boolean): Promise<void> {
+  const { runPush } = await import('../satellite/push.js');
+  // A live holder is polled for 5 s, then we proceed anyway: a query must not
+  // be held hostage by a long detached `--full` run (S6).
+  await runPush({ full, lockWaitMs: 5000, proceedWithoutLock: true });
+}
+
+/** argv minus `--project <v>` and `--project-key <v>` — the hub is the SOLE
+ *  writer of scope flags (§2.3 Query rules), so the client must not send them. */
+function stripScopeFlags(a: string[]): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < a.length; i++) {
+    const t = a[i]!;
+    if (t === '--project' || t === '--project-key') { i++; continue; }
+    out.push(t);
+  }
+  return out;
+}
+
+/**
+ * Forward this invocation to the hub and relay the reply byte-identically,
+ * including the exit code (D3). Returns the exit code to use.
+ */
+async function forwardQuery(): Promise<number> {
+  const sat = satellite()!;
+  const scope = projectFlag ?? process.cwd();
+  const forwardArgv = stripScopeFlags(argv);
+
+  // Bounded inline flush first, so a query run seconds after a turn sees it.
+  try { await runPushInline(false); } catch { /* push logs its own failures */ }
+
+  const { hubRequest, parseJson, HubTransportError } = await import('../satellite/hub-client.js');
+  const { HEADER_STALE } = await import('../hub/protocol.js');
+  const derived = deriveProjectKey(scope);
+  const body = JSON.stringify({
+    argv: forwardArgv,
+    cwd: scope,
+    ...(derived.key ? { key: derived.key } : {}),
+  });
+
+  let res;
+  try {
+    res = await hubRequest(sat.hubUrl, {
+      method: 'POST',
+      path: '/v1/query',
+      token: sat.token,
+      headers: { 'content-type': 'application/json' },
+      body,
+      timeoutMs: 130_000,
+    });
+  } catch (e) {
+    const reason = e instanceof HubTransportError ? e.reason : (e as Error).message;
+    console.error(`recall: hub ${sat.hubUrl} unreachable: ${reason}`);
+    return 2;
+  }
+  if (res.status < 200 || res.status > 299) {
+    const reason = (res.body.toString('utf-8').trim().split('\n')[0] ?? '').slice(0, 200);
+    console.error(`recall: hub ${sat.hubUrl} replied ${res.status} ${reason}`);
+    return 2;
+  }
+  const payload = parseJson<{ stdout?: string; stderr?: string; exit?: number }>(res);
+  if (!payload) {
+    console.error(`recall: hub ${sat.hubUrl} replied ${res.status} with an unparseable body`);
+    return 2;
+  }
+  if (payload.stdout) process.stdout.write(payload.stdout);
+  if (payload.stderr) process.stderr.write(payload.stderr);
+  if (res.headers[HEADER_STALE] === '1') console.error('recall: hub results may be stale');
+  return typeof payload.exit === 'number' ? payload.exit : 0;
+}
+
 async function main() {
   if (showVersion) {
     console.log(getVersion());
@@ -1290,6 +1432,25 @@ async function main() {
   if (showHelp) {
     printHelp();
     exit(0);
+  }
+
+  // ---- Satellite guard (spec §3.4) ----
+  // Sits directly under the --version/--help block and above EVERY path that
+  // could open a database: `backfill` reaches initDb() and `repair` (inside
+  // INSTALLER_SUBCOMMANDS) reaches getDb, either of which would create a local
+  // recall.db on a machine that must never have one.
+  const sat = satellite();
+  if (sat) {
+    const c = positional[0];
+    if (c === 'backfill' || c === 'repair' || c === 'hub') {
+      console.error(`recall ${c}: not available in satellite mode (queries run on the hub)`);
+      exit(1);
+    }
+    if (c === 'push') { await runPushInline(hasFlag('--full')); exit(0); }
+    if (hasFlag('--commit') || blameMode) { await runCommitAttribution(); exit(0); }
+    if (c === 'statusline' && positional.length === 1) { await runStatuslineSubcommand(); exit(0); }
+    if (c && INSTALLER_SUBCOMMANDS.has(c)) { await runInstallerSubcommand(c); exit(0); }
+    exit(await forwardQuery());
   }
 
   // Commit attribution — dispatched before the positional subcommands so a

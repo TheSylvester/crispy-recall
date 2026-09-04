@@ -116,6 +116,68 @@ export function buildManifest(report: PreflightReport): ManifestItem[] {
   return items;
 }
 
+/**
+ * Build the SATELLITE action manifest (spec §3.1).
+ *
+ * A separate builder on purpose: a satellite runs no GPU phase, downloads no
+ * runtime and creates no database, so the hub manifest's `gpu`/`backfill`
+ * items would be lies. Kept apart so `buildManifest`'s contract (and
+ * manifest-optout.test.ts) is untouched.
+ */
+export function buildSatelliteManifest(report: PreflightReport): ManifestItem[] {
+  const items: ManifestItem[] = [];
+
+  items.push({
+    key: 'stop-hook',
+    label: 'Add the Stop (+ SubagentStop) hook to ~/.claude/settings.json',
+    detail: 'pushes each finished session to the hub',
+    mandatory: true,
+    defaultSelected: true,
+  });
+  items.push({
+    key: 'skill',
+    label: 'Install the recall skill into ~/.claude/skills/recall/',
+    detail: 'teaches the agent to search past sessions (queries run on the hub)',
+    mandatory: true,
+    defaultSelected: true,
+  });
+  if (report.codex) {
+    items.push({
+      key: 'codex-hook',
+      label: 'Add the Stop (+ SubagentStop) hook to ~/.codex/hooks.json',
+      detail: 'pushes each finished Codex session to the hub',
+      mandatory: true,
+      defaultSelected: true,
+    });
+    items.push({
+      key: 'codex-skill',
+      label: 'Install the recall skill into ~/.codex/skills/recall/',
+      detail: 'Codex harness detected',
+      mandatory: true,
+      defaultSelected: true,
+    });
+  }
+
+  items.push({
+    key: 'claudemd',
+    label: 'Update ~/.claude/CLAUDE.md so Claude knows about Recall',
+    detail: 'appends a short "## Recall" nudge',
+    mandatory: false,
+    defaultSelected: true,
+  });
+  if (report.codex) {
+    items.push({
+      key: 'codex-agentsmd',
+      label: 'Update ~/.codex/AGENTS.md so Codex knows about Recall',
+      detail: 'appends a short "## Recall" nudge',
+      mandatory: false,
+      defaultSelected: true,
+    });
+  }
+
+  return items;
+}
+
 export interface RenderOptions {
   /** Suppress prompting (--yes or non-interactive): select all defaults, log them. */
   yes?: boolean;

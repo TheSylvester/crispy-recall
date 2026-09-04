@@ -11,8 +11,9 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { join, isAbsolute } from 'node:path';
 import Database from 'better-sqlite3';
+import { spawnSync } from 'node:child_process';
 import { runPreflight, claudeSettingsPath, type PreflightReport } from './preflight.js';
-import { readConfig } from './config.js';
+import { readConfig, readSatelliteConfig, type SatelliteConfig } from './config.js';
 import { integrityCheck } from './repair.js';
 import { detectStatusline } from './statusline-suggest.js';
 import { isBindingLoadError, CODEX_REKEY_MIGRATION_KEY, LEGACY_CODEX_ID_SQL } from '../db.js';
@@ -69,6 +70,13 @@ export interface BindingHealth {
 export async function runDoctor(opts: DoctorOptions = {}): Promise<number> {
   if (opts.integrity) return printIntegrity(opts.json ?? false);
 
+  // A satellite has no database, no staged addon and no embedder, so
+  // checkBindingHealth and the GPU/embedder rows would all report absence as
+  // breakage. Report what actually matters here: the hub link and the local
+  // things that decide whether a transcript ever reaches it.
+  const sat = readSatelliteConfig();
+  if (sat) return runSatelliteDoctor(sat, opts);
+
   const report = await runPreflight({ ...(opts.offline ? { offline: true } : {}) });
   const embedder = readConfig()?.embedder ?? null;
   const binding = checkBindingHealth();
@@ -84,6 +92,135 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<number> {
   const bindingFailed = binding.installed && binding.problems.length > 0;
   // Statusline coverage is WARN-only — it never affects the exit code.
   return report.failures.length > 0 || bindingFailed ? 1 : 0;
+}
+
+// ---------------------------------------------------------------------------
+// Satellite doctor (spec §3.1)
+// ---------------------------------------------------------------------------
+
+export interface SatelliteDoctorReport {
+  mode: 'satellite';
+  hubUrl: string;
+  host: string;
+  hubReachable: boolean;
+  authOk: boolean;
+  hubVersion: string;
+  localVersion: string;
+  lastPush: string | null;
+  pendingBytes: number | null;
+  pendingFiles: number;
+  git: string;
+  cleanupPeriodDays: number | null;
+  failingFiles: string[];
+  shallowClone: boolean;
+  warnings: string[];
+  failures: string[];
+}
+
+/** `git --version`, or `missing` when git is not on PATH. */
+function gitVersion(): string {
+  try {
+    const r = spawnSync('git', ['--version'], { encoding: 'utf-8', timeout: 3000, windowsHide: true });
+    const out = (r.stdout ?? '').trim();
+    return r.status === 0 && out ? out : 'missing';
+  } catch {
+    return 'missing';
+  }
+}
+
+/** True when the cwd repo is a shallow clone (its root commit is a graft, so
+ *  `deriveProjectKey` cannot produce a stable `git:` key — spec §4.1 step 2). */
+function cwdIsShallow(): boolean {
+  try {
+    const r = spawnSync('git', ['rev-parse', '--is-shallow-repository'], {
+      encoding: 'utf-8', timeout: 3000, windowsHide: true,
+    });
+    return r.status === 0 && (r.stdout ?? '').trim() === 'true';
+  } catch {
+    return false;
+  }
+}
+
+/** Claude Code's configured transcript retention, or null when absent/foreign. */
+export function readCleanupPeriodDays(settingsPath: string): number | null {
+  try {
+    const parsed = JSON.parse(readFileSync(settingsPath, 'utf-8')) as Record<string, unknown>;
+    const v = parsed['cleanupPeriodDays'];
+    return typeof v === 'number' ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+async function runSatelliteDoctor(sat: SatelliteConfig, opts: DoctorOptions): Promise<number> {
+  const { computePendingBytes, readPushLogSummary } = await import('../satellite/push.js');
+  const { localVersion } = await import('../satellite/hub-client.js');
+
+  const report = await runPreflight({ satellite: { hubUrl: sat.hubUrl, token: sat.token } });
+  const hubReachable = !report.failures.some((f) => f.check === 'hub.unreachable');
+  const authOk = hubReachable && !report.failures.some((f) => f.check === 'hub.auth');
+  const pending = authOk ? await computePendingBytes() : { bytes: null, files: 0 };
+  const pushLog = readPushLogSummary();
+  const cleanup = readCleanupPeriodDays(claudeSettingsPath());
+  const shallow = cwdIsShallow();
+
+  const warnings = report.warnings.map((w) => `${w.check}: ${w.message}`);
+  if (cleanup === null) {
+    warnings.push('cleanupPeriodDays is unset in settings.json — transcripts may be deleted before they reach the hub; run `recall install`');
+  } else if (cleanup < 999) {
+    warnings.push(`cleanupPeriodDays is ${cleanup} — transcripts older than that are deleted before they can be pushed; run \`recall install\``);
+  }
+  if (shallow) {
+    warnings.push('this repository is a shallow clone — its project key cannot match the hub\'s; run `git fetch --unshallow`');
+  }
+  for (const f of pushLog.failingFiles) {
+    warnings.push(`${f} has failed to push in each of the last 3 runs`);
+  }
+
+  const out: SatelliteDoctorReport = {
+    mode: 'satellite',
+    hubUrl: sat.hubUrl,
+    host: report.satellite?.host || sat.host,
+    hubReachable,
+    authOk,
+    hubVersion: report.satellite?.hubVersion ?? 'unknown',
+    localVersion: localVersion(),
+    lastPush: pushLog.lastPush,
+    pendingBytes: pending.bytes,
+    pendingFiles: pending.files,
+    git: gitVersion(),
+    cleanupPeriodDays: cleanup,
+    failingFiles: pushLog.failingFiles,
+    shallowClone: shallow,
+    warnings,
+    failures: report.failures.map((f) => `${f.check}: ${f.message}`),
+  };
+
+  if (opts.json) {
+    console.log(JSON.stringify(out, null, 2));
+  } else {
+    console.log('recall doctor (satellite)');
+    console.log('=========================');
+    console.log(`Hub:                ${out.hubUrl}  host=${out.host || 'unknown'}`);
+    console.log(`hub reachable:      ${out.hubReachable ? 'yes' : 'no'}`);
+    console.log(`auth ok:            ${out.authOk ? 'yes' : 'no'}`);
+    console.log(`hub version ${out.hubVersion} (local ${out.localVersion})`);
+    console.log(`last push:          ${out.lastPush ?? 'never'}`);
+    console.log(`pending bytes:      ${out.pendingBytes === null ? 'unknown' : `${out.pendingBytes} in ${out.pendingFiles} file(s)`}`);
+    console.log(`git:                ${out.git}`);
+    console.log(`cleanupPeriodDays:  ${out.cleanupPeriodDays ?? 'unset'}`);
+    console.log(`Node:               ${report.runtime.node}`);
+    if (out.warnings.length) {
+      console.log('\nWarnings:');
+      for (const w of out.warnings) console.log(`  • ${w}`);
+    }
+    if (out.failures.length) {
+      console.log('\nFailures:');
+      for (const f of out.failures) console.log(`  ✖ ${f}`);
+    }
+    if (!out.warnings.length && !out.failures.length) console.log('\nAll checks passed.');
+  }
+  return out.failures.length > 0 ? 1 : 0;
 }
 
 /** Opt-in statusLine coverage. All findings are WARN — never exit-1. Gated on

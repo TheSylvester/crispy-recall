@@ -13,6 +13,7 @@
  */
 import { ingestSessionMessages } from "../recall/message-ingest.js";
 import { deriveProjectKey } from "../recall/project-key.js";
+import { readSatelliteConfig } from "../installer/config.js";
 import { getDb } from "../db.js";
 import { binDir, dbPath, logsDir } from "../paths.js";
 import { appendFileSync, mkdirSync } from "fs";
@@ -114,6 +115,20 @@ async function runStopHook(): Promise<void> {
   let ingestedClass: 'hot' | 'agent' | undefined;
   let canonicalId = target.sessionId;
   try {
+    // Satellite branch (spec §3.2, S6). FIRST statement inside the try, so a
+    // synchronous config/spawn throw is still caught and the hook still exits
+    // 0. This machine has no database: hand the transcript to a detached
+    // push-pending and get out of the turn's way at once. Nothing below runs,
+    // so `getDb` — and therefore any better_sqlite3.node dlopen — is never
+    // reached on a satellite.
+    const sat = readSatelliteConfig();
+    if (sat) {
+      spawn(process.execPath, [join(binDir(), "push-pending.js"), '--named', target.transcriptPath,
+            '--hook', JSON.stringify(target.hook), '--cwd', payload.cwd ?? ''],
+            { detached: true, stdio: 'ignore', windowsHide: true }).unref();
+      process.exit(0);
+    }
+
     // 5000 ms busy_timeout for hook DB writes. The wasm-era 500 ms was a
     // contention dodge (its coarse mkdir lock blocked even readers); under real
     // WAL a writer never blocks a reader and short writes settle well inside
