@@ -12,11 +12,12 @@
  */
 
 import {
-  appendFileSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync, existsSync,
+  appendFileSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { logsDir, runDir } from '../paths.js';
+import { getVersion as packageVersion } from '../version.js';
 
 // ---------------------------------------------------------------------------
 // Shared atomic write (query-embed-coordinator.ts:175-179 idiom)
@@ -233,16 +234,8 @@ export function updateHostRecord(host: string, patch: (current: HostRecord) => H
   return next;
 }
 
-/** Package version as the bundle sees it (`unknown` for a staged bundle until
- *  U4's build-time define lands). */
+/** Package version as the bundle sees it — the build-time define, else the
+ *  package.json fallback (spec §6). */
 export function readPackageVersion(): string {
-  try {
-    const candidates = [join(__dirname, '..', 'package.json'), join(__dirname, '..', '..', 'package.json')];
-    for (const c of candidates) {
-      if (!existsSync(c)) continue;
-      const pkg = JSON.parse(readFileSync(c, 'utf8')) as { name?: string; version?: string };
-      if (pkg.name === 'crispy-recall' && pkg.version) return pkg.version;
-    }
-  } catch { /* fall through */ }
-  return 'unknown';
+  return packageVersion();
 }

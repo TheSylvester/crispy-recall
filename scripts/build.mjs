@@ -10,7 +10,7 @@
  */
 
 import { build } from 'esbuild';
-import { chmodSync, copyFileSync, mkdirSync, readdirSync, rmSync, statSync } from 'node:fs';
+import { chmodSync, copyFileSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
 
@@ -18,6 +18,11 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const root = resolve(__dirname, '..');
 
 mkdirSync(join(root, 'dist'), { recursive: true });
+
+// The version every bundle reports (spec §6). A staged bundle under
+// `~/.recall/bin` has no sibling package.json, so without this define every
+// hook, daemon and satellite printed `unknown`.
+const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
 
 // Drop a stale wasm sidecar from a pre-migration build — dist/ is not cleaned
 // between builds and the bundles now load better_sqlite3.node, not the wasm.
@@ -34,6 +39,7 @@ const sharedOpts = {
   banner: { js: '#!/usr/bin/env node' },
   external: [],
   loader: { '.md': 'text' },
+  define: { __RECALL_VERSION__: JSON.stringify(pkg.version) },
 };
 
 await Promise.all([

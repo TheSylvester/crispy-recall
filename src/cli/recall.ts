@@ -43,7 +43,8 @@ import {
 } from '../git-attribution.js';
 import { renderStatuslineSegment, type StatuslineInput } from '../recall/statusline-segment.js';
 import { readSatelliteConfig, type SatelliteConfig } from '../installer/config.js';
-import { mkdirSync, openSync, writeFileSync, readFileSync } from 'node:fs';
+import { getVersion as packageVersion } from '../version.js';
+import { mkdirSync, openSync, writeFileSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { join } from 'node:path';
 
@@ -202,16 +203,9 @@ for (let i = 0; i < argv.length; i++) {
 // Help
 // ---------------------------------------------------------------------------
 
-/** Read the package version from the bundle's sibling package.json. */
+/** Package version — the build-time define, else a package.json fallback (§6). */
 function getVersion(): string {
-  try {
-    const pkg = JSON.parse(
-      readFileSync(join(__dirname, '..', 'package.json'), 'utf8'),
-    ) as { version?: string };
-    return pkg.version ?? 'unknown';
-  } catch {
-    return 'unknown';
-  }
+  return packageVersion();
 }
 
 /** Satellite record, resolved at most ONCE per process (spec §3.4). */
