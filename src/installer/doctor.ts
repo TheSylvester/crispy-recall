@@ -19,6 +19,7 @@ import { isBindingLoadError } from '../db.js';
 import { binDir, dbPath, statuslineScript } from '../paths.js';
 import { EMBED_VERSION } from '../recall/embed-config.js';
 import { META_RESIDUE_SQL } from '../recall/purge-meta.js';
+import { CODEX_REKEY_KEY, LEGACY_CODEX_ID_SQL } from './codex-rekey-migration.js';
 
 export interface DoctorOptions {
   json?: boolean;
@@ -46,6 +47,17 @@ export interface BindingHealth {
    *  pre-migration schema). Non-zero → warn to run `recall backfill
    *  --purge-meta`; whitelisted rows (task notifications) are not counted. */
   metaResidue: number | null;
+  /** Codex message-id re-key pending (null if DB absent / pre-migration schema).
+   *  True → normal commands fail closed until `recall install` or
+   *  `recall repair --rekey-codex` runs it. */
+  codexRekeyPending: boolean | null;
+  /** Sessions still carrying legacy 8-hex Codex ids AFTER the migration —
+   *  their transcripts are gone. Informational, never a problem. */
+  legacyCodexSessions: number | null;
+  /** Hot messages with no vector at all (null if DB absent / pre-migration
+   *  schema). embedCoverage cannot serve: its denominator counts only rows
+   *  that HAVE a vector, so a vector purge leaves coverage at 1.0. */
+  embedGap: number | null;
   problems: string[];
 }
 
@@ -125,13 +137,14 @@ function stagedBindingPath(): string {
   return join(binDir(), 'better_sqlite3.node');
 }
 
-function checkBindingHealth(): BindingHealth {
+export function checkBindingHealth(): BindingHealth {
   const problems: string[] = [];
   const installed = existsSync(join(binDir(), 'recall.js'));
   if (!installed) {
     return {
       installed: false, markerPresent: false, abiOk: null, pinnedNodeOk: null,
       bindingLoads: false, journalMode: null, embedCoverage: null, metaResidue: null,
+      codexRekeyPending: null, legacyCodexSessions: null, embedGap: null,
       problems: ['recall is not installed — run `recall install`'],
     };
   }
@@ -169,6 +182,9 @@ function checkBindingHealth(): BindingHealth {
   let journalMode: string | null = null;
   let embedCoverage: number | null = null;
   let metaResidue: number | null = null;
+  let codexRekeyPending: boolean | null = null;
+  let legacyCodexSessions: number | null = null;
+  let embedGap: number | null = null;
   const localBinding = stagedBindingPath();
   const dbFile = dbPath();
   if (existsSync(dbFile)) {
@@ -225,8 +241,42 @@ function checkBindingHealth(): BindingHealth {
           if (!complete) {
             problems.push('retrieval-class schema migration pending — run `recall install` to finish it');
           }
+          // Codex message-id re-key (same readonly handle, same shape).
+          let codexComplete = false;
+          try {
+            const marker = raw
+              .prepare(`SELECT value FROM schema_meta WHERE key='${CODEX_REKEY_KEY}'`)
+              .get() as { value?: string } | undefined;
+            codexComplete = marker?.value === 'complete';
+          } catch {
+            codexComplete = false; // no schema_meta table at all
+          }
+          codexRekeyPending = !codexComplete;
+          if (!codexComplete) {
+            problems.push('codex message-id migration pending — run `recall install` (or `recall repair --rekey-codex`) to finish it');
+          } else {
+            const row = raw
+              .prepare(`SELECT COUNT(DISTINCT session_id) AS n FROM messages WHERE ${LEGACY_CODEX_ID_SQL}`)
+              .get() as { n: number } | undefined;
+            legacyCodexSessions = row ? Number(row.n) : null;
+          }
         }
       } catch { /* detection is best-effort */ }
+      // Embed drain gap on the SAME readonly connection: hot rows with NO
+      // vector at all. This is what a re-key's vector purge opens up, and what
+      // `recall backfill --auto-embed` closes.
+      try {
+        const row = raw
+          .prepare(
+            `SELECT COUNT(*) AS n FROM messages m
+             WHERE m.retrieval_class = 'hot' AND m.message_text != ''
+               AND NOT EXISTS (SELECT 1 FROM message_vectors v WHERE v.message_id = m.message_id)`,
+          )
+          .get() as { n: number } | undefined;
+        embedGap = row ? Number(row.n) : null;
+      } catch {
+        embedGap = null; // pre-migration schema
+      }
       raw.close();
       if (journalMode !== 'wal') {
         problems.push(
@@ -258,7 +308,10 @@ function checkBindingHealth(): BindingHealth {
     }
   }
 
-  return { installed, markerPresent, abiOk, pinnedNodeOk, bindingLoads, journalMode, embedCoverage, metaResidue, problems };
+  return {
+    installed, markerPresent, abiOk, pinnedNodeOk, bindingLoads, journalMode,
+    embedCoverage, metaResidue, codexRekeyPending, legacyCodexSessions, embedGap, problems,
+  };
 }
 
 function printBinding(b: BindingHealth): void {
@@ -282,6 +335,12 @@ function printBinding(b: BindingHealth): void {
         ? 'Meta residue:   none'
         : `Meta residue:   ⚠ ${b.metaResidue} boilerplate rows indexed — run: recall backfill --purge-meta`,
     );
+  }
+  if (b.legacyCodexSessions !== null && b.legacyCodexSessions > 0) {
+    console.log(`Legacy codex ids: ${b.legacyCodexSessions} sessions (transcripts gone)`);
+  }
+  if (b.embedGap !== null && b.embedGap > 0) {
+    console.log(`Embed gap:      ${b.embedGap} messages awaiting vectors — run: recall backfill --auto-embed`);
   }
   if (b.problems.length) {
     console.log('  Issues:');

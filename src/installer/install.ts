@@ -24,7 +24,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
 import { binDir, modelsDir, runDir, logsDir, recallRoot, dbPath } from '../paths.js';
-import { getDb, isBindingLoadError, isRetrievalMigrationPending } from '../db.js';
+import { getDb, isBindingLoadError, isRetrievalMigrationPending, isCodexRekeyPending } from '../db.js';
 import { getEmbedVersionStats, getEmbeddingGapStats } from '../recall/message-store.js';
 import {
   runPreflight, preflightPassed, acquireInstallLock, releaseInstallLock,
@@ -34,6 +34,7 @@ import {
   type PreflightReport,
 } from './preflight.js';
 import type { RetrievalMigrationResult } from './retrieval-class-migration.js';
+import type { CodexRekeyResult } from './codex-rekey-migration.js';
 import { buildManifest, renderManifest } from './manifest.js';
 import { runGpuPhase, type GpuPhaseResult, type GpuProbeArgs, type OffloadProbeResult } from './gpu.js';
 import { mergeStopHook, removeStopHook, backupFile, mergeStatusLine, removeStatusLine } from './settings-merge.js';
@@ -83,6 +84,8 @@ export interface MigrationInfo {
   integrity?: IntegrityStatus;
   /** Retrieval-class migration outcome (when one ran or was attempted). */
   retrieval?: RetrievalMigrationResult;
+  /** Codex message-id re-key outcome (when one ran or was attempted). */
+  codexRekey?: CodexRekeyResult;
 }
 
 export interface InstallResult {
@@ -474,6 +477,20 @@ export async function runInstall(opts: InstallOptions = {}): Promise<InstallResu
   const retrievalMigration = retrievalPending
     ? await import('./retrieval-class-migration.js')
     : undefined;
+  // Codex message-id re-key pending? Same read-only probe shape. An old DB is
+  // re-probed AFTER phase 6.7 instead: it needs both migrations in one install,
+  // and only the retrieval pass can open it before then.
+  let codexPending = false;
+  if (migration.state === 'already-migrated' && !retrievalPending) {
+    try {
+      codexPending = isCodexRekeyPending(
+        getDb(dbPath(), { allowPendingMigration: true }),
+      );
+    } catch {
+      // Fail closed; the attended phase below will surface actionable detail.
+      codexPending = true;
+    }
+  }
 
   const filesWritten: string[] = [];
   let gpu: GpuPhaseResult = { mode: 'cpu', libDir: null, ngl: 0, cudaAvailable: 'none' };
@@ -481,6 +498,7 @@ export async function runInstall(opts: InstallOptions = {}): Promise<InstallResu
   let snapshotPath: string | undefined;
   let integrity: IntegrityStatus | undefined;
   let retrieval: RetrievalMigrationResult | undefined;
+  let codexRekey: CodexRekeyResult | undefined;
   let drainLaunched = false;
 
   // Hook-restore guard: capture the EXACT prior hook-file contents before any
@@ -510,7 +528,7 @@ export async function runInstall(opts: InstallOptions = {}): Promise<InstallResu
     // early is strictly safer. Phase 7 re-adds the recall hook pointing at
     // the freshly staged stop-hook.js; abort paths restore the exact prior
     // configuration via restoreQuiescedHooks().
-    if (migration.state === 'needs-migration' || retrievalPending) {
+    if (migration.state === 'needs-migration' || retrievalPending || codexPending) {
       for (const p of [claudeSettingsPath(), codexHooksPath()]) {
         captureHookFile(p);
         const r = removeStopHook(p);
@@ -675,6 +693,46 @@ export async function runInstall(opts: InstallOptions = {}): Promise<InstallResu
       }
     }
 
+    // ---- 6.8 Codex message-id re-key (attended, marker-gated) ----
+    // An old DB needs BOTH migrations in one install: phase 6.7 has just made
+    // the schema current, so the codex probe becomes possible only now.
+    if (retrievalPending) {
+      try {
+        codexPending = isCodexRekeyPending(getDb(dbPath(), { allowPendingMigration: true }));
+      } catch {
+        codexPending = true;
+      }
+    }
+    if (codexPending) {
+      try {
+        const { runCodexRekeyMigration } = await import('./codex-rekey-migration.js');
+        codexRekey = await runCodexRekeyMigration({ log: say });
+        if (codexRekey.performed) {
+          say(
+            `codex re-key: ${codexRekey.sessions} sessions, ${codexRekey.reingested} re-ingested, ` +
+            `${codexRekey.fileGone} transcripts gone, ${codexRekey.vectorsDropped} vectors dropped ` +
+            '— the background drain below re-embeds them',
+          );
+        }
+      } catch (e) {
+        const remediation =
+          `Codex message-id migration failed (${(e as Error).message}). Re-run \`recall install\` ` +
+          'to retry, or run `recall repair --rekey-codex` directly.';
+        restoreQuiescedHooks();
+        if (interactive) note(remediation, 'Migration aborted');
+        else log({ source: 'installer/install', level: 'error', summary: `migration aborted: ${remediation}` });
+        return {
+          aborted: true, abortReason: remediation, report, selected: [...selected], gpu, filesWritten,
+          migration: {
+            state: migration.state, coverage: migration.coverage, drainLaunched: false,
+            ...(snapshotPath ? { snapshotPath } : {}),
+            ...(retrieval ? { retrieval } : {}),
+            ...(codexRekey ? { codexRekey } : {}),
+          },
+        };
+      }
+    }
+
     // ---- 7. Claude / Codex filesystem edits (LAST) ----
     const runnable = recallBinCommand();
     const templatePath = resolveTemplatePath(opts.templatePath);
@@ -808,6 +866,7 @@ export async function runInstall(opts: InstallOptions = {}): Promise<InstallResu
     ...(snapshotPath ? { snapshotPath } : {}),
     ...(integrity ? { integrity } : {}),
     ...(retrieval ? { retrieval } : {}),
+    ...(codexRekey ? { codexRekey } : {}),
   };
   const migLine = migrationReportLine(finalCoverage);
 

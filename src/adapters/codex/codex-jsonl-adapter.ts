@@ -1028,7 +1028,12 @@ function parseCodexPatch(input: string): PatchFileChange[] {
 /**
  * Generate a deterministic entry ID for records that lack a natural key.
  * Tool calls use their call_id; messages and reasoning use this counter.
+ *
+ * The FULL session uuid is used, never an 8-hex prefix: a UUIDv7 prefix is a
+ * ~65 s bucket, so sibling sessions collided and `INSERT OR IGNORE` silently
+ * dropped their turns. Legacy `codex-jsonl-<8 hex>-<n>` rows are rewritten by
+ * the attended `codex_message_id_v2` migration (installer/codex-rekey-migration.ts).
  */
 function generateId(sessionId: string, counter: number): string {
-  return `codex-jsonl-${sessionId.slice(0, 8)}-${counter}`;
+  return `codex-jsonl-${sessionId}-${counter}`;
 }

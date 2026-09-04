@@ -85,10 +85,17 @@ export class BindingLoadError extends Error {
  * migration never blocks the user's turn; T1 re-ingests the gap afterwards.
  */
 export class MigrationPendingError extends Error {
-  constructor(public readonly dbPath: string) {
+  constructor(
+    public readonly dbPath: string,
+    public readonly kind: 'retrieval-class' | 'codex-rekey' = 'retrieval-class',
+  ) {
     super(
-      'recall: this database needs a one-time schema migration — run `recall install` to finish it. ' +
-        '(Normal commands refuse to rewrite the index unattended.)',
+      kind === 'codex-rekey'
+        ? 'recall: this database needs a one-time Codex message-id migration — run `recall install` ' +
+          '(or `recall repair --rekey-codex`) to finish it. ' +
+          '(Normal commands refuse to rewrite the index unattended.)'
+        : 'recall: this database needs a one-time schema migration — run `recall install` to finish it. ' +
+          '(Normal commands refuse to rewrite the index unattended.)',
     );
     this.name = 'MigrationPendingError';
   }
@@ -184,6 +191,16 @@ export function getDb(dbPath: string, opts?: GetDbOptions): RecallDb {
     return db;
   }
 
+  // Codex re-key gate (sibling of the retrieval-class gate, spec §5): the
+  // 8-hex message_id generation collides across sessions, so normal commands
+  // fail closed until the attended migration rewrites the rows. Unlike the
+  // retrieval-class case the SCHEMA is already current, so the attended path
+  // (allowPendingMigration) falls through to ensureSchema normally.
+  if (isCodexRekeyPending(adapter) && !opts?.allowPendingMigration) {
+    raw.close();
+    throw new MigrationPendingError(dbPath, 'codex-rekey');
+  }
+
   db = adapter;
   currentDbPath = dbPath;
 
@@ -215,6 +232,36 @@ export function isRetrievalMigrationPending(d: RecallDb): boolean {
     const row = d.get(
       `SELECT value FROM schema_meta WHERE key = ?`,
       [RETRIEVAL_MIGRATION_KEY],
+    ) as { value?: string } | undefined;
+    return row?.value !== 'complete';
+  } catch {
+    // Unreadable state → treat as pending (fail closed).
+    return true;
+  }
+}
+
+/** The durable marker row that says every Codex message_id carries a full uuid. */
+export const CODEX_REKEY_MIGRATION_KEY = 'codex_message_id_v2';
+
+/**
+ * Pending iff a `messages` table already exists but the durable
+ * `codex_message_id_v2` marker does not say 'complete'. A fresh DB is never
+ * pending (ensureSchema writes the marker with the fresh DDL). Read-only —
+ * safe to run before any DDL decision; unreadable state → pending.
+ */
+export function isCodexRekeyPending(d: RecallDb): boolean {
+  try {
+    const hasMessages = d.get(
+      `SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'messages'`,
+    );
+    if (!hasMessages) return false;
+    const hasMeta = d.get(
+      `SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_meta'`,
+    );
+    if (!hasMeta) return true;
+    const row = d.get(
+      `SELECT value FROM schema_meta WHERE key = ?`,
+      [CODEX_REKEY_MIGRATION_KEY],
     ) as { value?: string } | undefined;
     return row?.value !== 'complete';
   } catch {
@@ -553,6 +600,14 @@ function ensureSchema(db: RecallDb): void {
   // pending-migration OLD DB to the next opener. DDL is transactional in
   // SQLite, so fresh init is atomic (concurrent openers serialize on the
   // write lock and each statement is IF NOT EXISTS).
+  // A FRESH database (no messages table yet) initializes new-generation on
+  // every marker, including the Codex re-key: no legacy row can exist. An
+  // EXISTING database must NOT get the codex marker here — only the attended
+  // migration may claim its rows are re-keyed.
+  const fresh = !db.get(
+    `SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'messages'`,
+  );
+
   db.exec('BEGIN IMMEDIATE');
   try {
     db.exec(RETRIEVAL_SCHEMA_DDL.tables);
@@ -623,6 +678,12 @@ function ensureSchema(db: RecallDb): void {
       INSERT OR IGNORE INTO schema_meta(key, value)
       VALUES ('${RETRIEVAL_MIGRATION_KEY}', 'complete');
     `);
+    if (fresh) {
+      db.exec(`
+        INSERT OR IGNORE INTO schema_meta(key, value)
+        VALUES ('${CODEX_REKEY_MIGRATION_KEY}', 'complete');
+      `);
+    }
 
     db.exec('COMMIT');
   } catch (e) {

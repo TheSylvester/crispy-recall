@@ -11,9 +11,13 @@
  */
 
 import { confirm, isCancel } from '@clack/prompts';
+import { spawn } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
 import { getDb } from '../db.js';
-import { dbPath } from '../paths.js';
+import { dbPath, binDir } from '../paths.js';
 import { log } from '../log.js';
+import type { CodexRekeyResult } from './codex-rekey-migration.js';
 
 function db() {
   const d = getDb(dbPath());
@@ -63,6 +67,33 @@ export function repairFts(): void {
 export function repairVectors(): void {
   db().exec('DELETE FROM message_vectors;');
   log({ source: 'installer/repair', level: 'info', summary: 'message_vectors cleared — will re-embed on next sweep' });
+}
+
+/**
+ * `recall repair --rekey-codex` — attended entry point for the
+ * `codex_message_id_v2` migration (spec §5).
+ *
+ * The force re-ingests drop the re-keyed sessions' vectors, so this MUST be
+ * followed by a drain: a detached `embed-pending.js` when one is staged, else
+ * a printed instruction to run `recall backfill --auto-embed`.
+ */
+export async function repairRekeyCodex(): Promise<CodexRekeyResult> {
+  const { runCodexRekeyMigration } = await import('./codex-rekey-migration.js');
+  const result = await runCodexRekeyMigration();
+  if (result.vectorsDropped > 0) {
+    const child = join(binDir(), 'embed-pending.js');
+    if (existsSync(child)) {
+      spawn(process.execPath, [child], {
+        detached: true,
+        stdio: 'ignore',
+        windowsHide: true,
+      }).unref();
+      log({ source: 'installer/repair', level: 'info', summary: 'codex re-key: detached embed-pending drain launched' });
+    } else {
+      console.log('run: recall backfill --auto-embed to re-embed the dropped vectors');
+    }
+  }
+  return result;
 }
 
 export interface RepairFullOptions { yes?: boolean }
