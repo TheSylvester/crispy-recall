@@ -154,6 +154,19 @@ describe('meta codec (decodeMeta)', () => {
     const big = encodeMeta({ cwd: 'x'.repeat(17 * 1024) });
     expect(decodeMeta(big)).toBeInstanceOf(Error);
   });
+
+  it('carries `prefix` and rejects anything that is not 64 lowercase hex (D1)', () => {
+    const hex = 'a'.repeat(64);
+    expect(decodeMeta(encodeMeta({ prefix: hex }))).toEqual({ prefix: hex });
+    expect(decodeMeta(Buffer.from('{"prefix":"' + 'A'.repeat(64) + '"}').toString('base64url'))).toBeInstanceOf(Error);
+    expect(decodeMeta(Buffer.from('{"prefix":"abc"}').toString('base64url'))).toBeInstanceOf(Error);
+    expect(decodeMeta(Buffer.from('{"prefix":7}').toString('base64url'))).toBeInstanceOf(Error);
+  });
+
+  it('IGNORES unknown keys — a newer satellite may add a field without a wire bump', () => {
+    const raw = '{"cwd":"/x","final":true,"tomorrow":{"deep":1},"extra":"whatever"}';
+    expect(decodeMeta(Buffer.from(raw).toString('base64url'))).toEqual({ cwd: '/x', final: true });
+  });
 });
 
 describe('query body + argv rules', () => {

@@ -195,9 +195,35 @@ export interface HostRecord {
   lastQueryAt?: string;
   lastFullManifestAt?: string;
   refusedCollisions: number;
+  /**
+   * Canonical session ids of the most recent refusals, newest first, at most
+   * `REFUSED_RECENT_MAX` and deduped (D5). The satellite doctor and the hub
+   * doctor both read THIS — there is one source for "recent ids".
+   */
+  refusedRecent: string[];
+}
+
+/** How many refused ids a host record keeps. */
+export const REFUSED_RECENT_MAX = 5;
+
+/** Prepend `sid`, dedupe, cap — the one place the recent-id list is built. */
+export function pushRefusedRecent(current: string[], sid: string): string[] {
+  return [sid, ...current.filter((s) => s !== sid)].slice(0, REFUSED_RECENT_MAX);
 }
 
 export type HostRecords = Record<string, HostRecord>;
+
+/**
+ * Forget a host's refusals: the counter and the id list both go to zero.
+ *
+ * The refusal record is a STANDING warning on both doctors — without a way to
+ * clear it, an operator who has resolved the collisions is told about them
+ * for ever. `recall hub release-foreign-scans` calls this after it releases
+ * the foreign provenance rows.
+ */
+export function clearHostRefusals(host: string): void {
+  updateHostRecord(host, (r) => ({ ...r, refusedCollisions: 0, refusedRecent: [] }));
+}
 
 export function hubHostsPath(): string {
   return join(runDir(), 'hub-hosts.json');
@@ -216,6 +242,9 @@ export function readHostRecords(): HostRecords {
         ...(typeof r['lastQueryAt'] === 'string' ? { lastQueryAt: r['lastQueryAt'] } : {}),
         ...(typeof r['lastFullManifestAt'] === 'string' ? { lastFullManifestAt: r['lastFullManifestAt'] } : {}),
         refusedCollisions: typeof r['refusedCollisions'] === 'number' ? r['refusedCollisions'] : 0,
+        refusedRecent: Array.isArray(r['refusedRecent'])
+          ? (r['refusedRecent'] as unknown[]).filter((v): v is string => typeof v === 'string').slice(0, REFUSED_RECENT_MAX)
+          : [],
       };
     }
     return out;
@@ -227,7 +256,7 @@ export function readHostRecords(): HostRecords {
 /** Read → patch → atomic write. The patch sees the current record. */
 export function updateHostRecord(host: string, patch: (current: HostRecord) => HostRecord): HostRecord {
   const all = readHostRecords();
-  const current = all[host] ?? { refusedCollisions: 0 };
+  const current = all[host] ?? { refusedCollisions: 0, refusedRecent: [] };
   const next = patch(current);
   all[host] = next;
   atomicWriteFile(hubHostsPath(), JSON.stringify(all, null, 2) + '\n');

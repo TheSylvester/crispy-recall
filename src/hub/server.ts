@@ -23,14 +23,18 @@ import type { ScanResult } from '../recall/mtime-scan.js';
 import {
   IngestQueue, runPushIngest, type PushIngestDeps, type PushIngestJob, type PushIngestOutcome,
 } from './ingest-queue.js';
-import { appendMirrorBytes, resolveMirrorPath, withFileLock, writeSidecar } from './mirror.js';
+import { hashFilePrefix, headWindow, HEX64_RE } from './hash.js';
+import {
+  appendMirrorBytes, resolveMirrorPath, withFileLock, writeSidecar,
+  type AppendFail, type AppendOk,
+} from './mirror.js';
 import {
   HEADER_META, HEADER_STALE, HEADER_WIRE, MAX_APPEND_BYTES, MAX_MANIFEST_BODY, MAX_MANIFEST_FILES,
   MAX_QUERY_BODY, WIRE_VERSION, decodeMeta, metaToSidecar, parseVendor,
   type HealthResponse, type ManifestResponse, type ManifestResponseFile, type WireMismatchResponse,
 } from './protocol.js';
 import { HUB_DRAIN_CAP_MS, QueryRunner, buildHubArgv, validateQueryBody } from './query.js';
-import { HubLock, hubLog, readHostRecords, readPackageVersion, updateHostRecord } from './runtime.js';
+import { HubLock, hubLog, pushRefusedRecent, readHostRecords, readPackageVersion, updateHostRecord } from './runtime.js';
 import { runMirrorSweep, sweepIntervalMs } from './sweep.js';
 import { TokenStore } from './tokens.js';
 
@@ -126,6 +130,9 @@ export interface HubHandle {
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
+/** `appendMirrorBytes`'s result, plus the hub-side prefix rejection (D1). */
+type AppendOutcome = AppendOk | (AppendFail & { prefixMismatch?: true });
+
 function sendJson(res: ServerResponse, status: number, body: unknown, headers?: Record<string, string>): void {
   const text = JSON.stringify(body);
   res.writeHead(status, {
@@ -209,7 +216,13 @@ export async function startHubServer(opts: HubServerOptions): Promise<HubHandle>
   const ingestDeps: PushIngestDeps = {
     spawnEmbed,
     log: hubLog,
-    onRefused: (host) => { updateHostRecord(host, (r) => ({ ...r, refusedCollisions: r.refusedCollisions + 1 })); },
+    onRefused: (host, sid) => {
+      updateHostRecord(host, (r) => ({
+        ...r,
+        refusedCollisions: r.refusedCollisions + 1,
+        refusedRecent: pushRefusedRecent(r.refusedRecent, sid),
+      }));
+    },
   };
 
   const lock = new HubLock();
@@ -251,6 +264,9 @@ export async function startHubServer(opts: HubServerOptions): Promise<HubHandle>
       if (typeof e['path'] !== 'string') return sendJson(res, 400, { error: 'files[].path must be a string' });
       if (typeof e['size'] !== 'number' || !Number.isInteger(e['size']) || e['size'] < 0) return sendJson(res, 400, { error: 'files[].size must be a non-negative integer' });
       if (typeof e['mtime'] !== 'number') return sendJson(res, 400, { error: 'files[].mtime must be a number' });
+      if (e['head'] !== undefined && (typeof e['head'] !== 'string' || !HEX64_RE.test(e['head']))) {
+        return sendJson(res, 400, { error: 'files[].head must be 64 lowercase hex characters' });
+      }
       const resolved = resolveMirrorPath(host, vendor, e['path']);
       if (!resolved.ok) {
         hubLog(`path-rejected host=${host} endpoint=manifest reason=${resolved.reason}`);
@@ -258,6 +274,22 @@ export async function startHubServer(opts: HubServerOptions): Promise<HubHandle>
       }
       let offset = 0;
       try { offset = statSync(resolved.abs).size; } catch { offset = 0; }
+      // D1: the satellite's file may have been REWRITTEN IN PLACE under a
+      // stable mtime (Codex Desktop 0.153.1 did exactly that), so a byte
+      // offset alone cannot say the mirror is a prefix of it. Compare the
+      // first `min(satSize, HEAD_BYTES)` bytes when the satellite sent a
+      // hash and the mirror is at least that long; a shorter mirror is left
+      // to the append-time `prefix` check.
+      const head = typeof e['head'] === 'string' ? e['head'] : undefined;
+      const window = headWindow(e['size']);
+      if (head !== undefined && offset >= window && window > 0) {
+        const mine = hashFilePrefix(resolved.abs, window);
+        if (mine !== null && mine !== head) {
+          hubLog(`prefix-mismatch host=${host} vendor=${vendor} path=${resolved.rel} via=head`);
+          out.push({ path: e['path'], offset: 0, reset: true as const });
+          continue;
+        }
+      }
       out.push({ path: e['path'], offset, ...(offset > e['size'] ? { reset: true as const } : {}) });
     }
 
@@ -269,7 +301,15 @@ export async function startHubServer(opts: HubServerOptions): Promise<HubHandle>
     const lastMs = last ? Date.parse(last) : NaN;
     const fullSweepDue = !Number.isFinite(lastMs) || t - lastMs > DAY_MS;
     hubLog(`manifest host=${host} vendor=${vendor} full=${String(m['full'])} files=${files.length} due=${fullSweepDue}`);
-    const response: ManifestResponse = { host, fullSweepDue, files: out };
+    // D5: the calling host's own refusal record rides every manifest reply —
+    // that is the ONLY channel a satellite has to learn its pushes were
+    // refused (its doctor has no hub log and no database).
+    const record = readHostRecords()[host];
+    const response: ManifestResponse = {
+      host, fullSweepDue, files: out,
+      refusedCollisions: record?.refusedCollisions ?? 0,
+      refusedRecent: record?.refusedRecent ?? [],
+    };
     sendJson(res, 200, response);
   }
 
@@ -300,14 +340,34 @@ export async function startHubServer(opts: HubServerOptions): Promise<HubHandle>
     }
 
     const { abs, rel } = resolved;
-    const result = await withFileLock(abs, () => {
+    const result = await withFileLock(abs, (): AppendOutcome => {
       const nowDate = new Date(now());
+      // D1: before ANY bytes land, prove the mirror's `[0, offset)` is the
+      // same prefix the satellite is resuming from. Only when the sizes
+      // already agree — a size disagreement is the existing 409 `{size}`
+      // recovery, and the satellite re-offers the file with a new offset.
+      if (meta.prefix !== undefined && !meta.reset && offset > 0) {
+        let current = -1;
+        try { current = statSync(abs).size; } catch { current = -1; }
+        if (current === offset) {
+          const mine = hashFilePrefix(abs, offset);
+          if (mine !== null && mine !== meta.prefix) {
+            return { ok: false, status: 409, size: current, prefixMismatch: true, reason: 'prefix mismatch' };
+          }
+        }
+      }
       const r = appendMirrorBytes(abs, body.buf, { offset, reset: !!meta.reset, now: nowDate });
       if (r.ok) writeSidecar(abs, metaToSidecar(host, meta, nowDate.toISOString()));
       return r;
     });
     if (!result.ok) {
-      if (result.status === 409) return sendJson(res, 409, { size: result.size ?? 0 });
+      if (result.status === 409) {
+        if (result.prefixMismatch) {
+          hubLog(`prefix-mismatch host=${host} vendor=${vendor} path=${rel} via=prefix`);
+          return sendJson(res, 409, { size: result.size ?? 0, prefixMismatch: true });
+        }
+        return sendJson(res, 409, { size: result.size ?? 0 });
+      }
       return sendJson(res, 400, { error: result.reason });
     }
     updateHostRecord(host, (r) => ({ ...r, lastPushAt: new Date(now()).toISOString() }));

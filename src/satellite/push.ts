@@ -10,6 +10,29 @@
  * and by the CLI's inline flush before a forwarded query (S6) — hence a
  * library, not a script. Never throws: every failure is logged and skipped.
  *
+ * PUSH INTEGRITY (D1). Resuming by byte offset is only sound while a
+ * transcript is append-only. Codex Desktop 0.153.1 rewrote older rollouts IN
+ * PLACE — it added `ordinal` and `payload.session_id` to every line — and the
+ * NTFS mtime stayed at its March value, so the pusher appended the tail of the
+ * NEW file onto the OLD prefix and every mirror ended with a torn JSON line at
+ * the seam. Two hashes close that:
+ *   - every manifest entry carries `head`, the sha256 of `[0, min(size,
+ *     HEAD_BYTES))`, so the hub answers `reset` when its first 4 KB differ;
+ *   - the first chunk of a RESUMED append carries `prefix`, the sha256 of
+ *     `[0, offset)`, so a rewrite past the head window is caught before any
+ *     byte lands (409 `prefixMismatch` → reset).
+ * COST: the prefix hash is O(file) on both sides, once per resumed push.
+ * Transcripts are tens of MB at worst, so this is a read, not a rewrite.
+ * KNOWN LIMITATIONS, both self-healing:
+ *   - a rewrite that keeps the size IDENTICAL and leaves the first 4 KB
+ *     unchanged is invisible until the file grows — at which point the
+ *     `prefix` hash catches it on the next resumed append;
+ *   - a rewrite that lands BETWEEN the chunks of a multi-chunk push is not
+ *     caught inside that run, because only the FIRST chunk carries `prefix`
+ *     (one hash per resumed push, not one per 8 MiB chunk). The next run
+ *     re-offers the file and catches it through `head`, or through `prefix`
+ *     once the file grows again.
+ *
  * @module satellite/push
  */
 
@@ -25,8 +48,10 @@ import { deriveProjectKey } from '../recall/project-key.js';
 import { readSatelliteConfig } from '../installer/config.js';
 import {
   MAX_APPEND_BYTES, MAX_MANIFEST_FILES, HEADER_META,
-  encodeMeta, type ManifestResponse, type HubVendor, type AppendMeta,
+  encodeMeta, type AppendConflictResponse, type ManifestFile as WireManifestFile,
+  type ManifestResponse, type HubVendor, type AppendMeta,
 } from '../hub/protocol.js';
+import { hashFileHead, hashFilePrefix } from '../hub/hash.js';
 import { hubRequest, parseJson, HubTransportError, REQUEST_TIMEOUT_MS } from './hub-client.js';
 
 // ---------------------------------------------------------------------------
@@ -53,6 +78,9 @@ export const LOCK_HEARTBEAT_MS = 60_000;
  * any UTF-8 expansion the estimate under-counts.
  */
 export const MANIFEST_BODY_SOFT_LIMIT = 224 * 1024;
+
+/** Serialized size of the `head` field a manifest entry carries. */
+export const HEAD_FIELD_BYTES = Buffer.byteLength(',"head":"' + 'a'.repeat(64) + '"', 'utf8');
 
 /** Bytes of a transcript read when peeking for the session cwd. */
 export const CWD_PEEK_BYTES = 64 * 1024;
@@ -254,6 +282,8 @@ export interface PushResult {
   lockBusy?: boolean;
   /** True when a transport failure stopped the run before any file. */
   unreachable?: boolean;
+  /** Refusals the hub reported for this host, when it reported any (D5). */
+  refused?: RefusalReport;
 }
 
 interface Ctx {
@@ -327,6 +357,7 @@ export async function runPush(opts: PushOptions = {}): Promise<PushResult> {
     result,
   };
 
+  let refused: RefusalReport | undefined;
   try {
     let sweepFull = full;
     // Pass 2 only runs when the hub answered `fullSweepDue` on pass 1 (S15).
@@ -336,6 +367,7 @@ export async function runPush(opts: PushOptions = {}): Promise<PushResult> {
         if (!budgetLeft(ctx)) break;
         const r = await pushVendor(ctx, vr, sweepFull, opts);
         if (r.fullSweepDue) fullSweepDue = true;
+        if (r.refused) refused = r.refused;
         if (r.transportFailed) {
           // Nothing was pushed and the hub did not answer — stop the run.
           if (result.pushed === 0) result.unreachable = true;
@@ -352,11 +384,18 @@ export async function runPush(opts: PushOptions = {}): Promise<PushResult> {
   } finally {
     stopHeartbeat();
     if (haveLock) releasePushLock();
+    // D5: ONE line per run. The satellite has no hub log and no database, so
+    // this line and the manifest reply are its only evidence that sessions of
+    // its own were refused and are therefore NOT indexed on the hub.
+    if (refused && refused.count > 0) {
+      pushLog(`${nowIso()} hub-refused host=${ctx.host} count=${refused.count} recent=${refused.recent.join(',')}`);
+      result.refused = refused;
+    }
   }
   return result;
 }
 
-interface VendorOutcome { fullSweepDue: boolean; transportFailed: boolean }
+interface VendorOutcome { fullSweepDue: boolean; transportFailed: boolean; refused?: RefusalReport }
 
 async function pushVendor(
   ctx: Ctx, vr: VendorRoot, full: boolean, opts: PushOptions,
@@ -396,12 +435,23 @@ async function pushVendor(
     if (!budgetLeft(ctx)) return out;
     const r = await sendManifestBatch(ctx, vr, full, batch, opts);
     if (r.fullSweepDue) out.fullSweepDue = true;
+    if (r.refused) out.refused = r.refused;
     if (r.kind === 'fatal') { out.transportFailed = true; return out; }
   }
   return out;
 }
 
 type ManifestFile = { abs: string; rel: string; size: number; mtime: number; named: boolean };
+
+/**
+ * The ONE manifest-entry builder (D1): `sendManifestBatch` and the doctor's
+ * `computePendingBytes` must describe a file identically, or the doctor would
+ * report pending bytes the real push then resets — or the reverse.
+ */
+export function manifestEntry(abs: string, rel: string, size: number, mtime: number): WireManifestFile {
+  const head = hashFileHead(abs, size);
+  return { path: rel, size, mtime, ...(head !== null ? { head } : {}) };
+}
 
 /**
  * Split `files` into manifest batches bounded by BOTH `MAX_MANIFEST_FILES`
@@ -419,10 +469,11 @@ export function planManifestBatches<T extends { rel: string; size: number; mtime
   let cur: T[] = [];
   let bytes = envelopeBytes;
   for (const f of files) {
-    // +1 for the separating comma.
+    // +1 for the separating comma; +76 for the `head` field the builder adds
+    // (`,"head":"<64 hex>"`), which is not known here but always sent.
     const entryBytes = Buffer.byteLength(
       JSON.stringify({ path: f.rel, size: f.size, mtime: f.mtime }), 'utf8',
-    ) + 1;
+    ) + 1 + HEAD_FIELD_BYTES;
     if (cur.length > 0 && (cur.length >= MAX_MANIFEST_FILES || bytes + entryBytes > MANIFEST_BODY_SOFT_LIMIT)) {
       batches.push(cur);
       cur = [];
@@ -436,7 +487,21 @@ export function planManifestBatches<T extends { rel: string; size: number; mtime
   return batches;
 }
 
-interface BatchOutcome { kind: 'ok' | 'skipped' | 'fatal'; fullSweepDue: boolean }
+interface BatchOutcome { kind: 'ok' | 'skipped' | 'fatal'; fullSweepDue: boolean; refused?: RefusalReport }
+
+/** What the hub told THIS host about refused pushes of its own sessions (D5). */
+export interface RefusalReport { count: number; recent: string[] }
+
+/** `refusedCollisions` / `refusedRecent` of a manifest reply, read
+ *  defensively: a pre-0.4.0-sat.3 hub sends neither. */
+function readRefusal(body: Partial<ManifestResponse>): RefusalReport | undefined {
+  const count = typeof body.refusedCollisions === 'number' ? body.refusedCollisions : 0;
+  if (count <= 0) return undefined;
+  const recent = Array.isArray(body.refusedRecent)
+    ? body.refusedRecent.filter((s): s is string => typeof s === 'string')
+    : [];
+  return { count, recent };
+}
 
 /**
  * Send ONE manifest batch and push whatever it asks for.
@@ -461,7 +526,7 @@ async function sendManifestBatch(
       body: JSON.stringify({
         vendor: vr.vendor,
         full,
-        files: batch.map((f) => ({ path: f.rel, size: f.size, mtime: f.mtime })),
+        files: batch.map((f) => manifestEntry(f.abs, f.rel, f.size, f.mtime)),
       }),
       timeoutMs: reqTimeout(ctx),
     });
@@ -477,7 +542,8 @@ async function sendManifestBatch(
       const a = await sendManifestBatch(ctx, vr, full, batch.slice(0, mid), opts);
       const b = await sendManifestBatch(ctx, vr, full, batch.slice(mid), opts);
       const kind = a.kind === 'fatal' || b.kind === 'fatal' ? 'fatal' : 'ok';
-      return { kind, fullSweepDue: a.fullSweepDue || b.fullSweepDue };
+      const refused = b.refused ?? a.refused;
+      return { kind, fullSweepDue: a.fullSweepDue || b.fullSweepDue, ...(refused ? { refused } : {}) };
     }
     pushLog(`${nowIso()} manifest replied 413 path=${batch[0]?.rel ?? '(empty batch)'}`);
     return { kind: 'skipped', fullSweepDue: false };
@@ -511,7 +577,8 @@ async function sendManifestBatch(
     if (!local) continue;
     await pushFile(ctx, vr, local, entry.offset, entry.reset === true, opts);
   }
-  return { kind: 'ok', fullSweepDue: body.fullSweepDue === true };
+  const refused = readRefusal(body);
+  return { kind: 'ok', fullSweepDue: body.fullSweepDue === true, ...(refused ? { refused } : {}) };
 }
 
 async function pushFile(
@@ -535,6 +602,12 @@ async function pushFile(
   const key = cwd ? deriveProjectKey(cwd).key : undefined;
   const from = offset;
   let recovered = false;
+  // D1: the first chunk of a RESUMED append proves its prefix. Re-armed after
+  // a size-driven 409, whose new offset is a new claim about the same bytes.
+  let prefixPending = true;
+  // One prefix-driven reset per file per run — a second means the hub and the
+  // file disagree faster than we can re-read, so leave it to the next run.
+  let prefixReset = false;
 
   let fd: number;
   try { fd = openSync(local.abs, 'r'); } catch (e) {
@@ -557,12 +630,14 @@ async function pushFile(
       if (read <= 0) break;
       const body = buf.subarray(0, read);
       const final = offset + read >= size;
+      const prefix = prefixPending && offset > 0 && !reset ? hashFilePrefix(local.abs, offset) : null;
       const meta: AppendMeta = {
         ...(cwd ? { cwd } : {}),
         ...(cwd && key ? { key } : {}),
         ...(local.named && opts.hook ? { hook: opts.hook } : {}),
         ...(final ? { final: true } : {}),
         ...(reset && firstChunk ? { reset: true } : {}),
+        ...(prefix !== null ? { prefix } : {}),
       };
       const headers: Record<string, string> = {
         'content-type': 'application/octet-stream',
@@ -588,6 +663,25 @@ async function pushFile(
         return;
       }
       if (res.status === 409) {
+        const conflict409 = parseJson<AppendConflictResponse>(res);
+        // D1: the hub holds DIFFERENT bytes under our offset — its mirror is
+        // an old-format prefix and our file was rewritten in place. Start the
+        // file over. This is NOT the one-shot `recovered` path: a prefix
+        // mismatch can follow a size recovery, so it has its own guard.
+        if (conflict409?.prefixMismatch === true) {
+          if (prefixReset) {
+            ctx.result.failed++;
+            pushLog(`${nowIso()} push-failed host=${ctx.host} vendor=${vr.vendor} path=${local.rel} err=prefix mismatch twice`);
+            return;
+          }
+          prefixReset = true;
+          reset = true;
+          offset = 0;
+          firstChunk = true;
+          prefixPending = false;
+          try { size = statSync(local.abs).size; } catch { return; }
+          continue;
+        }
         // The hub moved on (a concurrent pusher, or a reset we did not see).
         // Re-read its size and continue from there ONCE; a second 409 is a
         // real disagreement — log and let the next run re-offer the file.
@@ -597,11 +691,11 @@ async function pushFile(
           return;
         }
         recovered = true;
-        const conflict = parseJson<{ size: number }>(res);
-        const hubSize = typeof conflict?.size === 'number' ? conflict.size : 0;
+        const hubSize = typeof conflict409?.size === 'number' ? conflict409.size : 0;
         offset = hubSize;
         firstChunk = false;
         reset = false;
+        prefixPending = true;
         try { size = statSync(local.abs).size; } catch { return; }
         if (offset >= size) {
           ctx.result.unchanged++;
@@ -618,6 +712,7 @@ async function pushFile(
       offset += read;
       ctx.result.bytes += read;
       firstChunk = false;
+      prefixPending = false;
     }
   } finally {
     try { closeSync(fd); } catch { /* ignore */ }
@@ -635,9 +730,17 @@ export interface PendingBytes {
   bytes: number | null;
   /** Files with bytes the hub has not seen. */
   files: number;
+  /**
+   * Refusals the hub reports for this host, from the FIRST manifest reply
+   * (D5). NULL exactly when `bytes` is null — the hub was never successfully
+   * asked, so "no refusals" would be a claim we cannot make.
+   */
+  refused: RefusalReport | null;
   /** Set when the hub could not be asked. */
   error?: string;
 }
+
+const NO_REFUSALS: RefusalReport = { count: 0, recent: [] };
 
 /**
  * Ask the hub what it is missing WITHOUT pushing anything: the same recent-set
@@ -646,14 +749,17 @@ export interface PendingBytes {
  */
 export async function computePendingBytes(): Promise<PendingBytes> {
   const sat = readSatelliteConfig();
-  if (!sat) return { bytes: null, files: 0, error: 'not a satellite' };
+  if (!sat) return { bytes: null, files: 0, refused: null, error: 'not a satellite' };
   const cutoff = Date.now() - RECENT_WINDOW_MS;
   let bytes = 0;
   let files = 0;
+  let refused: RefusalReport | undefined;
   for (const vr of vendorRoots()) {
     let swept: string[] = [];
     try { swept = await glob(vendorPattern(vr), { nodir: true }); } catch { continue; }
-    const batch: Array<{ path: string; size: number; mtime: number }> = [];
+    // The SAME entry builder the real push uses (head included): the probe
+    // must not describe a file differently from the run it predicts.
+    const batch: WireManifestFile[] = [];
     const sizes = new Map<string, number>();
     for (const abs of swept) {
       let st;
@@ -661,7 +767,7 @@ export async function computePendingBytes(): Promise<PendingBytes> {
       if (st.mtimeMs < cutoff) continue;
       const rel = relFor(vr.root, abs);
       sizes.set(rel, st.size);
-      batch.push({ path: rel, size: st.size, mtime: Math.floor(st.mtimeMs) });
+      batch.push(manifestEntry(abs, rel, st.size, Math.floor(st.mtimeMs)));
       if (batch.length >= MAX_MANIFEST_FILES) break;
     }
     if (batch.length === 0) continue;
@@ -675,11 +781,12 @@ export async function computePendingBytes(): Promise<PendingBytes> {
         body: JSON.stringify({ vendor: vr.vendor, full: false, files: batch }),
       });
     } catch (e) {
-      return { bytes: null, files: 0, error: (e as Error).message };
+      return { bytes: null, files: 0, refused: null, error: (e as Error).message };
     }
-    if (res.status !== 200) return { bytes: null, files: 0, error: `manifest replied ${res.status}` };
+    if (res.status !== 200) return { bytes: null, files: 0, refused: null, error: `manifest replied ${res.status}` };
     const body = parseJson<ManifestResponse>(res);
-    if (!body || !Array.isArray(body.files)) return { bytes: null, files: 0, error: 'manifest body unparseable' };
+    if (!body || !Array.isArray(body.files)) return { bytes: null, files: 0, refused: null, error: 'manifest body unparseable' };
+    if (refused === undefined) refused = readRefusal(body) ?? NO_REFUSALS;
     for (const entry of body.files) {
       const size = sizes.get(entry.path);
       if (size === undefined) continue;
@@ -687,7 +794,7 @@ export async function computePendingBytes(): Promise<PendingBytes> {
       if (delta > 0) { bytes += delta; files++; }
     }
   }
-  return { bytes, files };
+  return { bytes, files, refused: refused ?? NO_REFUSALS };
 }
 
 // ---------------------------------------------------------------------------

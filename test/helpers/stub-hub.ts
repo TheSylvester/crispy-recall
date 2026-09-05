@@ -52,6 +52,10 @@ export interface StubHubOptions {
   manifestGarbage?: string;
   /** 413 any manifest carrying more than this many files. */
   manifestMaxFiles?: number;
+  /** `refusedCollisions` / `refusedRecent` every manifest reply carries (D5). */
+  refused?: { count: number; recent: string[] };
+  /** Omit both refusal fields — a pre-0.4.0-sat.3 hub's exact reply shape. */
+  omitRefusalFields?: boolean;
 }
 
 export interface StubHub {
@@ -154,7 +158,13 @@ export async function startStubHub(opts: StubHubOptions = {}): Promise<StubHub> 
         const offset = stored ? stored.byteLength : 0;
         return offset > f.size ? { path: f.path, offset: 0, reset: true as const } : { path: f.path, offset };
       });
-      send(200, { host, fullSweepDue: opts.fullSweepDue === true, files: out });
+      send(200, {
+        host, fullSweepDue: opts.fullSweepDue === true, files: out,
+        ...(opts.omitRefusalFields ? {} : {
+          refusedCollisions: opts.refused?.count ?? 0,
+          refusedRecent: opts.refused?.recent ?? [],
+        }),
+      });
       return;
     }
 
