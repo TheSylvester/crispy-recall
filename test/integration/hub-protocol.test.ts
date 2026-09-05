@@ -224,10 +224,11 @@ describe('install-service unit text (never reaches systemctl)', () => {
     expect(unit).toContain('recall.js" hub serve');
     expect(unit).toContain('Restart=on-failure');
     expect(unit).toContain('RestartSec=10');
-    expect(unit).toContain('After=network-online.target');
-    expect(unit).toContain('Wants=network-online.target');
     expect(unit).toContain('StartLimitIntervalSec=0');
-    expect(unit).not.toContain('After=network.target');
+    expect(unit).toContain('After=network.target');
+    // network-online.target does not exist in the USER manager (LoadState
+    // not-found): Wants= on it is dropped and After= is inert.
+    expect(unit).not.toContain('network-online');
     expect(unit).toContain('TimeoutStopSec=15');
     expect(unit).toContain('WantedBy=default.target');
     expect(hubUnitPath().startsWith(join(sandbox, 'xdg'))).toBe(true);
