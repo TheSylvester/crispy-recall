@@ -24,13 +24,19 @@ export function renderHubUnit(): string {
   return [
     '[Unit]',
     'Description=recall hub daemon (satellite transcript mirror + proxied queries)',
-    'After=network.target',
+    // network-online, not network.target: the daemon binds a Tailscale
+    // address that does not exist yet at network.target. StartLimitIntervalSec=0
+    // removes systemd's 5-failures-in-10s limit, which left the unit `failed`
+    // for good after a reboot race with tailscale0.
+    'After=network-online.target',
+    'Wants=network-online.target',
+    'StartLimitIntervalSec=0',
     '',
     '[Service]',
     'Type=simple',
     `ExecStart="${process.execPath}" "${join(binDir(), 'recall.js')}" hub serve`,
     'Restart=on-failure',
-    'RestartSec=5',
+    'RestartSec=10',
     'TimeoutStopSec=15',
     '',
     '[Install]',
