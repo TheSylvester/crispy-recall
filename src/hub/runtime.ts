@@ -100,7 +100,7 @@ export function hubDaemonAlive(): { alive: boolean; record: HubRecord | null } {
   return { alive: pidAlive(record.pid), record };
 }
 
-const STALE_RECORD_MS = 60 * 60 * 1000;
+export const STALE_RECORD_MS = 60 * 60 * 1000;
 
 /** Ownership of `hub.json` for THIS daemon's tenure. */
 export class HubLock {

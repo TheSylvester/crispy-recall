@@ -16,6 +16,7 @@ import { deriveProjectKey } from "../recall/project-key.js";
 import { readSatelliteConfig } from "../installer/config.js";
 import { getDb } from "../db.js";
 import { binDir, dbPath, logsDir } from "../paths.js";
+import { codexRoot } from "../recall/transcript-roots.js";
 import { appendFileSync, mkdirSync } from "fs";
 import { spawn } from "child_process";
 import { join } from "path";
@@ -31,7 +32,7 @@ import { join } from "path";
  */
 export function vendorForTranscript(
   transcriptPath: string,
-  codexHome = process.env['CODEX_HOME'],
+  codexHome = codexRoot(),
 ): 'claude' | 'codex' {
   const p = transcriptPath.replace(/\\/g, '/');
   const root = codexHome?.replace(/\\/g, '/').replace(/\/$/, '');

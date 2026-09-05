@@ -21,6 +21,7 @@ import * as fs from 'fs';
 import { log } from '../../log.js';
 import * as path from 'path';
 import * as os from 'os';
+import { codexRoot } from '../../recall/transcript-roots.js';
 
 // ============================================================================
 // Types
@@ -57,10 +58,7 @@ export interface CodexSessionMeta {
  *  test/sandbox env set after module import still takes effect (a module-level
  *  const froze the REAL home and leaked reads outside sandboxes). */
 function codexSessionsDir(): string {
-  const root = process.env['CODEX_HOME'];
-  return root && root.length > 0
-    ? path.join(root, 'sessions')
-    : path.join(os.homedir(), '.codex', 'sessions');
+  return path.join(codexRoot(), 'sessions');
 }
 
 /**

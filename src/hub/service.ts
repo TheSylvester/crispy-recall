@@ -24,13 +24,20 @@ export function renderHubUnit(): string {
   return [
     '[Unit]',
     'Description=recall hub daemon (satellite transcript mirror + proxied queries)',
+    // The daemon binds a Tailscale address that does not exist yet at boot, so
+    // the first attempts fail with EADDRNOTAVAIL. The retry loop is the fix:
+    // StartLimitIntervalSec=0 removes systemd's 5-failures-in-10s limit, and
+    // RestartSec=10 retries without a bound until the bind succeeds. There is
+    // no network-online.target in the systemd USER manager (LoadState
+    // not-found), so ordering against it would buy nothing.
     'After=network.target',
+    'StartLimitIntervalSec=0',
     '',
     '[Service]',
     'Type=simple',
     `ExecStart="${process.execPath}" "${join(binDir(), 'recall.js')}" hub serve`,
     'Restart=on-failure',
-    'RestartSec=5',
+    'RestartSec=10',
     'TimeoutStopSec=15',
     '',
     '[Install]',

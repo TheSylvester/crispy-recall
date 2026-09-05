@@ -1530,6 +1530,7 @@ async function main() {
       host: flagValue('--host'),
       revoke: flagValue('--revoke'),
       json: hasFlag('--json'),
+      yes: hasFlag('--yes'),
     });
     exit(code);
   }
