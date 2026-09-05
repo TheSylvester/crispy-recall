@@ -17,6 +17,7 @@
 
 import { createHash } from 'node:crypto';
 import { closeSync, openSync, readSync } from 'node:fs';
+import { log } from '../log.js';
 
 /** Head window for the manifest `head` hash. */
 export const HEAD_BYTES = 4096;
@@ -28,11 +29,14 @@ export const HEX64_RE = /^[0-9a-f]{64}$/;
 const CHUNK_BYTES = 256 * 1024;
 
 /**
- * sha256 of the file's bytes `[0, length)`, or null when the file cannot be
- * read or holds fewer than `length` bytes.
+ * sha256 of the file's bytes `[0, length)`, or null when the file holds fewer
+ * than `length` bytes or cannot be read.
  *
  * Never throws: a hash that cannot be taken means "do not claim anything",
- * and both callers then fall back to the size-only rules.
+ * and both callers then fall back to the size-only rules. The two null causes
+ * are NOT the same, so they are not silent in the same way — a file shorter
+ * than `length` is an ordinary answer, while an I/O error is a fault the
+ * operator must be able to see, and gets exactly one log line.
  */
 export function hashFilePrefix(file: string, length: number): string | null {
   if (!Number.isInteger(length) || length < 0) return null;
@@ -46,12 +50,19 @@ export function hashFilePrefix(file: string, length: number): string | null {
     while (done < length) {
       const want = Math.min(buf.length, length - done);
       const read = readSync(fd, buf, 0, want, done);
-      if (read <= 0) return null; // shorter than `length` — nothing to claim
+      // Shorter than `length`: an ordinary answer, not a fault — no log line.
+      if (read <= 0) return null;
       hash.update(buf.subarray(0, read));
       done += read;
     }
     return hash.digest('hex');
-  } catch {
+  } catch (e) {
+    const err = e as NodeJS.ErrnoException;
+    log({
+      source: 'hub/hash',
+      level: 'warn',
+      summary: `hash: could not read ${file}: ${err.code ?? err.message}`,
+    });
     return null;
   } finally {
     if (fd !== undefined) { try { closeSync(fd); } catch { /* ignore */ } }

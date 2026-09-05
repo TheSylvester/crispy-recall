@@ -324,8 +324,8 @@ describe.skipIf(win32)('hub refusal surfacing (D5)', () => {
 
     // And the doctor probe reads it from that same reply.
     const pending = await computePendingBytes();
-    expect(pending.refused.count).toBeGreaterThanOrEqual(1);
-    expect(pending.refused.recent).toContain(sid);
+    expect(pending.refused?.count).toBeGreaterThanOrEqual(1);
+    expect(pending.refused?.recent).toContain(sid);
   }, 60_000);
 });
 

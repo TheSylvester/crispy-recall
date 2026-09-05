@@ -119,10 +119,11 @@ export interface SatelliteDoctorReport {
   lastPush: string | null;
   pendingBytes: number | null;
   pendingFiles: number;
-  /** Pushes of THIS host's sessions the hub refused as id collisions (D5). */
-  refusedCollisions: number;
+  /** Pushes of THIS host's sessions the hub refused as id collisions (D5).
+   *  Null when the hub could not be asked — never a claim of zero. */
+  refusedCollisions: number | null;
   /** Canonical ids of the most recent of those refusals, newest first. */
-  refusedRecent: string[];
+  refusedRecent: string[] | null;
   git: string;
   cleanupPeriodDays: number | null;
   failingFiles: string[];
@@ -177,7 +178,7 @@ async function runSatelliteDoctor(sat: SatelliteConfig, opts: DoctorOptions): Pr
   const authOk = hubReachable && !report.failures.some((f) => f.check === 'hub.auth');
   const pending = authOk
     ? await computePendingBytes()
-    : { bytes: null, files: 0, refused: { count: 0, recent: [] } };
+    : { bytes: null, files: 0, refused: null };
   const pushLog = readPushLogSummary();
   const cleanup = readCleanupPeriodDays(claudeSettingsPath());
   const shallow = cwdIsShallow();
@@ -197,8 +198,10 @@ async function runSatelliteDoctor(sat: SatelliteConfig, opts: DoctorOptions): Pr
   // D5: the hub refuses a push whose session id already belongs to another
   // machine. Only the hub logged it before this — the satellite operator saw
   // `pending bytes: 0` and no warning, with the sessions silently unindexed.
-  const refusedIds = pending.refused.recent.length ? ` (recent ids: ${pending.refused.recent.join(', ')})` : '';
-  if (pending.refused.count > 0) {
+  // A hub that could not be asked reports NOTHING here: `refused` is null,
+  // and a warning would be an invention (as would a printed `0`).
+  const refusedIds = pending.refused?.recent.length ? ` (recent ids: ${pending.refused.recent.join(', ')})` : '';
+  if (pending.refused !== null && pending.refused.count > 0) {
     warnings.push(
       `the hub refused ${pending.refused.count} push(es) of this host's sessions as session-id collisions — ` +
       `those sessions are NOT indexed on the hub${refusedIds}; on the hub run: recall hub release-foreign-scans`,
@@ -216,8 +219,8 @@ async function runSatelliteDoctor(sat: SatelliteConfig, opts: DoctorOptions): Pr
     lastPush: pushLog.lastPush,
     pendingBytes: pending.bytes,
     pendingFiles: pending.files,
-    refusedCollisions: pending.refused.count,
-    refusedRecent: pending.refused.recent,
+    refusedCollisions: pending.refused?.count ?? null,
+    refusedRecent: pending.refused?.recent ?? null,
     git: gitVersion(),
     cleanupPeriodDays: cleanup,
     failingFiles: pushLog.failingFiles,
@@ -238,7 +241,7 @@ async function runSatelliteDoctor(sat: SatelliteConfig, opts: DoctorOptions): Pr
     console.log(`hub version ${out.hubVersion} (local ${out.localVersion})`);
     console.log(`last push:          ${out.lastPush ?? 'never'}`);
     console.log(`pending bytes:      ${out.pendingBytes === null ? 'unknown' : `${out.pendingBytes} in ${out.pendingFiles} file(s)`}`);
-    console.log(`hub refusals:       ${out.refusedCollisions}${out.refusedCollisions > 0 ? refusedIds : ''}`);
+    console.log(`hub refusals:       ${out.refusedCollisions === null ? 'unknown' : `${out.refusedCollisions}${out.refusedCollisions > 0 ? refusedIds : ''}`}`);
     console.log(`git:                ${out.git}`);
     console.log(`cleanupPeriodDays:  ${out.cleanupPeriodDays ?? 'unset'}`);
     console.log('integrity:          no local database on a satellite');
@@ -466,7 +469,12 @@ export function checkHubHealth(): HubHealth {
   // is the daemon's own refusal record, and `recall doctor` must stay fast on
   // a 1 GB index.
   const collisions = readCollisionEvidence();
-  const recent = collisions.recentSessionIds.length ? ` (recent ids: ${collisions.recentSessionIds.join(', ')})` : '';
+  // A count with no ids is the sweep guard's evidence (`source=scan`): it
+  // refuses per PATH and keeps no host record, so say where the ids live
+  // rather than printing a bare count the operator cannot act on.
+  const recent = collisions.recentSessionIds.length
+    ? ` (recent ids: ${collisions.recentSessionIds.join(', ')})`
+    : (collisions.logLines > 0 ? ' (ids not recorded — see hub.log)' : '');
 
   for (const r of collisions.refusedByHost) {
     warnings.push(

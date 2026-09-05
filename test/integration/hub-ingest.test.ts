@@ -450,4 +450,23 @@ describe.skipIf(win32)('doctor hub section', () => {
     const printed = capture(() => printHub(h));
     expect(printed).toContain(`Collisions:     ≥${tailIds.length} logged`);
   });
+
+  it('a count with no recorded ids says where the ids are, rather than nothing', () => {
+    // The sweep guard refuses per PATH and keeps no host record, so hub.log
+    // can carry collision lines that no `refusedRecent` list mirrors. The
+    // warning must still point somewhere the operator can look.
+    const hostsFile = join(recallRoot(), 'run', 'hub-hosts.json');
+    const saved = readFileSync(hostsFile, 'utf-8');
+    try {
+      writeFileSync(hostsFile, JSON.stringify({ idless: { refusedCollisions: 2, refusedRecent: [] } }, null, 2));
+      const h = checkHubHealth();
+      expect(h.collisions.recentSessionIds).toEqual([]);
+      expect(h.collisions.logLines).toBeGreaterThan(0);
+      const warning = h.warnings.find((w) => w.includes('refused as session-id collisions'));
+      expect(warning).toContain('(ids not recorded — see hub.log)');
+      expect(warning).not.toContain('recent ids:');
+    } finally {
+      writeFileSync(hostsFile, saved);
+    }
+  });
 });

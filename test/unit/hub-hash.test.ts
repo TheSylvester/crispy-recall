@@ -4,7 +4,7 @@
  * Pure filesystem reads into a temp directory; no recall root is touched, so
  * this suite needs no `_setTestRoot`.
  */
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -57,6 +57,29 @@ describe('hashFilePrefix', () => {
     expect(hashFilePrefix(join(dir, 'absent2.txt'), 1)).toBeNull();
     expect(hashFilePrefix(p, -1)).toBeNull();
     expect(hashFilePrefix(p, 1.5)).toBeNull();
+  });
+
+  it('a file SHORTER than `length` is silent; an I/O error logs exactly one line', () => {
+    // The two null causes are not the same fault. A short file is an ordinary
+    // answer the callers act on; an unreadable path is an operator problem.
+    const written: string[] = [];
+    const spy = vi.spyOn(process.stderr, 'write').mockImplementation((c: unknown) => {
+      written.push(String(c));
+      return true;
+    });
+    try {
+      expect(hashFilePrefix(file('quiet.txt', 'abc'), 4)).toBeNull();
+      expect(written.filter((l) => l.includes('hub/hash'))).toHaveLength(0);
+
+      // A directory opens but never reads (EISDIR on Linux).
+      expect(hashFilePrefix(dir, 8)).toBeNull();
+      const logged = written.filter((l) => l.includes('hub/hash'));
+      expect(logged).toHaveLength(1);
+      expect(logged[0]).toContain('could not read');
+      expect(logged[0]).toContain(dir);
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it('spans more than one read chunk', () => {

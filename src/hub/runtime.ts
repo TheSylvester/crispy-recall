@@ -213,6 +213,18 @@ export function pushRefusedRecent(current: string[], sid: string): string[] {
 
 export type HostRecords = Record<string, HostRecord>;
 
+/**
+ * Forget a host's refusals: the counter and the id list both go to zero.
+ *
+ * The refusal record is a STANDING warning on both doctors — without a way to
+ * clear it, an operator who has resolved the collisions is told about them
+ * for ever. `recall hub release-foreign-scans` calls this after it releases
+ * the foreign provenance rows.
+ */
+export function clearHostRefusals(host: string): void {
+  updateHostRecord(host, (r) => ({ ...r, refusedCollisions: 0, refusedRecent: [] }));
+}
+
 export function hubHostsPath(): string {
   return join(runDir(), 'hub-hosts.json');
 }

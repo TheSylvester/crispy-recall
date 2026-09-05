@@ -157,9 +157,26 @@ describe('satellite doctor / status / uninstall', () => {
     await hub.close();
     const { code, out } = await captured(() => runDoctor({ json: true }));
     expect(code).toBe(1);
-    const j = JSON.parse(out) as { hubReachable: boolean; pendingBytes: number | null };
+    const j = JSON.parse(out) as {
+      hubReachable: boolean; pendingBytes: number | null;
+      refusedCollisions: number | null; refusedRecent: string[] | null;
+    };
     expect(j.hubReachable).toBe(false);
     expect(j.pendingBytes).toBeNull();
+    // A hub that was never asked reports NOTHING — a printed 0 would be a
+    // claim, and the same condition that makes `pendingBytes` unknown makes
+    // the refusal count unknown.
+    expect(j.refusedCollisions).toBeNull();
+    expect(j.refusedRecent).toBeNull();
+    hub = await startStubHub(); // afterEach closes something valid
+  });
+
+  it('prints `hub refusals: unknown` — never 0 — when the hub could not be asked', async () => {
+    await hub.close();
+    const { out } = await captured(() => runDoctor({}));
+    expect(out).toContain('pending bytes:      unknown');
+    expect(out).toContain('hub refusals:       unknown');
+    expect(out).not.toContain('release-foreign-scans');
     hub = await startStubHub(); // afterEach closes something valid
   });
 
@@ -202,6 +219,26 @@ describe('satellite doctor / status / uninstall', () => {
     const { out } = await captured(() => runDoctor({}));
     expect(out).toContain('hub refusals:       0');
     expect(out).not.toContain('release-foreign-scans');
+  });
+
+  it('an OLD hub that sends neither refusal field still reads as zero, with no warning', async () => {
+    // Reverse compatibility: the fields are additive, so a 0.4.0-sat.2 hub
+    // omits them entirely. That is "none reported", never "unknown" — the
+    // manifest round trip itself succeeded.
+    await hub.close();
+    hub = await startStubHub({ host: 'sat-doctor', omitRefusalFields: true });
+    makeSatellite();
+    seedTranscript(sandbox);
+
+    const { code, out } = await captured(() => runDoctor({}));
+    expect(code).toBe(0);
+    expect(out).toContain('hub refusals:       0');
+    expect(out).not.toContain('release-foreign-scans');
+
+    const { out: json } = await captured(() => runDoctor({ json: true }));
+    const j = JSON.parse(json) as { refusedCollisions: number | null; refusedRecent: string[] | null };
+    expect(j.refusedCollisions).toBe(0);
+    expect(j.refusedRecent).toEqual([]);
   });
 
   it('runUninstall removes the satellite token', () => {

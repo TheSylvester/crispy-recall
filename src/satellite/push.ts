@@ -23,9 +23,15 @@
  *     byte lands (409 `prefixMismatch` → reset).
  * COST: the prefix hash is O(file) on both sides, once per resumed push.
  * Transcripts are tens of MB at worst, so this is a read, not a rewrite.
- * KNOWN LIMITATION: a rewrite that keeps the size IDENTICAL and leaves the
- * first 4 KB unchanged is invisible until the file grows — at which point the
- * `prefix` hash catches it on the next resumed append.
+ * KNOWN LIMITATIONS, both self-healing:
+ *   - a rewrite that keeps the size IDENTICAL and leaves the first 4 KB
+ *     unchanged is invisible until the file grows — at which point the
+ *     `prefix` hash catches it on the next resumed append;
+ *   - a rewrite that lands BETWEEN the chunks of a multi-chunk push is not
+ *     caught inside that run, because only the FIRST chunk carries `prefix`
+ *     (one hash per resumed push, not one per 8 MiB chunk). The next run
+ *     re-offers the file and catches it through `head`, or through `prefix`
+ *     once the file grows again.
  *
  * @module satellite/push
  */
@@ -463,7 +469,6 @@ export function planManifestBatches<T extends { rel: string; size: number; mtime
   let cur: T[] = [];
   let bytes = envelopeBytes;
   for (const f of files) {
-    // +1 for the separating comma.
     // +1 for the separating comma; +76 for the `head` field the builder adds
     // (`,"head":"<64 hex>"`), which is not known here but always sent.
     const entryBytes = Buffer.byteLength(
@@ -725,8 +730,12 @@ export interface PendingBytes {
   bytes: number | null;
   /** Files with bytes the hub has not seen. */
   files: number;
-  /** Refusals the hub reports for this host, from the FIRST manifest reply (D5). */
-  refused: RefusalReport;
+  /**
+   * Refusals the hub reports for this host, from the FIRST manifest reply
+   * (D5). NULL exactly when `bytes` is null — the hub was never successfully
+   * asked, so "no refusals" would be a claim we cannot make.
+   */
+  refused: RefusalReport | null;
   /** Set when the hub could not be asked. */
   error?: string;
 }
@@ -740,7 +749,7 @@ const NO_REFUSALS: RefusalReport = { count: 0, recent: [] };
  */
 export async function computePendingBytes(): Promise<PendingBytes> {
   const sat = readSatelliteConfig();
-  if (!sat) return { bytes: null, files: 0, refused: NO_REFUSALS, error: 'not a satellite' };
+  if (!sat) return { bytes: null, files: 0, refused: null, error: 'not a satellite' };
   const cutoff = Date.now() - RECENT_WINDOW_MS;
   let bytes = 0;
   let files = 0;
@@ -772,11 +781,11 @@ export async function computePendingBytes(): Promise<PendingBytes> {
         body: JSON.stringify({ vendor: vr.vendor, full: false, files: batch }),
       });
     } catch (e) {
-      return { bytes: null, files: 0, refused: refused ?? NO_REFUSALS, error: (e as Error).message };
+      return { bytes: null, files: 0, refused: null, error: (e as Error).message };
     }
-    if (res.status !== 200) return { bytes: null, files: 0, refused: refused ?? NO_REFUSALS, error: `manifest replied ${res.status}` };
+    if (res.status !== 200) return { bytes: null, files: 0, refused: null, error: `manifest replied ${res.status}` };
     const body = parseJson<ManifestResponse>(res);
-    if (!body || !Array.isArray(body.files)) return { bytes: null, files: 0, refused: refused ?? NO_REFUSALS, error: 'manifest body unparseable' };
+    if (!body || !Array.isArray(body.files)) return { bytes: null, files: 0, refused: null, error: 'manifest body unparseable' };
     if (refused === undefined) refused = readRefusal(body) ?? NO_REFUSALS;
     for (const entry of body.files) {
       const size = sizes.get(entry.path);

@@ -54,6 +54,8 @@ export interface StubHubOptions {
   manifestMaxFiles?: number;
   /** `refusedCollisions` / `refusedRecent` every manifest reply carries (D5). */
   refused?: { count: number; recent: string[] };
+  /** Omit both refusal fields — a pre-0.4.0-sat.3 hub's exact reply shape. */
+  omitRefusalFields?: boolean;
 }
 
 export interface StubHub {
@@ -158,8 +160,10 @@ export async function startStubHub(opts: StubHubOptions = {}): Promise<StubHub> 
       });
       send(200, {
         host, fullSweepDue: opts.fullSweepDue === true, files: out,
-        refusedCollisions: opts.refused?.count ?? 0,
-        refusedRecent: opts.refused?.recent ?? [],
+        ...(opts.omitRefusalFields ? {} : {
+          refusedCollisions: opts.refused?.count ?? 0,
+          refusedRecent: opts.refused?.recent ?? [],
+        }),
       });
       return;
     }
