@@ -244,6 +244,11 @@ describe.skipIf(win32)('hub daemon — push endpoints', () => {
     expect((await post({ vendor: 'claude', full: false, files: [{ path: '../x.jsonl', size: 1, mtime: 1 }] })).status).toBe(400);
     expect((await post({ vendor: 'claude', full: false, files: new Array(1001).fill({ path: 'projects/a.jsonl', size: 1, mtime: 1 }) })).status).toBe(400);
     expect((await post({ vendor: 'claude', full: 'yes', files: [] })).status).toBe(400);
+    // D1: `head` is optional, but a present one must be 64 lowercase hex.
+    expect((await post({ vendor: 'claude', full: false, files: [{ path: 'projects/a.jsonl', size: 1, mtime: 1, head: 'abc' }] })).status).toBe(400);
+    expect((await post({ vendor: 'claude', full: false, files: [{ path: 'projects/a.jsonl', size: 1, mtime: 1, head: 'A'.repeat(64) }] })).status).toBe(400);
+    expect((await post({ vendor: 'claude', full: false, files: [{ path: 'projects/a.jsonl', size: 1, mtime: 1, head: 7 }] })).status).toBe(400);
+    expect((await post({ vendor: 'claude', full: false, files: [{ path: 'projects/a.jsonl', size: 1, mtime: 1, head: 'a'.repeat(64) }] })).status).toBe(200);
     expect((await post('nope')).status).toBe(400);
     const huge = await req(d.url, { method: 'POST', path: '/v1/push/manifest', headers: authHeaders(token), body: JSON.stringify({ vendor: 'claude', full: false, files: [], pad: 'x'.repeat(256 * 1024) }) });
     expect(huge.status).toBe(413);

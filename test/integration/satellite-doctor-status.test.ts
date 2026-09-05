@@ -174,6 +174,36 @@ describe('satellite doctor / status / uninstall', () => {
     expect(existsSync(join(recallHome, 'recall.db'))).toBe(false);
   });
 
+  it('reports the hub refusals the manifest reply carries, with the recovery command', async () => {
+    // D5: the hub refuses a push whose session id already belongs to another
+    // machine and indexes nothing. Before this the satellite operator saw
+    // `pending bytes: 0` and no warning at all.
+    await hub.close();
+    hub = await startStubHub({ host: 'sat-doctor', refused: { count: 3, recent: ['sid-new', 'sid-old'] } });
+    makeSatellite();
+    seedTranscript(sandbox);
+
+    const { out } = await captured(() => runDoctor({}));
+    expect(out).toContain('hub refusals:       3');
+    expect(out).toContain('sid-new, sid-old');
+    const warning = out.split('\n').find((l) => l.includes('refused 3 push(es)'));
+    expect(warning).toBeDefined();
+    expect(warning).toContain('NOT indexed on the hub');
+    expect(warning).toContain('recall hub release-foreign-scans');
+
+    const { out: json } = await captured(() => runDoctor({ json: true }));
+    const j = JSON.parse(json) as { refusedCollisions: number; refusedRecent: string[] };
+    expect(j.refusedCollisions).toBe(3);
+    expect(j.refusedRecent).toEqual(['sid-new', 'sid-old']);
+  });
+
+  it('prints `hub refusals: 0` when the hub reports none', async () => {
+    seedTranscript(sandbox);
+    const { out } = await captured(() => runDoctor({}));
+    expect(out).toContain('hub refusals:       0');
+    expect(out).not.toContain('release-foreign-scans');
+  });
+
   it('runUninstall removes the satellite token', () => {
     const tokenFile = join(recallHome, 'satellite-token');
     expect(readFileSync(tokenFile, 'utf-8').trim()).toBe(hub.token);
