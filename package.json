@@ -36,6 +36,7 @@
   "scripts": {
     "build": "node scripts/build.mjs",
     "typecheck": "tsc --noEmit",
+    "pretest": "npm run build",
     "test": "vitest run",
     "prepack": "npm run build && rm -f dist/better_sqlite3.node",
     "prepublishOnly": "npm run build && rm -f dist/better_sqlite3.node"
