@@ -37,7 +37,6 @@
  */
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import * as os from 'node:os';
 import { execFileSync } from 'node:child_process';
 import {
   extractSessionEdits,
@@ -45,6 +44,7 @@ import {
   type SessionEditTrace,
 } from './adapters/claude/transcript-edits.js';
 import { log } from './log.js';
+import { claudeRoot } from './recall/transcript-roots.js';
 
 // ============================================================================
 // Types
@@ -269,10 +269,10 @@ function cwdToProjectSlugNarrow(cwd: string): string {
 }
 
 function defaultSessionsDir(repoRoot: string): string {
-  const claudeRoot = process.env['CLAUDE_CONFIG_DIR'] ?? path.join(os.homedir(), '.claude');
-  const broad = path.join(claudeRoot, 'projects', cwdToProjectSlug(repoRoot));
+  const root = claudeRoot();
+  const broad = path.join(root, 'projects', cwdToProjectSlug(repoRoot));
   if (fs.existsSync(broad)) return broad;
-  const narrow = path.join(claudeRoot, 'projects', cwdToProjectSlugNarrow(repoRoot));
+  const narrow = path.join(root, 'projects', cwdToProjectSlugNarrow(repoRoot));
   if (fs.existsSync(narrow)) return narrow;
   return broad; // missing-dir warn path uses the canonical form
 }
