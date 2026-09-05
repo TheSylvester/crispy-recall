@@ -18,7 +18,7 @@ import { getDb, closeDbBeforeChildSpawn, RETRIEVAL_SCHEMA_DDL, PROJECT_KEY_BACKF
 import { dbPath, binDir, remoteRoot } from '../paths.js';
 import { mirrorRoots } from '../hub/mirror.js';
 import { log } from '../log.js';
-import { deriveProjectKey } from '../recall/project-key.js';
+import { deriveProjectKey, upgradeLocalPathKey, wslUncToPosix } from '../recall/project-key.js';
 import { isUnderRemoteRoot } from '../recall/mirror-meta.js';
 import type { CodexRekeyResult } from './codex-rekey-migration.js';
 
@@ -234,6 +234,12 @@ export interface RekeyProjectsResult {
   skippedMirror: number;
   /** project_ids whose derivation failed transiently — rows left NULL. */
   transient: number;
+  /** Rows carrying a `\\wsl$\…` UNC key that this pass rewrote. */
+  wslRows: number;
+  /** Of those, rows that reached a `git:`/`origin:` key. */
+  wslUpgraded: number;
+  /** Of those, rows left with the POSIX `path:` key. */
+  wslPathOnly: number;
   /** Whether the durable 'complete' marker was written (false → re-run). */
   markerWritten: boolean;
 }
@@ -284,7 +290,26 @@ export function repairRekeyProjects(opts: { force: boolean }): RekeyProjectsResu
     derived.push({ projectId, key: result.key });
   }
 
+  // WSL UNC keys (U3). A Windows satellite that works on a repository inside
+  // WSL saw a `\\wsl$\<distro>\…` cwd and keyed the mount, not the repository,
+  // so the one repository split into two keys. Such a key is provably wrong,
+  // and this branch corrects it without `--force`.
+  const wslKeys = (d.all(
+    `SELECT DISTINCT project_key AS key FROM messages
+      WHERE project_key LIKE 'path://wsl$/%' OR project_key LIKE 'path://wsl.localhost/%'`,
+  ) as Array<{ key: string }>);
+  const wslRewrites: Array<{ from: string; to: string }> = [];
+  for (const row of wslKeys) {
+    const unc = wslUncToPosix(row.key.slice('path:'.length));
+    if (!unc) continue;
+    const to = upgradeLocalPathKey('path:' + unc.posix);
+    wslRewrites.push({ from: row.key, to });
+  }
+
   let updated = 0;
+  let wslRows = 0;
+  let wslUpgraded = 0;
+  let wslPathOnly = 0;
   const markerWritten = transient === 0;
 
   d.exec('BEGIN IMMEDIATE');
@@ -299,6 +324,17 @@ export function repairRekeyProjects(opts: { force: boolean }): RekeyProjectsResu
     for (const row of derived) {
       const info = d.run(sql, [row.key, row.projectId]) as { changes?: number } | undefined;
       updated += Number(info?.changes ?? 0);
+    }
+
+    // The UNC rewrite runs LAST, so a `--force` re-derivation from the UNC
+    // project_id cannot overwrite it.
+    for (const row of wslRewrites) {
+      const info = d.run(
+        `UPDATE messages SET project_key = ? WHERE project_key = ?`, [row.to, row.from],
+      ) as { changes?: number } | undefined;
+      const n = Number(info?.changes ?? 0);
+      wslRows += n;
+      if (row.to.startsWith('path:')) wslPathOnly += n; else wslUpgraded += n;
     }
 
     // Every statement in `fts` is IF NOT EXISTS, so the view, FTS table and
@@ -322,8 +358,12 @@ export function repairRekeyProjects(opts: { force: boolean }): RekeyProjectsResu
     source: 'installer/repair',
     level: 'info',
     summary: `project keys: ${considered} project_ids, ${updated} rows updated, ` +
-      `${skippedMirror} mirror-only skipped, ${transient} transient (left NULL)`,
+      `${skippedMirror} mirror-only skipped, ${transient} transient (left NULL); ` +
+      `wsl-unc keys: ${wslRows} rows → ${wslUpgraded} upgraded, ${wslPathOnly} left as path:<posix>`,
   });
 
-  return { projectIds: considered, updated, skippedMirror, transient, markerWritten };
+  return {
+    projectIds: considered, updated, skippedMirror, transient,
+    wslRows, wslUpgraded, wslPathOnly, markerWritten,
+  };
 }

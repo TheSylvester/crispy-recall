@@ -20,6 +20,7 @@ import {
 import { tmpdir, platform } from 'node:os';
 import { join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 
 import { _setTestRoot, dbPath, recallRoot, remoteRoot, transcriptGlob } from '../../src/paths.js';
 import { _resetDb, getDb } from '../../src/db.js';
@@ -35,6 +36,7 @@ import {
   HUB_LOG_TAIL_BYTES, checkHubHealth, hasCollisionEvidence, printHub, readCollisionEvidence,
 } from '../../src/installer/doctor.js';
 import { writeHubConfig } from '../../src/installer/config.js';
+import { clearProjectKeyCache } from '../../src/recall/project-key.js';
 import { appendPath, authHeaders, claudeEntry, codexRollout, metaHeader, req } from './helpers/hub-harness.js';
 
 const win32 = platform() === 'win32';
@@ -62,6 +64,27 @@ function stageMirror(host: string, rel: string, body: string, meta: PushIngestJo
   writeSidecar(abs, { host, ...(meta.cwd !== undefined ? { cwd: meta.cwd } : {}), ...(meta.key !== undefined ? { key: meta.key } : {}), ...(meta.hook ? { hook: meta.hook } : {}), updatedAt: new Date().toISOString(), v: 1 });
   const st = statSync(abs);
   return { host, vendor, rel, abs, mtimeInt: Math.floor(st.mtimeMs), size: st.size, meta, reset: false };
+}
+
+/** A two-commit git repository under the sandbox. Returns its path. */
+function makeGitRepo(name: string): string {
+  const repo = join(sandbox, name);
+  mkdirSync(repo, { recursive: true });
+  const g = (args: string[]) => execFileSync('git', [
+    '-c', 'user.name=Test', '-c', 'user.email=test@example.com', '-c', 'commit.gpgsign=false',
+    ...args,
+  ], { cwd: repo, encoding: 'utf8' }).trim();
+  g(['init', '-q', '-b', 'main']);
+  writeFileSync(join(repo, 'f.txt'), 'content\n');
+  g(['add', '-A']);
+  g(['commit', '-q', '-m', 'c0']);
+  clearProjectKeyCache();
+  return repo;
+}
+
+function rootCommitOf(repo: string): string {
+  return execFileSync('git', ['rev-list', '--max-parents=0', 'HEAD'], { cwd: repo, encoding: 'utf8' })
+    .split('\n')[0]!.trim();
 }
 
 function capture(fn: () => void): string {
@@ -120,6 +143,51 @@ describe.skipIf(win32)('runPushIngest (§2.4)', () => {
     expect(d.embeds).toEqual([sid]);
     expect(d.refused).toEqual([]);
     expect(d.lines.some((l) => l.startsWith('push-ingested host=sat1'))).toBe(true);
+  });
+
+  it('upgrades a sidecar path: key the HUB owns to the repository key (U3)', async () => {
+    // A Windows satellite reached this repository through `\\\\wsl$\\Ubuntu\\…`,
+    // so it could key only the path. The hub owns the directory and knows the
+    // repository — one physical repo must keep one key.
+    const repo = makeGitRepo('wsl-repo');
+    const sid = randomUUID();
+    const rel = `projects/-wsl-repo/${sid}.jsonl`;
+    const job = stageMirror('silverera2', rel, claudeEntry(sid, 0, 'a windows turn on a wsl repository, long enough to clear the floor', { cwd: repo }), {
+      cwd: repo, key: `path:${repo}`,
+    });
+    const d = deps();
+    expect(await runPushIngest(job, d)).toBe('ingested');
+    expect(getDb(dbPath()).get('SELECT project_key FROM messages WHERE session_id = ?', [sid]))
+      .toEqual({ project_key: `git:${rootCommitOf(repo)}` });
+    expect(d.lines.some((l) => l.startsWith('key-upgraded host=silverera2')
+      && l.includes(`from=path:${repo}`) && l.includes(`to=git:${rootCommitOf(repo)}`))).toBe(true);
+  });
+
+  it('leaves a path: key for a directory the hub does not own unchanged', async () => {
+    const sid = randomUUID();
+    const rel = `projects/-gone/${sid}.jsonl`;
+    const job = stageMirror('silverera2', rel, claudeEntry(sid, 0, 'a turn from a path this hub never had, long enough to clear it', { cwd: '/home/u/gone' }), {
+      cwd: '/home/u/gone', key: 'path:/home/u/gone',
+    });
+    const d = deps();
+    expect(await runPushIngest(job, d)).toBe('ingested');
+    expect(getDb(dbPath()).get('SELECT project_key FROM messages WHERE session_id = ?', [sid]))
+      .toEqual({ project_key: 'path:/home/u/gone' });
+    expect(d.lines.some((l) => l.startsWith('key-upgraded'))).toBe(false);
+  });
+
+  it('the mirror SWEEP upgrades the same sidecar key', async () => {
+    const repo = makeGitRepo('wsl-repo-sweep');
+    const sid = randomUUID();
+    const rel = `projects/-wsl-repo-sweep/${sid}.jsonl`;
+    // Staged on disk with a sidecar, but never pushed: the sweep ingests it.
+    stageMirror('silverera2', rel, claudeEntry(sid, 0, 'a swept windows turn on a wsl repository, long enough to clear it', { cwd: repo }), {
+      cwd: repo, key: `path:${repo}`,
+    });
+    const r = await runMirrorSweep();
+    expect(r.ingested).toBeGreaterThanOrEqual(1);
+    expect(getDb(dbPath()).get('SELECT project_key FROM messages WHERE session_id = ?', [sid]))
+      .toEqual({ project_key: `git:${rootCommitOf(repo)}` });
   });
 
   it('ingests WITHOUT hook context: cwd from the transcript, key from the sidecar, never derived', async () => {

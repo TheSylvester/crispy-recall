@@ -22,7 +22,8 @@ import { tmpdir, platform } from 'node:os';
 import { randomUUID } from 'node:crypto';
 
 import {
-  clearProjectKeyCache, deriveProjectKey, foldKeyPath, normalizeOrigin,
+  clearProjectKeyCache, deriveProjectKey, foldKeyPath, normalizeOrigin, upgradeLocalPathKey,
+  wslUncToPosix,
 } from '../../src/recall/project-key.js';
 import { normalizePath } from '../../src/url-path-resolver.js';
 import { _setTestRoot, dbPath } from '../../src/paths.js';
@@ -351,9 +352,17 @@ describe('normalizeOrigin', () => {
 });
 
 describe('foldKeyPath', () => {
-  it('lowercases the WHOLE path on win32', () => {
+  it('lowercases a win32 path that is not POSIX-absolute', () => {
     expect(foldKeyPath('C:/WinDev/Proj', 'win32')).toBe('c:/windev/proj');
-    expect(foldKeyPath('/home/u/Dev/Proj', 'win32')).toBe('/home/u/dev/proj');
+    expect(foldKeyPath('//Server/Share/Dev', 'win32')).toBe('//server/share/dev');
+  });
+
+  it('keeps the case of a POSIX-absolute path on win32 too', () => {
+    // A Windows satellite working on a WSL repository derives the POSIX path
+    // the Linux hub owns. POSIX paths are case-sensitive, so folding here
+    // would split the one repository across two keys again.
+    expect(foldKeyPath('/home/u/Dev/Proj', 'win32')).toBe('/home/u/Dev/Proj');
+    expect(foldKeyPath('/home/u/Dev/Proj', 'linux')).toBe('/home/u/Dev/Proj');
   });
 
   it('folds a Windows-SHAPED path on any host, and leaves a POSIX path alone', () => {
@@ -405,5 +414,58 @@ describe.skipIf(platform() === 'win32')('non-ASCII cwd round-trip', () => {
       restore();
       _resetDb();
     }
+  });
+});
+
+describe('wslUncToPosix', () => {
+  it('converts every accepted UNC spelling', () => {
+    expect(wslUncToPosix('\\\\wsl$\\Ubuntu\\home\\silver\\dev\\x'))
+      .toEqual({ distro: 'Ubuntu', posix: '/home/silver/dev/x' });
+    expect(wslUncToPosix('\\\\wsl.localhost\\Ubuntu\\home\\x'))
+      .toEqual({ distro: 'Ubuntu', posix: '/home/x' });
+    expect(wslUncToPosix('//wsl$/Ubuntu/home/x'))
+      .toEqual({ distro: 'Ubuntu', posix: '/home/x' });
+    // The host part is matched in any case; the POSIX half keeps its own.
+    expect(wslUncToPosix('\\\\WSL$\\Ubuntu-22.04\\home\\Silver\\Dev'))
+      .toEqual({ distro: 'Ubuntu-22.04', posix: '/home/Silver/Dev' });
+    // The distro root alone is still the POSIX root.
+    expect(wslUncToPosix('\\\\wsl$\\Ubuntu')).toEqual({ distro: 'Ubuntu', posix: '/' });
+  });
+
+  it('leaves every other shape alone', () => {
+    expect(wslUncToPosix('C:\\Users\\u\\dev')).toBeUndefined();
+    expect(wslUncToPosix('c:/Users/u/dev')).toBeUndefined();
+    expect(wslUncToPosix('/home/silver/dev/x')).toBeUndefined();
+    expect(wslUncToPosix('\\\\Server\\Share\\dev')).toBeUndefined();
+    expect(wslUncToPosix('')).toBeUndefined();
+  });
+});
+
+describe.skipIf(platform() === 'win32')('a \\\\wsl$ UNC cwd', () => {
+  it('keys by the POSIX path when git cannot answer', () => {
+    // The hub has no such directory, and a Windows satellite with no git on
+    // PATH answers the same way. Both must land on the POSIX path key.
+    const r = deriveProjectKey('\\\\wsl$\\Ubuntu\\home\\silver\\dev\\antidote-dev');
+    expect(r.kind).toBe('path');
+    expect(r.key).toBe('path:/home/silver/dev/antidote-dev');
+  });
+
+  it('keys by the POSIX path when the git executable is absent', () => {
+    const dir = join(sandbox, 'unc-live');
+    mkdirSync(dir, { recursive: true });
+    process.env['PATH'] = mkdtempSync(join(sandbox, 'nogit-'));
+    const r = deriveProjectKey(`//wsl$/Ubuntu${dir}`);
+    expect(r.key).toBe(`path:${dir}`);
+  });
+
+  it('upgradeLocalPathKey turns a local POSIX path key into the repo key', () => {
+    const repo = makeRepo('unc-repo', 2);
+    const key = 'path:' + repo;
+    expect(upgradeLocalPathKey(key)).toBe('git:' + rootCommit(repo));
+    // A path this machine does not own, and a key that is already a repo
+    // identity, are both returned unchanged.
+    expect(upgradeLocalPathKey('path:/no/such/dir/anywhere')).toBe('path:/no/such/dir/anywhere');
+    expect(upgradeLocalPathKey('path:c:/windev/proj')).toBe('path:c:/windev/proj');
+    expect(upgradeLocalPathKey('git:' + 'a'.repeat(40))).toBe('git:' + 'a'.repeat(40));
   });
 });

@@ -15,6 +15,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import { tmpdir, platform } from 'node:os';
 import { randomUUID } from 'node:crypto';
@@ -168,6 +169,38 @@ describe.skipIf(platform() === 'win32')('repairRekeyProjects', () => {
     // --force never reaches a mirror-only project_id.
     expect(keyOf('M1')).toBe(MIRROR_KEY);
   });
+
+  it('rewrites a \\\\wsl$ UNC key without --force, upgrading the ones the hub owns', () => {
+    // A Windows satellite working on a WSL repository keyed the mount it saw,
+    // not the repository. Two rows: one whose POSIX path this hub owns, one
+    // whose path is gone.
+    const repo = join(recallHome, 'wsl-repo');
+    mkdirSync(repo, { recursive: true });
+    const g = (args: string[]) => execFileSync('git', [
+      '-c', 'user.name=Test', '-c', 'user.email=test@example.com', '-c', 'commit.gpgsign=false',
+      ...args,
+    ], { cwd: repo, encoding: 'utf8' }).trim();
+    g(['init', '-q', '-b', 'main']);
+    writeFileSync(join(repo, 'f.txt'), 'content\n');
+    g(['add', '-A']);
+    g(['commit', '-q', '-m', 'c0']);
+    const root = g(['rev-list', '--max-parents=0', 'HEAD']).split('\n')[0]!.trim();
+    clearProjectKeyCache();
+
+    insertMessage('W1', 'W1-m0', `//wsl$/Ubuntu${repo}`, `path://wsl$/ubuntu${repo.toLowerCase()}`);
+    insertMessage('W2', 'W2-m0', '//wsl.localhost/Ubuntu/home/silver/dev/gone', 'path://wsl.localhost/ubuntu/home/silver/dev/gone');
+
+    const r = repairRekeyProjects({ force: false });
+    expect(r.wslRows).toBe(2);
+    expect(r.wslUpgraded).toBe(1);
+    expect(r.wslPathOnly).toBe(1);
+    expect(keyOf('W1')).toBe(`git:${root}`);
+    expect(keyOf('W2')).toBe('path:/home/silver/dev/gone');
+
+    // A second run finds nothing left to rewrite.
+    const second = repairRekeyProjects({ force: false });
+    expect(second.wslRows).toBe(0);
+  }, 30_000);
 
   it('a transient derivation leaves the rows NULL, the marker absent, and markerWritten false', () => {
     // A project_id that EXISTS on disk is the only one that reaches git.

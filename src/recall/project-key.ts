@@ -19,7 +19,11 @@
  *   unless `--force` is given.
  * - On Windows, non-git directories unify across casings through the key half
  *   only: the key is fully folded, while `project_id` keeps normalizePath's
- *   drive-letter-only rule.
+ *   drive-letter-only rule. A POSIX-absolute path is exempt from the fold.
+ * - A Windows satellite that works on a WSL repository sees a `\\wsl$\…` UNC
+ *   cwd. That cwd keys by the POSIX path inside the distro, and the hub
+ *   upgrades such a key to the repository identity it can see itself
+ *   (`upgradeLocalPathKey`), so one repository keeps one key.
  *
  * @module recall/project-key
  */
@@ -87,13 +91,65 @@ function isTransient(r: SpawnSyncReturns<string>): boolean {
  * values a Windows satellite wrote (`c:/WinDev/Proj`): without the shape test
  * the hub would key `path:c:/WinDev/Proj` while the satellite keys
  * `path:c:/windev/proj`, and the two would never unify.
+ *
+ * A POSIX-ABSOLUTE path is exempt on every host, win32 included: a Windows
+ * satellite that works on a WSL repository derives `/home/u/Dev/Proj`, and
+ * the Linux hub that owns that directory keys the same string with its case
+ * intact. Folding it on the satellite alone would split the repository again.
  */
 export function foldKeyPath(p: string, platform: NodeJS.Platform = process.platform): string {
-  return platform === 'win32' || /^[A-Za-z]:\//.test(p) ? p.toLowerCase() : p;
+  if (/^[A-Za-z]:\//.test(p)) return p.toLowerCase();
+  if (/^\/(?!\/)/.test(p)) return p;
+  return platform === 'win32' ? p.toLowerCase() : p;
 }
 
+/**
+ * A `\\wsl$\<distro>\<path>` or `\\wsl.localhost\<distro>\<path>` UNC path
+ * split into its distro and the POSIX path INSIDE that distro. Both
+ * separator styles and any case of the host part are accepted; the POSIX
+ * half keeps its case, because POSIX paths are case-sensitive.
+ *
+ * Returns undefined for every other shape — a drive path, a plain POSIX
+ * path, and any other UNC share.
+ */
+export function wslUncToPosix(p: string): { distro: string; posix: string } | undefined {
+  const m = /^[\\/]{2}(?:wsl\$|wsl\.localhost)[\\/]([^\\/]+)(?:[\\/](.*))?$/i.exec(p.trim());
+  if (!m) return undefined;
+  const rest = (m[2] ?? '').replace(/\\/g, '/').replace(/^\/+/, '').replace(/\/+$/, '');
+  return { distro: m[1]!, posix: '/' + rest };
+}
+
+/**
+ * The `path:` key for a directory.
+ *
+ * A `\\wsl$\…` cwd is rewritten to the POSIX path first: the Windows
+ * satellite sees the repository through a mount, while the hub owns the
+ * directory itself. Both must key the one repository the same way.
+ */
 function pathKey(p: string): string {
+  const unc = wslUncToPosix(p);
+  if (unc) return 'path:' + unc.posix;
   return 'path:' + foldKeyPath(normalizePath(p));
+}
+
+/**
+ * Upgrade a `path:` key that names a directory THIS machine owns.
+ *
+ * The hub receives `path:/home/u/dev/x` from a Windows satellite that reached
+ * the repository through `\\wsl$\Ubuntu\home\u\dev\x`. The satellite could
+ * not see the repository identity across that mount; the hub can. Keys that
+ * name no local directory, and keys that already carry a repo identity, are
+ * returned unchanged.
+ */
+export function upgradeLocalPathKey(key: string): string {
+  if (!key.startsWith('path:')) return key;
+  const p = key.slice('path:'.length);
+  // POSIX-absolute only: a drive path or a UNC share on the hub is not ours.
+  if (!/^\/(?!\/)/.test(p)) return key;
+  if (!existsSync(p)) return key;
+  const r = deriveProjectKey(p);
+  if (r.key && (r.kind === 'git' || r.kind === 'origin')) return r.key;
+  return key;
 }
 
 /**
