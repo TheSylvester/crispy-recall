@@ -16,18 +16,23 @@
  * nothing and never signals a real process: `kill` is injected.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
 import { getDb, type RecallDb } from '../../src/db.js';
-import { _setTestRoot, dbPath, remoteRoot } from '../../src/paths.js';
-import { hubRecordPath } from '../../src/hub/runtime.js';
+import { writeSatelliteConfig } from '../../src/installer/config.js';
+import { _setTestRoot, dbPath, recallRoot, remoteRoot } from '../../src/paths.js';
+import { STALE_RECORD_MS, hubRecordPath } from '../../src/hub/runtime.js';
 import { findForeignScans, runReleaseForeignScans } from '../../src/hub/cli.js';
 
 const FOREIGN_SID = '01a06e2c-2146-71c2-97a3-a3044d56d2fe';
 const ORPHAN_SID = '01a06e2c-2146-71c2-97a3-a3044d56d2ff';
 const MIRRORED_SID = '01a06e2c-2146-71c2-97a3-a3044d56d2fa';
+// A stolen Codex SUBAGENT: the rollout filename carries one uuid, the
+// session_meta carries the canonical one that provenance stores.
+const SUB_RAW_SID = '01a06e2c-2146-71c2-97a3-a3044d56d2fb';
+const SUB_CANON_SID = '01a06e2c-2146-71c2-97a3-a3044d56d2fc';
 const FOREIGN_LOCAL = `/mnt/c/Users/silve/.codex/sessions/2026/09/05/rollout-2026-09-05T20-47-45-${FOREIGN_SID}.jsonl`;
 
 let sandbox: string;
@@ -35,6 +40,7 @@ let restore: (() => void) | undefined;
 let db: RecallDb;
 let prevRemote: string | undefined;
 let logs: string[];
+let errors: string[];
 
 function provenance(sid: string, path: string): void {
   db.run(
@@ -51,12 +57,32 @@ function watermark(path: string): void {
   );
 }
 
-function mirrorFile(host: string, sid: string): string {
+function mirrorFile(host: string, sid: string, meta?: Record<string, unknown>): string {
   const abs = join(remoteRoot(), host, 'codex', 'sessions', '2026', '09', '05',
     `rollout-2026-09-05T20-47-45-${sid}.jsonl`);
   mkdirSync(dirname(abs), { recursive: true });
-  writeFileSync(abs, '{}\n');
+  const body = meta
+    ? JSON.stringify({ timestamp: '2026-09-05T20:47:45.000Z', type: 'session_meta', payload: meta }) + '\n'
+    : '{}\n';
+  writeFileSync(abs, body);
   return abs.replace(/\\/g, '/');
+}
+
+/** A hub.json naming `pid`, `ageMs` old. */
+function daemonRecord(pid: number, ageMs = 0): void {
+  mkdirSync(dirname(hubRecordPath()), { recursive: true });
+  writeFileSync(hubRecordPath(), JSON.stringify({
+    pid, bind: '127.0.0.1', port: 7877, startedAt: new Date().toISOString(),
+    lockToken: 'x', ts: Date.now() - ageMs, v: 1,
+  }));
+}
+
+/** A fake process table: `<procRoot>/<pid>/cmdline`. */
+function fakeProc(pid: number, cmdline: string): string {
+  const root = join(sandbox, 'proc');
+  mkdirSync(join(root, String(pid)), { recursive: true });
+  writeFileSync(join(root, String(pid), 'cmdline'), cmdline.replace(/ /g, '\0'));
+  return root;
 }
 
 beforeEach(() => {
@@ -86,6 +112,8 @@ beforeEach(() => {
   provenance('local-sid', join(homedir(), '.codex', 'sessions', '2026', '09', '05', 'rollout-y-local-sid.jsonl'));
 
   logs = [];
+  errors = [];
+  vi.spyOn(console, 'error').mockImplementation((...a: unknown[]) => { errors.push(a.join(' ')); });
   vi.spyOn(console, 'log').mockImplementation((...a: unknown[]) => { logs.push(a.join(' ')); });
 });
 
@@ -117,13 +145,10 @@ describe('hub release-foreign-scans', () => {
   });
 
   it('--yes deletes both rows, keeps the messages and signals the live daemon', () => {
-    mkdirSync(dirname(hubRecordPath()), { recursive: true });
-    writeFileSync(hubRecordPath(), JSON.stringify({
-      pid: process.pid, bind: '127.0.0.1', port: 7877, startedAt: new Date().toISOString(),
-      lockToken: 'x', ts: Date.now(), v: 1,
-    }));
+    daemonRecord(process.pid);
+    const procRoot = fakeProc(process.pid, `node ${join(recallRoot(), 'bin', 'recall.js')} hub serve`);
     const kill = vi.fn();
-    expect(runReleaseForeignScans({ apply: true, kill })).toBe(0);
+    expect(runReleaseForeignScans({ apply: true, kill, procRoot })).toBe(0);
     expect(kill).toHaveBeenCalledWith(process.pid, 'SIGUSR1');
     expect(logs.join('\n')).toContain(`sweep requested pid=${process.pid}`);
 
@@ -140,5 +165,67 @@ describe('hub release-foreign-scans', () => {
     expect(runReleaseForeignScans({ apply: true, kill })).toBe(0);
     expect(kill).not.toHaveBeenCalled();
     expect(logs.join('\n')).toContain('daemon not running: the next sweep adopts them');
+  });
+});
+
+describe('hub release-foreign-scans — the daemon must be the one we recorded', () => {
+  it('refuses to signal a stale record (a pid can be recycled across a reboot)', () => {
+    daemonRecord(process.pid, STALE_RECORD_MS + 1000);
+    const procRoot = fakeProc(process.pid, `node ${join(recallRoot(), 'bin', 'recall.js')} hub serve`);
+    const kill = vi.fn();
+    expect(runReleaseForeignScans({ apply: true, kill, procRoot })).toBe(0);
+    expect(kill).not.toHaveBeenCalled();
+    expect(logs.join('\n')).toContain('daemon not running: the next sweep adopts them');
+  });
+
+  it('refuses to signal a pid whose cmdline is not recall.js', () => {
+    daemonRecord(process.pid);
+    const procRoot = fakeProc(process.pid, '/usr/bin/some-other-daemon --serve');
+    const kill = vi.fn();
+    expect(runReleaseForeignScans({ apply: true, kill, procRoot })).toBe(0);
+    expect(kill).not.toHaveBeenCalled();
+    expect(logs.join('\n')).toContain('daemon not running: the next sweep adopts them');
+  });
+});
+
+describe('hub release-foreign-scans — canonical ids', () => {
+  it('matches a stolen subagent by its canonical id, not the rollout filename', () => {
+    // The mirror file is named for SUB_RAW_SID; session_meta names the
+    // canonical SUB_CANON_SID, which is what the sweep stored as provenance.
+    const local = `/mnt/c/Users/silve/.codex/sessions/2026/09/05/rollout-x-${SUB_RAW_SID}.jsonl`;
+    provenance(SUB_CANON_SID, local);
+    mirrorFile('silverera2', SUB_RAW_SID, {
+      id: SUB_CANON_SID,
+      cwd: '/proj',
+      source: { subagent: { thread_spawn: { parent_thread_id: MIRRORED_SID, depth: 1, agent_type: 'explorer' } } },
+    });
+
+    const rows = findForeignScans();
+    expect(rows.map((r) => r.sessionId).sort()).toEqual([FOREIGN_SID, SUB_CANON_SID].sort());
+    const sub = rows.find((r) => r.sessionId === SUB_CANON_SID)!;
+    expect(sub.mirrorPath).toContain(SUB_RAW_SID);
+    expect(sub.host).toBe('silverera2');
+  });
+});
+
+describe('hub release-foreign-scans — satellite guard', () => {
+  let satSandbox: string;
+  let satRestore: (() => void) | undefined;
+
+  beforeEach(() => {
+    satSandbox = mkdtempSync(join(tmpdir(), 'recall-release-sat-'));
+    satRestore = _setTestRoot(join(satSandbox, '.recall'));
+    writeSatelliteConfig({ hubUrl: 'http://hub.example:7877', host: 'sat1', installedAt: new Date().toISOString() });
+  });
+
+  afterEach(() => {
+    satRestore?.(); satRestore = undefined;
+    rmSync(satSandbox, { recursive: true, force: true });
+  });
+
+  it('refuses, and never creates a local recall.db', () => {
+    expect(runReleaseForeignScans({ apply: true, kill: vi.fn() })).toBe(1);
+    expect(errors.join('\n')).toContain('not available in satellite mode');
+    expect(existsSync(dbPath())).toBe(false);
   });
 });

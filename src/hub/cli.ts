@@ -7,16 +7,21 @@
 
 import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, openSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { globSync } from 'glob';
 import { getDb } from '../db.js';
-import { readHubConfig, writeHubConfig } from '../installer/config.js';
+import { readHubConfig, readSatelliteConfig, writeHubConfig } from '../installer/config.js';
 import { dbPath, logsDir, remoteRoot, runDir } from '../paths.js';
 import { getBinaryPath, getModelPath } from '../recall/embedder.js';
 import { sessionIdFromPath } from '../recall/mtime-scan.js';
+import { classifySession } from '../recall/session-classifier.js';
 import { defaultClaudeRoot, defaultCodexRoot } from '../recall/transcript-roots.js';
 import { mirrorHostSummary, mirrorHosts, mirrorRoots } from './mirror.js';
 import { WIRE_VERSION } from './protocol.js';
-import { hubDaemonAlive, hubLogPath, readHostRecords, readPackageVersion } from './runtime.js';
+import {
+  STALE_RECORD_MS, hubDaemonAlive, hubLogPath, readHostRecords, readPackageVersion, type HubRecord,
+} from './runtime.js';
 import { checkBindPolicy, startHubServer } from './server.js';
 import { runInstallService } from './service.js';
 import { issueHubToken, listHubTokenHosts, revokeHubToken } from './tokens.js';
@@ -284,16 +289,33 @@ function prefixOf(dir: string): string {
   return p.endsWith('/') ? p : `${p}/`;
 }
 
-/** sessionId → the first mirror file that carries it, per vendor. */
+/**
+ * sessionId → the first mirror file that carries it, per vendor.
+ *
+ * Keyed by the CANONICAL id, because that is what `session_provenance` stores:
+ * the sweep classifies before it ingests (sweep.ts:46-49), and a Codex
+ * subagent's canonical id is its `session_meta.id`, not the rollout filename
+ * UUID. The raw basename id is indexed too, as a fallback for a row written
+ * before classification or by a different id shape.
+ */
 function mirrorIndex(): Map<string, { path: string; host: string }> {
   const out = new Map<string, { path: string; host: string }>();
   const remotePrefix = prefixOf(remoteRoot());
+  const add = (key: string, value: { path: string; host: string }): void => {
+    if (!out.has(key)) out.set(key, value);
+  };
   for (const { root, vendor } of mirrorRoots()) {
     const host = root.replace(/\\/g, '/').slice(remotePrefix.length).split('/')[0] ?? '';
     for (const file of globSync(`${root}/**/*.jsonl`, { nodir: true })) {
       const norm = file.replace(/\\/g, '/');
-      const key = `${vendor}:${sessionIdFromPath(norm, vendor)}`;
-      if (!out.has(key)) out.set(key, { path: norm, host });
+      const raw = sessionIdFromPath(norm, vendor);
+      const value = { path: norm, host };
+      let canonical = raw;
+      try {
+        canonical = classifySession({ sessionId: raw, transcriptPath: norm, vendor }).canonicalSessionId;
+      } catch { /* an unreadable mirror file still answers to its basename id */ }
+      add(`${vendor}:${canonical}`, value);
+      add(`${vendor}:${raw}`, value);
     }
   }
   return out;
@@ -325,9 +347,37 @@ export interface ReleaseOptions {
   apply?: boolean;
   /** Test seam — never signal a real process from a unit test. */
   kill?: (pid: number, signal: NodeJS.Signals) => void;
+  /** Test seam — the process table to read cmdlines from. */
+  procRoot?: string;
+}
+
+/**
+ * Is the recorded pid still THIS daemon? `hubDaemonAlive()` only asks whether
+ * the pid exists, and a pid is recycled after a reboot — SIGUSR1 to a stranger
+ * is not acceptable. Require a fresh heartbeat, and where `/proc` exists,
+ * require the command line to name recall.js.
+ */
+export function daemonIsOurs(record: HubRecord, procRoot = '/proc'): boolean {
+  if (typeof record.ts !== 'number' || Date.now() - record.ts >= STALE_RECORD_MS) return false;
+  if (!existsSync(procRoot)) return true; // no process table to ask (BSD, Windows)
+  try {
+    return readFileSync(join(procRoot, String(record.pid), 'cmdline'), 'utf-8')
+      .replace(/\0/g, ' ')
+      .includes('recall.js');
+  } catch {
+    return false;
+  }
 }
 
 export function runReleaseForeignScans(opts: ReleaseOptions = {}): number {
+  // A satellite has no local index: `findForeignScans()` would open (and so
+  // CREATE) a recall.db that must never exist there — the same guard the other
+  // DB-touching subcommands carry (recall.ts:1474-1478).
+  if (readSatelliteConfig()) {
+    console.error('recall hub release-foreign-scans: not available in satellite mode (the hub owns the index)');
+    return 1;
+  }
+
   const rows = findForeignScans();
   for (const r of rows) {
     console.log(`release sid=${r.sessionId} local=${r.localPath} mirror=${r.mirrorPath} host=${r.host}`);
@@ -359,7 +409,7 @@ export function runReleaseForeignScans(opts: ReleaseOptions = {}): number {
   console.log(`released ${rows.length} session(s); messages were left untouched.`);
 
   const { alive, record } = hubDaemonAlive();
-  if (alive && record) {
+  if (alive && record && daemonIsOurs(record, opts.procRoot)) {
     const kill = opts.kill ?? ((pid: number, signal: NodeJS.Signals) => { process.kill(pid, signal); });
     try {
       kill(record.pid, 'SIGUSR1');
