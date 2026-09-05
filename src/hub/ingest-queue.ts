@@ -40,8 +40,8 @@ export interface PushIngestDeps {
   spawnEmbed: (canonicalId: string) => void;
   /** One hub.log line. */
   log: (line: string) => void;
-  /** `refusedCollisions++` for the host. */
-  onRefused: (host: string) => void;
+  /** `refusedCollisions++` for the host, and `sid` onto its recent list (D5). */
+  onRefused: (host: string, sid: string) => void;
 }
 
 export type PushIngestOutcome = 'ingested' | 'refused' | 'failed' | 'skipped';
@@ -94,7 +94,7 @@ export async function runPushIngest(job: PushIngestJob, deps: PushIngestDeps): P
   }
   if (existing !== null) {
     deps.log(`session-id collision host=${job.host} sid=${canonicalId} existing=${existing}`);
-    deps.onRefused(job.host);
+    deps.onRefused(job.host, canonicalId);
     return 'refused';
   }
 

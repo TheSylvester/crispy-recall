@@ -12,6 +12,7 @@
  * @module hub/protocol
  */
 
+import { HEX64_RE } from './hash.js';
 import type { MirrorMeta } from '../recall/mirror-meta.js';
 
 /** Bumped on ANY incompatible change to §2.3. */
@@ -84,6 +85,12 @@ export interface ManifestFile {
   path: string;
   size: number;
   mtime: number;
+  /**
+   * sha256 of the satellite's bytes `[0, min(size, HEAD_BYTES))` (§2.3, D1).
+   * OPTIONAL and additive — a pre-0.4.0-sat.3 satellite omits it and the hub
+   * falls back to the size-only rules, so no `WIRE_VERSION` bump.
+   */
+  head?: string;
 }
 
 /** `POST /v1/push/manifest` request. */
@@ -104,6 +111,10 @@ export interface ManifestResponse {
   host: string;
   fullSweepDue: boolean;
   files: ManifestResponseFile[];
+  /** Pushes of THIS host's sessions the hub refused as id collisions (D5). */
+  refusedCollisions: number;
+  /** Up to 5 canonical ids of those refusals, newest first. */
+  refusedRecent: string[];
 }
 
 /** Decoded `X-Recall-Meta` on `PUT /v1/push/append`. */
@@ -113,11 +124,23 @@ export interface AppendMeta {
   hook?: { payloadSessionId?: string; agentId?: string; isSubagent: boolean };
   final?: boolean;
   reset?: boolean;
+  /**
+   * sha256 of the satellite's bytes `[0, offset)`, on the FIRST chunk of a
+   * resumed append only (§2.3, D1). Optional and additive.
+   */
+  prefix?: string;
 }
 
 /** `PUT /v1/push/append` → 200 `{size}`; 409 `{size}` on an offset mismatch. */
 export interface AppendResponse {
   size: number;
+}
+
+/** 409 body: `{size}` on an offset mismatch, plus the flag when the mirror's
+ *  `[0, offset)` bytes are not the satellite's (the caller must reset). */
+export interface AppendConflictResponse {
+  size: number;
+  prefixMismatch?: true;
 }
 
 /** `POST /v1/query` request. */
@@ -156,7 +179,11 @@ const BASE64URL_RE = /^[A-Za-z0-9_-]*$/;
  * (never throws) so the caller maps it to a 400 without a try/catch.
  *
  * The result is "MirrorMeta-like": the fields a sidecar carries plus the
- * per-request `final`/`reset` flags.
+ * per-request `final`/`reset`/`prefix` flags.
+ *
+ * UNKNOWN KEYS ARE IGNORED — the result is rebuilt field by field from the
+ * known names, never spread from the parsed object. A newer satellite may add
+ * a meta field without a `WIRE_VERSION` bump.
  */
 export function decodeMeta(header: string | undefined): AppendMeta | Error {
   if (typeof header !== 'string' || header.length === 0) return new Error('X-Recall-Meta header missing');
@@ -179,6 +206,10 @@ export function decodeMeta(header: string | undefined): AppendMeta | Error {
   }
   if (m['final'] !== undefined && typeof m['final'] !== 'boolean') return new Error('X-Recall-Meta final must be a boolean');
   if (m['reset'] !== undefined && typeof m['reset'] !== 'boolean') return new Error('X-Recall-Meta reset must be a boolean');
+  if (m['prefix'] !== undefined) {
+    if (typeof m['prefix'] !== 'string') return new Error('X-Recall-Meta prefix must be a string');
+    if (!HEX64_RE.test(m['prefix'])) return new Error('X-Recall-Meta prefix must be 64 lowercase hex characters');
+  }
   if (m['hook'] !== undefined) {
     const h = m['hook'];
     if (!h || typeof h !== 'object' || Array.isArray(h)) return new Error('X-Recall-Meta hook must be an object');
@@ -200,6 +231,7 @@ export function decodeMeta(header: string | undefined): AppendMeta | Error {
   }
   if (m['final'] !== undefined) out.final = m['final'] as boolean;
   if (m['reset'] !== undefined) out.reset = m['reset'] as boolean;
+  if (typeof m['prefix'] === 'string') out.prefix = m['prefix'];
   return out;
 }
 

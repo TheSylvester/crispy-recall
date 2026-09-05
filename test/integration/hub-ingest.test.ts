@@ -359,10 +359,14 @@ describe.skipIf(win32)('doctor hub section', () => {
 
   it('reports collisions from the refusal evidence the daemon persists, naming the host and the ids', () => {
     // The earlier suites in this file left both artifacts behind: the
-    // in-process daemon incremented `refusedCollisions` for `wirehost`, and
-    // the sweep guard wrote `session-id collision … source=scan` to hub.log.
-    const hosts = JSON.parse(readFileSync(join(recallRoot(), 'run', 'hub-hosts.json'), 'utf-8')) as Record<string, { refusedCollisions: number }>;
+    // in-process daemon incremented `refusedCollisions` for `wirehost` and
+    // recorded the refused id, and the sweep guard wrote
+    // `session-id collision … source=scan` to hub.log.
+    const hosts = JSON.parse(readFileSync(join(recallRoot(), 'run', 'hub-hosts.json'), 'utf-8')) as Record<string, { refusedCollisions: number; refusedRecent: string[] }>;
     expect(hosts['wirehost']!.refusedCollisions).toBe(1);
+    // D5: the daemon persists the refused canonical ids on the record too —
+    // that record is the ONE source both doctors and the manifest reply quote.
+    expect(hosts['wirehost']!.refusedRecent).toHaveLength(1);
     const logIds = readFileSync(join(recallRoot(), 'logs', 'hub.log'), 'utf-8')
       .split('\n').filter((l) => /session-id collision host=/.test(l))
       .map((l) => /sid=(\S+)/.exec(l)![1]!);
@@ -371,13 +375,15 @@ describe.skipIf(win32)('doctor hub section', () => {
     const h = checkHubHealth();
     expect(h.collisions.refusedByHost).toEqual([{ host: 'wirehost', count: 1 }]);
     expect(h.collisions.logLines).toBe(logIds.length);
-    expect(h.collisions.recentSessionIds).toEqual(logIds.slice(-5));
+    expect(h.collisions.recentSessionIds).toEqual(hosts['wirehost']!.refusedRecent);
+    // The same ids the log carries — one source, not a second parse of it.
+    expect(logIds).toContain(h.collisions.recentSessionIds[0]);
     expect(h.collisions.logLinesTruncated).toBe(false); // the fixture log is far under the tail window
     expect(hasCollisionEvidence(h.collisions)).toBe(true);
     const warning = h.warnings.find((w) => w.includes('refused as session-id collisions'));
     expect(warning).toBeDefined();
     expect(warning).toContain('wirehost');
-    expect(warning).toContain(logIds[logIds.length - 1]!);
+    expect(warning).toContain(hosts['wirehost']!.refusedRecent[0]!);
     // The printed section names the evidence too.
     const printed = capture(() => printHub(h));
     expect(printed).toContain('Collisions:');
@@ -435,9 +441,10 @@ describe.skipIf(win32)('doctor hub section', () => {
     const c = readCollisionEvidence();
     expect(c.logLinesTruncated).toBe(true);
     expect(c.logLines).toBe(tailIds.length); // older collision lines are outside the window
-    expect(c.recentSessionIds).toEqual(tailIds);
-    // The dropped first element was a fragment, never a half-parsed line.
-    expect(c.recentSessionIds.every((id) => tailIds.includes(id))).toBe(true);
+    // The COUNT comes from the log tail; the IDS come from the host records
+    // (D5), so these hand-written `source=scan` lines — which belong to no
+    // host record — raise the count without contributing an id.
+    expect(c.recentSessionIds.some((id) => tailIds.includes(id))).toBe(false);
 
     const h = checkHubHealth();
     const printed = capture(() => printHub(h));

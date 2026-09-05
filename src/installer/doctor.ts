@@ -21,7 +21,7 @@ import { binDir, dbPath, logsDir, remoteRoot, statuslineScript } from '../paths.
 import { EMBED_VERSION } from '../recall/embed-config.js';
 import { META_RESIDUE_SQL } from '../recall/purge-meta.js';
 import { mirrorHostSummary, mirrorHosts } from '../hub/mirror.js';
-import { hubDaemonAlive, readHostRecords } from '../hub/runtime.js';
+import { hubDaemonAlive, readHostRecords, REFUSED_RECENT_MAX } from '../hub/runtime.js';
 import { classifyBind } from '../hub/server.js';
 
 export interface DoctorOptions {
@@ -119,6 +119,10 @@ export interface SatelliteDoctorReport {
   lastPush: string | null;
   pendingBytes: number | null;
   pendingFiles: number;
+  /** Pushes of THIS host's sessions the hub refused as id collisions (D5). */
+  refusedCollisions: number;
+  /** Canonical ids of the most recent of those refusals, newest first. */
+  refusedRecent: string[];
   git: string;
   cleanupPeriodDays: number | null;
   failingFiles: string[];
@@ -171,7 +175,9 @@ async function runSatelliteDoctor(sat: SatelliteConfig, opts: DoctorOptions): Pr
   const report = await runPreflight({ satellite: { hubUrl: sat.hubUrl, token: sat.token } });
   const hubReachable = !report.failures.some((f) => f.check === 'hub.unreachable');
   const authOk = hubReachable && !report.failures.some((f) => f.check === 'hub.auth');
-  const pending = authOk ? await computePendingBytes() : { bytes: null, files: 0 };
+  const pending = authOk
+    ? await computePendingBytes()
+    : { bytes: null, files: 0, refused: { count: 0, recent: [] } };
   const pushLog = readPushLogSummary();
   const cleanup = readCleanupPeriodDays(claudeSettingsPath());
   const shallow = cwdIsShallow();
@@ -188,6 +194,16 @@ async function runSatelliteDoctor(sat: SatelliteConfig, opts: DoctorOptions): Pr
   for (const f of pushLog.failingFiles) {
     warnings.push(`${f} has failed to push in each of the last 3 runs`);
   }
+  // D5: the hub refuses a push whose session id already belongs to another
+  // machine. Only the hub logged it before this — the satellite operator saw
+  // `pending bytes: 0` and no warning, with the sessions silently unindexed.
+  const refusedIds = pending.refused.recent.length ? ` (recent ids: ${pending.refused.recent.join(', ')})` : '';
+  if (pending.refused.count > 0) {
+    warnings.push(
+      `the hub refused ${pending.refused.count} push(es) of this host's sessions as session-id collisions — ` +
+      `those sessions are NOT indexed on the hub${refusedIds}; on the hub run: recall hub release-foreign-scans`,
+    );
+  }
 
   const out: SatelliteDoctorReport = {
     mode: 'satellite',
@@ -200,6 +216,8 @@ async function runSatelliteDoctor(sat: SatelliteConfig, opts: DoctorOptions): Pr
     lastPush: pushLog.lastPush,
     pendingBytes: pending.bytes,
     pendingFiles: pending.files,
+    refusedCollisions: pending.refused.count,
+    refusedRecent: pending.refused.recent,
     git: gitVersion(),
     cleanupPeriodDays: cleanup,
     failingFiles: pushLog.failingFiles,
@@ -220,6 +238,7 @@ async function runSatelliteDoctor(sat: SatelliteConfig, opts: DoctorOptions): Pr
     console.log(`hub version ${out.hubVersion} (local ${out.localVersion})`);
     console.log(`last push:          ${out.lastPush ?? 'never'}`);
     console.log(`pending bytes:      ${out.pendingBytes === null ? 'unknown' : `${out.pendingBytes} in ${out.pendingFiles} file(s)`}`);
+    console.log(`hub refusals:       ${out.refusedCollisions}${out.refusedCollisions > 0 ? refusedIds : ''}`);
     console.log(`git:                ${out.git}`);
     console.log(`cleanupPeriodDays:  ${out.cleanupPeriodDays ?? 'unset'}`);
     console.log('integrity:          no local database on a satellite');
@@ -329,7 +348,13 @@ export interface HubCollisionReport {
   logLines: number;
   /** True when the log was longer than the window, so `logLines` is a floor. */
   logLinesTruncated: boolean;
-  /** The last 5 `sid=` values from those lines, oldest first. */
+  /**
+   * The most recent refused canonical ids, newest first, from the HOST
+   * RECORDS — the same field the manifest reply hands the satellite, so both
+   * doctors quote one source (D5). Sweep-guard refusals (`source=scan`) have
+   * no host record; they are still counted by `logLines` and logged in
+   * hub.log, but they contribute no id here.
+   */
   recentSessionIds: string[];
 }
 
@@ -354,10 +379,17 @@ export const HUB_LOG_TAIL_BYTES = 256 * 1024;
 
 /** Read the refusal evidence the daemon persists. Never throws. */
 export function readCollisionEvidence(): Omit<HubCollisionReport, never> {
-  const refusedByHost = Object.entries(readHostRecords())
+  const records = readHostRecords();
+  const refusedByHost = Object.entries(records)
     .filter(([, r]) => (r.refusedCollisions ?? 0) > 0)
     .map(([host, r]) => ({ host, count: r.refusedCollisions }))
     .sort((a, b) => a.host.localeCompare(b.host));
+  const recentSessionIds: string[] = [];
+  for (const [, r] of Object.entries(records)) {
+    for (const sid of r.refusedRecent ?? []) {
+      if (!recentSessionIds.includes(sid)) recentSessionIds.push(sid);
+    }
+  }
 
   let lines: string[] = [];
   let truncated = false;
@@ -384,12 +416,12 @@ export function readCollisionEvidence(): Omit<HubCollisionReport, never> {
     if (fd !== undefined) { try { closeSync(fd); } catch { /* ignore */ } }
   }
 
-  const ids: string[] = [];
-  for (const l of lines) {
-    const m = COLLISION_LINE.exec(l);
-    if (m?.[2] && !ids.includes(m[2])) ids.push(m[2]);
-  }
-  return { refusedByHost, logLines: lines.length, logLinesTruncated: truncated, recentSessionIds: ids.slice(-5) };
+  return {
+    refusedByHost,
+    logLines: lines.length,
+    logLinesTruncated: truncated,
+    recentSessionIds: recentSessionIds.slice(0, REFUSED_RECENT_MAX),
+  };
 }
 
 /** `12` or `≥12` — the count is a floor when the tail window was truncated. */
