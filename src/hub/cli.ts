@@ -20,7 +20,8 @@ import { defaultClaudeRoot, defaultCodexRoot } from '../recall/transcript-roots.
 import { mirrorHostSummary, mirrorHosts, mirrorRoots } from './mirror.js';
 import { WIRE_VERSION } from './protocol.js';
 import {
-  STALE_RECORD_MS, hubDaemonAlive, hubLogPath, readHostRecords, readPackageVersion, type HubRecord,
+  STALE_RECORD_MS, clearHostRefusals, hubDaemonAlive, hubLogPath, readHostRecords, readPackageVersion,
+  type HubRecord,
 } from './runtime.js';
 import { checkBindPolicy, startHubServer } from './server.js';
 import { runInstallService } from './service.js';
@@ -407,6 +408,20 @@ export function runReleaseForeignScans(opts: ReleaseOptions = {}): number {
     return 1;
   }
   console.log(`released ${rows.length} session(s); messages were left untouched.`);
+
+  // The refusal counter is a STANDING warning on both doctors (§U1). The
+  // collisions it counts are exactly the rows this command just released, so
+  // clear it for every host that got rows back — otherwise the satellite is
+  // told to run this command for ever. Only a host that HAS refusals on
+  // record is touched: `updateHostRecord()` creates a record for an unknown
+  // host, and a release must not invent one.
+  const records = readHostRecords();
+  for (const host of [...new Set(rows.map((r) => r.host))]) {
+    const rec = records[host];
+    if (!rec || (rec.refusedCollisions === 0 && rec.refusedRecent.length === 0)) continue;
+    clearHostRefusals(host);
+    console.log(`refusals cleared host=${host}`);
+  }
 
   const { alive, record } = hubDaemonAlive();
   if (alive && record && daemonIsOurs(record, opts.procRoot)) {
