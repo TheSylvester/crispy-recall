@@ -23,7 +23,9 @@ import { dirname, join } from 'node:path';
 import { getDb, type RecallDb } from '../../src/db.js';
 import { writeSatelliteConfig } from '../../src/installer/config.js';
 import { _setTestRoot, dbPath, recallRoot, remoteRoot } from '../../src/paths.js';
-import { STALE_RECORD_MS, hubRecordPath } from '../../src/hub/runtime.js';
+import {
+  STALE_RECORD_MS, hubRecordPath, readHostRecords, updateHostRecord, type HostRecord,
+} from '../../src/hub/runtime.js';
 import { findForeignScans, runReleaseForeignScans } from '../../src/hub/cli.js';
 
 const FOREIGN_SID = '01a06e2c-2146-71c2-97a3-a3044d56d2fe';
@@ -227,5 +229,48 @@ describe('hub release-foreign-scans — satellite guard', () => {
     expect(runReleaseForeignScans({ apply: true, kill: vi.fn() })).toBe(1);
     expect(errors.join('\n')).toContain('not available in satellite mode');
     expect(existsSync(dbPath())).toBe(false);
+  });
+});
+
+describe('hub release-foreign-scans — the refusal counter', () => {
+  /** Seed a host record straight into hub-hosts.json. */
+  function seedHost(host: string, rec: Partial<HostRecord>): void {
+    updateHostRecord(host, (c) => ({ ...c, ...rec }));
+  }
+
+  const LAST_PUSH = '2026-09-05T20:00:00.000Z';
+
+  beforeEach(() => {
+    seedHost('silverera2', { refusedCollisions: 3, refusedRecent: ['x'], lastPushAt: LAST_PUSH });
+    seedHost('otherbox', { refusedCollisions: 2, refusedRecent: ['y'] });
+  });
+
+  it('--yes clears the counter of every host that got rows back, and says so', () => {
+    expect(runReleaseForeignScans({ apply: true, kill: vi.fn() })).toBe(0);
+    expect(logs.join('\n')).toContain('refusals cleared host=silverera2');
+
+    const rec = readHostRecords()['silverera2']!;
+    expect(rec.refusedCollisions).toBe(0);
+    expect(rec.refusedRecent).toEqual([]);
+    // Clearing the refusals must not forget the rest of the record.
+    expect(rec.lastPushAt).toBe(LAST_PUSH);
+  });
+
+  it('leaves a host with no released rows alone', () => {
+    expect(runReleaseForeignScans({ apply: true, kill: vi.fn() })).toBe(0);
+    expect(logs.join('\n')).not.toContain('refusals cleared host=otherbox');
+
+    const rec = readHostRecords()['otherbox']!;
+    expect(rec.refusedCollisions).toBe(2);
+    expect(rec.refusedRecent).toEqual(['y']);
+  });
+
+  it('a dry run clears nothing', () => {
+    expect(runReleaseForeignScans()).toBe(0);
+    expect(logs.join('\n')).not.toContain('refusals cleared');
+
+    const rec = readHostRecords()['silverera2']!;
+    expect(rec.refusedCollisions).toBe(3);
+    expect(rec.refusedRecent).toEqual(['x']);
   });
 });
