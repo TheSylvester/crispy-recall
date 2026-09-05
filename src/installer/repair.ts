@@ -18,7 +18,7 @@ import { getDb, closeDbBeforeChildSpawn, RETRIEVAL_SCHEMA_DDL, PROJECT_KEY_BACKF
 import { dbPath, binDir, remoteRoot } from '../paths.js';
 import { mirrorRoots } from '../hub/mirror.js';
 import { log } from '../log.js';
-import { deriveProjectKey, upgradeLocalPathKey, wslUncToPosix } from '../recall/project-key.js';
+import { deriveProjectKey, upgradeLocalPathKey } from '../recall/project-key.js';
 import { isUnderRemoteRoot } from '../recall/mirror-meta.js';
 import type { CodexRekeyResult } from './codex-rekey-migration.js';
 
@@ -238,8 +238,8 @@ export interface RekeyProjectsResult {
   wslRows: number;
   /** Of those, rows that reached a `git:`/`origin:` key. */
   wslUpgraded: number;
-  /** Of those, rows left with the POSIX `path:` key. */
-  wslPathOnly: number;
+  /** Of those, rows the hub could not verify — the UNC key is KEPT for a retry. */
+  wslRetryable: number;
   /** Whether the durable 'complete' marker was written (false → re-run). */
   markerWritten: boolean;
 }
@@ -299,17 +299,22 @@ export function repairRekeyProjects(opts: { force: boolean }): RekeyProjectsResu
       WHERE project_key LIKE 'path://wsl$/%' OR project_key LIKE 'path://wsl.localhost/%'`,
   ) as Array<{ key: string }>);
   const wslRewrites: Array<{ from: string; to: string }> = [];
+  const wslRetryableKeys: string[] = [];
   for (const row of wslKeys) {
-    const unc = wslUncToPosix(row.key.slice('path:'.length));
-    if (!unc) continue;
-    const to = upgradeLocalPathKey('path:' + unc.posix);
-    wslRewrites.push({ from: row.key, to });
+    const to = upgradeLocalPathKey(row.key);
+    // ONLY a reached repository identity earns an UPDATE. A path the hub
+    // could not verify — a case the old win32 fold destroyed, a directory
+    // that is temporarily absent, a transient git — must keep its UNC key:
+    // rewriting it to a bare `path:<posix>` would drop it out of this branch
+    // and out of the main pass, and no later run could ever correct it.
+    if (to.startsWith('git:') || to.startsWith('origin:')) wslRewrites.push({ from: row.key, to });
+    else wslRetryableKeys.push(row.key);
   }
 
   let updated = 0;
   let wslRows = 0;
   let wslUpgraded = 0;
-  let wslPathOnly = 0;
+  let wslRetryable = 0;
   const markerWritten = transient === 0;
 
   d.exec('BEGIN IMMEDIATE');
@@ -334,7 +339,15 @@ export function repairRekeyProjects(opts: { force: boolean }): RekeyProjectsResu
       ) as { changes?: number } | undefined;
       const n = Number(info?.changes ?? 0);
       wslRows += n;
-      if (row.to.startsWith('path:')) wslPathOnly += n; else wslUpgraded += n;
+      wslUpgraded += n;
+    }
+    for (const key of wslRetryableKeys) {
+      const row = d.get(
+        `SELECT COUNT(*) AS c FROM messages WHERE project_key = ?`, [key],
+      ) as { c?: number } | undefined;
+      const n = Number(row?.c ?? 0);
+      wslRows += n;
+      wslRetryable += n;
     }
 
     // Every statement in `fts` is IF NOT EXISTS, so the view, FTS table and
@@ -359,11 +372,11 @@ export function repairRekeyProjects(opts: { force: boolean }): RekeyProjectsResu
     level: 'info',
     summary: `project keys: ${considered} project_ids, ${updated} rows updated, ` +
       `${skippedMirror} mirror-only skipped, ${transient} transient (left NULL); ` +
-      `wsl-unc keys: ${wslRows} rows → ${wslUpgraded} upgraded, ${wslPathOnly} left as path:<posix>`,
+      `wsl-unc keys: ${wslRows} rows → ${wslUpgraded} upgraded, ${wslRetryable} left (retryable)`,
   });
 
   return {
     projectIds: considered, updated, skippedMirror, transient,
-    wslRows, wslUpgraded, wslPathOnly, markerWritten,
+    wslRows, wslUpgraded, wslRetryable, markerWritten,
   };
 }

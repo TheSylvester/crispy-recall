@@ -1325,7 +1325,7 @@ async function runInstallerSubcommand(cmd: string): Promise<void> {
       );
       console.log(
         `wsl-unc keys: ${r.wslRows} rows → ${r.wslUpgraded} upgraded, ` +
-        `${r.wslPathOnly} left as path:<posix>`,
+        `${r.wslRetryable} left (retryable)`,
       );
       if (!r.markerWritten) {
         console.error('recall repair --rekey-projects: incomplete — re-run when git is responsive.');

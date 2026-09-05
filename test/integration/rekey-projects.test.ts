@@ -170,11 +170,11 @@ describe.skipIf(platform() === 'win32')('repairRekeyProjects', () => {
     expect(keyOf('M1')).toBe(MIRROR_KEY);
   });
 
-  it('rewrites a \\\\wsl$ UNC key without --force, upgrading the ones the hub owns', () => {
+  it('rewrites a \\\\wsl$ UNC key only when the hub reaches the repository (U3)', () => {
     // A Windows satellite working on a WSL repository keyed the mount it saw,
-    // not the repository. Two rows: one whose POSIX path this hub owns, one
-    // whose path is gone.
-    const repo = join(recallHome, 'wsl-repo');
+    // not the repository. The stored key also carries the OLD win32 whole-path
+    // fold, so its case no longer matches the real directory.
+    const repo = join(recallHome, 'Dev', 'Claro');
     mkdirSync(repo, { recursive: true });
     const g = (args: string[]) => execFileSync('git', [
       '-c', 'user.name=Test', '-c', 'user.email=test@example.com', '-c', 'commit.gpgsign=false',
@@ -190,16 +190,27 @@ describe.skipIf(platform() === 'win32')('repairRekeyProjects', () => {
     insertMessage('W1', 'W1-m0', `//wsl$/Ubuntu${repo}`, `path://wsl$/ubuntu${repo.toLowerCase()}`);
     insertMessage('W2', 'W2-m0', '//wsl.localhost/Ubuntu/home/silver/dev/gone', 'path://wsl.localhost/ubuntu/home/silver/dev/gone');
 
-    const r = repairRekeyProjects({ force: false });
+    const prevHome = process.env['HOME'];
+    process.env['HOME'] = recallHome;
+    let r: ReturnType<typeof repairRekeyProjects>;
+    try { r = repairRekeyProjects({ force: false }); }
+    finally { if (prevHome === undefined) delete process.env['HOME']; else process.env['HOME'] = prevHome; }
+
     expect(r.wslRows).toBe(2);
     expect(r.wslUpgraded).toBe(1);
-    expect(r.wslPathOnly).toBe(1);
+    expect(r.wslRetryable).toBe(1);
+    // The folded key resolved case-insensitively to the real `Dev/Claro`.
     expect(keyOf('W1')).toBe(`git:${root}`);
-    expect(keyOf('W2')).toBe('path:/home/silver/dev/gone');
+    // The unreachable one KEEPS its UNC key, so a later run can still fix it.
+    expect(keyOf('W2')).toBe('path://wsl.localhost/ubuntu/home/silver/dev/gone');
 
-    // A second run finds nothing left to rewrite.
+    // A second run re-finds the retryable row and re-attempts nothing else.
+    clearProjectKeyCache();
     const second = repairRekeyProjects({ force: false });
-    expect(second.wslRows).toBe(0);
+    expect(second.wslRows).toBe(1);
+    expect(second.wslUpgraded).toBe(0);
+    expect(second.wslRetryable).toBe(1);
+    expect(keyOf('W1')).toBe(`git:${root}`);
   }, 30_000);
 
   it('a transient derivation leaves the rows NULL, the marker absent, and markerWritten false', () => {

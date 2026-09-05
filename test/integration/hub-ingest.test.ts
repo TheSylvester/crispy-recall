@@ -163,6 +163,22 @@ describe.skipIf(win32)('runPushIngest (§2.4)', () => {
       && l.includes(`from=path:${repo}`) && l.includes(`to=git:${rootCommitOf(repo)}`))).toBe(true);
   });
 
+  it('upgrades a sidecar key still in the UNC spelling (U3)', async () => {
+    // A satellite that has not been upgraded yet still ships the UNC key, and
+    // `repair --full` re-reads those old sidecars: both must land on the repo
+    // key, never undo a completed rekey.
+    const repo = makeGitRepo('wsl-repo-unc');
+    const sid = randomUUID();
+    const rel = `projects/-wsl-repo-unc/${sid}.jsonl`;
+    const uncCwd = `//wsl$/Ubuntu${repo}`;
+    const job = stageMirror('silverera2', rel, claudeEntry(sid, 0, 'an unupgraded windows turn, long enough to clear the fifty char floor', { cwd: uncCwd }), {
+      cwd: uncCwd, key: `path://wsl$/ubuntu${repo}`,
+    });
+    expect(await runPushIngest(job, deps())).toBe('ingested');
+    expect(getDb(dbPath()).get('SELECT project_key FROM messages WHERE session_id = ?', [sid]))
+      .toEqual({ project_key: `git:${rootCommitOf(repo)}` });
+  });
+
   it('leaves a path: key for a directory the hub does not own unchanged', async () => {
     const sid = randomUUID();
     const rel = `projects/-gone/${sid}.jsonl`;

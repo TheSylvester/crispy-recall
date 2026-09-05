@@ -22,8 +22,8 @@ import { tmpdir, platform } from 'node:os';
 import { randomUUID } from 'node:crypto';
 
 import {
-  clearProjectKeyCache, deriveProjectKey, foldKeyPath, normalizeOrigin, upgradeLocalPathKey,
-  wslUncToPosix,
+  clearProjectKeyCache, deriveProjectKey, foldKeyPath, normalizeOrigin, resolveCaseInsensitive,
+  upgradeLocalPathKey, wslUncToPosix,
 } from '../../src/recall/project-key.js';
 import { normalizePath } from '../../src/url-path-resolver.js';
 import { _setTestRoot, dbPath } from '../../src/paths.js';
@@ -432,6 +432,15 @@ describe('wslUncToPosix', () => {
     expect(wslUncToPosix('\\\\wsl$\\Ubuntu')).toEqual({ distro: 'Ubuntu', posix: '/' });
   });
 
+  it('collapses separator runs and accepts the extended-length prefixes', () => {
+    expect(wslUncToPosix('\\\\wsl$\\Ubuntu\\home\\\\silver'))
+      .toEqual({ distro: 'Ubuntu', posix: '/home/silver' });
+    expect(wslUncToPosix('//wsl$//Ubuntu/home/x'))
+      .toEqual({ distro: 'Ubuntu', posix: '/home/x' });
+    expect(wslUncToPosix('\\\\?\\UNC\\wsl$\\Ubuntu\\home\\x'))
+      .toEqual({ distro: 'Ubuntu', posix: '/home/x' });
+  });
+
   it('leaves every other shape alone', () => {
     expect(wslUncToPosix('C:\\Users\\u\\dev')).toBeUndefined();
     expect(wslUncToPosix('c:/Users/u/dev')).toBeUndefined();
@@ -450,12 +459,18 @@ describe.skipIf(platform() === 'win32')('a \\\\wsl$ UNC cwd', () => {
     expect(r.key).toBe('path:/home/silver/dev/antidote-dev');
   });
 
-  it('keys by the POSIX path when the git executable is absent', () => {
-    const dir = join(sandbox, 'unc-live');
-    mkdirSync(dir, { recursive: true });
-    process.env['PATH'] = mkdtempSync(join(sandbox, 'nogit-'));
-    const r = deriveProjectKey(`//wsl$/Ubuntu${dir}`);
-    expect(r.key).toBe(`path:${dir}`);
+  it('keys the same way through every accepted UNC spelling', () => {
+    // On the hub the UNC cwd itself never exists, so derivation takes the
+    // vanished-directory branch. Every spelling must still land on one key.
+    const expected = 'path:/home/silver/dev/antidote-dev';
+    for (const cwd of [
+      '\\\\wsl.localhost\\Ubuntu\\home\\silver\\dev\\antidote-dev',
+      '//wsl$/Ubuntu/home/silver/dev/antidote-dev',
+      '\\\\?\\UNC\\wsl$\\Ubuntu\\home\\silver\\dev\\antidote-dev',
+    ]) {
+      clearProjectKeyCache();
+      expect(deriveProjectKey(cwd).key).toBe(expected);
+    }
   });
 
   it('upgradeLocalPathKey turns a local POSIX path key into the repo key', () => {
@@ -467,5 +482,64 @@ describe.skipIf(platform() === 'win32')('a \\\\wsl$ UNC cwd', () => {
     expect(upgradeLocalPathKey('path:/no/such/dir/anywhere')).toBe('path:/no/such/dir/anywhere');
     expect(upgradeLocalPathKey('path:c:/windev/proj')).toBe('path:c:/windev/proj');
     expect(upgradeLocalPathKey('git:' + 'a'.repeat(40))).toBe('git:' + 'a'.repeat(40));
+  });
+});
+
+describe.skipIf(platform() === 'win32')('resolveCaseInsensitive', () => {
+  let prevHome: string | undefined;
+  beforeEach(() => { prevHome = process.env['HOME']; process.env['HOME'] = sandbox; });
+  afterEach(() => {
+    if (prevHome === undefined) delete process.env['HOME']; else process.env['HOME'] = prevHome;
+  });
+
+  it('finds a directory whose case the old win32 fold destroyed', () => {
+    const real = join(sandbox, 'Dev', 'Claro');
+    mkdirSync(real, { recursive: true });
+    expect(resolveCaseInsensitive(real)).toBe(real);
+    expect(resolveCaseInsensitive(join(sandbox, 'dev', 'claro'))).toBe(real);
+  });
+
+  it('gives up on an absent path, on ambiguity, and outside the home tree', () => {
+    mkdirSync(join(sandbox, 'Dev', 'Claro'), { recursive: true });
+    expect(resolveCaseInsensitive(join(sandbox, 'dev', 'nope'))).toBeUndefined();
+    // Two entries that differ only in case: guessing could key the wrong repo.
+    mkdirSync(join(sandbox, 'Dev', 'CLARO'), { recursive: true });
+    expect(resolveCaseInsensitive(join(sandbox, 'dev', 'claro'))).toBeUndefined();
+    expect(resolveCaseInsensitive('/etc/PASSWD-not-here')).toBeUndefined();
+  });
+});
+
+describe.skipIf(platform() === 'win32')('upgradeLocalPathKey', () => {
+  let prevHome: string | undefined;
+  beforeEach(() => { prevHome = process.env['HOME']; process.env['HOME'] = sandbox; });
+  afterEach(() => {
+    if (prevHome === undefined) delete process.env['HOME']; else process.env['HOME'] = prevHome;
+  });
+
+  it('upgrades a UNC key and a case-folded key alike', () => {
+    const repo = makeRepo('Claro', 2);
+    const expected = 'git:' + rootCommit(repo);
+    expect(upgradeLocalPathKey('path:' + repo)).toBe(expected);
+    // An old sidecar still carries the UNC spelling; `repair --full` re-reads
+    // those, so it must not undo a completed rekey.
+    clearProjectKeyCache();
+    expect(upgradeLocalPathKey('path://wsl$/ubuntu' + repo.toLowerCase())).toBe(expected);
+  });
+
+  it('memoizes the NEGATIVE answer so one sweep spawns git once', () => {
+    const dir = join(sandbox, 'not-a-repo');
+    mkdirSync(dir, { recursive: true });
+    const marker = join(sandbox, 'git-calls');
+    fakeGit(`echo ran >> "${marker}"\nexit 128`);
+
+    expect(upgradeLocalPathKey('path:' + dir)).toBe('path:' + dir);
+    const after = readFileSync(marker, 'utf-8');
+    expect(upgradeLocalPathKey('path:' + dir)).toBe('path:' + dir);
+    expect(readFileSync(marker, 'utf-8')).toBe(after);
+
+    // Clearing the cache lets the next sweep retry.
+    clearProjectKeyCache();
+    expect(upgradeLocalPathKey('path:' + dir)).toBe('path:' + dir);
+    expect(readFileSync(marker, 'utf-8').length).toBeGreaterThan(after.length);
   });
 });
