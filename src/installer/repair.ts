@@ -18,7 +18,9 @@ import { getDb, closeDbBeforeChildSpawn, RETRIEVAL_SCHEMA_DDL, PROJECT_KEY_BACKF
 import { dbPath, binDir, remoteRoot } from '../paths.js';
 import { mirrorRoots } from '../hub/mirror.js';
 import { log } from '../log.js';
-import { deriveProjectKey, upgradeLocalPathKey, wslUncToPosix } from '../recall/project-key.js';
+import {
+  deriveProjectKey, resolveCaseInsensitive, upgradeLocalPathKey, wslUncToPosix,
+} from '../recall/project-key.js';
 import { isUnderRemoteRoot } from '../recall/mirror-meta.js';
 import type { CodexRekeyResult } from './codex-rekey-migration.js';
 
@@ -265,7 +267,7 @@ export function repairRekeyProjects(opts: { force: boolean }): RekeyProjectsResu
   ) as Array<{ project_id: string }>).map((r) => r.project_id);
 
   const derived: Array<{ projectId: string; key: string }> = [];
-  /** UNC project_ids the hub could not resolve — left for a later run. */
+  /** UNC project_ids whose directory the hub could not reach — left for a retry. */
   const wslRetryableIds: string[] = [];
   let considered = 0;
   let skippedMirror = 0;
@@ -287,18 +289,19 @@ export function repairRekeyProjects(opts: { force: boolean }): RekeyProjectsResu
     if (allMirrored) { skippedMirror++; continue; }
     considered++;
 
-    // A `\\wsl$\…` project_id must NEVER be keyed by a bare `path:<posix>`:
-    // that path is the one the hub could not verify, and such a key would
-    // fall out of the UNC branch below AND out of every later run. Only a
-    // reached repository identity is written; anything else stays as it is.
+    // A `\\wsl$\…` project_id keys by the directory INSIDE the distro, which
+    // only the hub can see. Resolve it first: an UNVERIFIED `path:<posix>`
+    // key would fall out of the UNC branch below AND out of every later run,
+    // so an unreachable directory keeps what it has and waits for a retry.
+    // A directory the hub DID reach is keyed exactly as any local one is —
+    // its repository identity, or a `path:` key for a plain directory.
     const unc = wslUncToPosix(projectId);
     if (unc) {
-      const upgraded = upgradeLocalPathKey('path:' + unc.posix);
-      if (upgraded.startsWith('git:') || upgraded.startsWith('origin:')) {
-        derived.push({ projectId, key: upgraded });
-      } else {
-        wslRetryableIds.push(projectId);
-      }
+      const dir = resolveCaseInsensitive(unc.posix);
+      if (dir === undefined) { wslRetryableIds.push(projectId); continue; }
+      const uncResult = deriveProjectKey(dir);
+      if (uncResult.transientFailure || !uncResult.key) { transient++; continue; }
+      derived.push({ projectId, key: uncResult.key });
       continue;
     }
 

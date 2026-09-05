@@ -417,6 +417,36 @@ describe.skipIf(platform() === 'win32')('non-ASCII cwd round-trip', () => {
   });
 });
 
+describe.skipIf(platform() === 'win32')('a hub-LOCAL transcript with a UNC cwd', () => {
+  it('ingests with the repository key, not a bare path key', async () => {
+    const recallHome = join(sandbox, '.recall-unc');
+    mkdirSync(recallHome, { recursive: true });
+    const restore = _setTestRoot(recallHome);
+    _resetDb();
+    try {
+      const repo = makeRepo('local-unc-repo', 2);
+      getDb(dbPath());
+      const sid = randomUUID();
+      const jsonl = join(sandbox, `${sid}.jsonl`);
+      const cwd = `//wsl$/Ubuntu${repo}`;
+      writeFileSync(jsonl, JSON.stringify({
+        type: 'user', uuid: `${sid}-u1`, sessionId: sid, cwd,
+        timestamp: '2026-05-01T10:00:00.000Z',
+        message: { role: 'user', content: 'uncfixture please index this repository through the mount path' },
+      }) + '\n');
+
+      const res = await ingestSessionMessages(sid, jsonl, 'claude', { projectId: cwd });
+      expect(res.error).toBeUndefined();
+      expect(getDb(dbPath()).get(
+        'SELECT DISTINCT project_key FROM messages WHERE session_id = ?', [sid],
+      )).toEqual({ project_key: 'git:' + rootCommit(repo) });
+    } finally {
+      restore();
+      _resetDb();
+    }
+  });
+});
+
 describe('wslUncToPosix', () => {
   it('converts every accepted UNC spelling', () => {
     expect(wslUncToPosix('\\\\wsl$\\Ubuntu\\home\\silver\\dev\\x'))
