@@ -89,6 +89,30 @@ function seed(): void {
   getDb(dbPath()).run('DELETE FROM schema_meta WHERE key = ?', [PROJECT_KEY_BACKFILL_KEY]);
 }
 
+/** A one-commit git repository at `dir`. Returns its root commit. */
+function makeRepoAt(dir: string): string {
+  mkdirSync(dir, { recursive: true });
+  const g = (args: string[]) => execFileSync('git', [
+    '-c', 'user.name=Test', '-c', 'user.email=test@example.com', '-c', 'commit.gpgsign=false',
+    ...args,
+  ], { cwd: dir, encoding: 'utf8' }).trim();
+  g(['init', '-q', '-b', 'main']);
+  writeFileSync(join(dir, 'f.txt'), 'content\n');
+  g(['add', '-A']);
+  g(['commit', '-q', '-m', 'c0']);
+  clearProjectKeyCache();
+  return g(['rev-list', '--max-parents=0', 'HEAD']).split('\n')[0]!.trim();
+}
+
+/** Run `fn` with HOME pointed at the sandbox — resolveCaseInsensitive needs it. */
+function withHome<T>(fn: () => T): T {
+  const prev = process.env['HOME'];
+  process.env['HOME'] = recallHome;
+  try { return fn(); } finally {
+    if (prev === undefined) delete process.env['HOME']; else process.env['HOME'] = prev;
+  }
+}
+
 /** Install a fake `git` first on PATH that always fails transiently. */
 function fakeTransientGit(): void {
   const dir = mkdtempSync(join(recallHome, 'fakegit-'));
@@ -175,26 +199,12 @@ describe.skipIf(platform() === 'win32')('repairRekeyProjects', () => {
     // not the repository. The stored key also carries the OLD win32 whole-path
     // fold, so its case no longer matches the real directory.
     const repo = join(recallHome, 'Dev', 'Claro');
-    mkdirSync(repo, { recursive: true });
-    const g = (args: string[]) => execFileSync('git', [
-      '-c', 'user.name=Test', '-c', 'user.email=test@example.com', '-c', 'commit.gpgsign=false',
-      ...args,
-    ], { cwd: repo, encoding: 'utf8' }).trim();
-    g(['init', '-q', '-b', 'main']);
-    writeFileSync(join(repo, 'f.txt'), 'content\n');
-    g(['add', '-A']);
-    g(['commit', '-q', '-m', 'c0']);
-    const root = g(['rev-list', '--max-parents=0', 'HEAD']).split('\n')[0]!.trim();
-    clearProjectKeyCache();
+    const root = makeRepoAt(repo);
 
     insertMessage('W1', 'W1-m0', `//wsl$/Ubuntu${repo}`, `path://wsl$/ubuntu${repo.toLowerCase()}`);
     insertMessage('W2', 'W2-m0', '//wsl.localhost/Ubuntu/home/silver/dev/gone', 'path://wsl.localhost/ubuntu/home/silver/dev/gone');
 
-    const prevHome = process.env['HOME'];
-    process.env['HOME'] = recallHome;
-    let r: ReturnType<typeof repairRekeyProjects>;
-    try { r = repairRekeyProjects({ force: false }); }
-    finally { if (prevHome === undefined) delete process.env['HOME']; else process.env['HOME'] = prevHome; }
+    const r = withHome(() => repairRekeyProjects({ force: false }));
 
     expect(r.wslRows).toBe(2);
     expect(r.wslUpgraded).toBe(1);
@@ -206,11 +216,40 @@ describe.skipIf(platform() === 'win32')('repairRekeyProjects', () => {
 
     // A second run re-finds the retryable row and re-attempts nothing else.
     clearProjectKeyCache();
-    const second = repairRekeyProjects({ force: false });
+    const second = withHome(() => repairRekeyProjects({ force: false }));
     expect(second.wslRows).toBe(1);
     expect(second.wslUpgraded).toBe(0);
     expect(second.wslRetryable).toBe(1);
     expect(keyOf('W1')).toBe(`git:${root}`);
+  }, 30_000);
+
+  it('--force never overwrites a UNC key with a derivation from its UNC project_id', () => {
+    // The force UPDATE keys on project_id and runs FIRST. Without the guard it
+    // wrote `path:<posix>` and the UNC rewrite then matched no row at all.
+    const repo = join(recallHome, 'Dev', 'Claro');
+    const root = makeRepoAt(repo);
+    insertMessage('W1', 'W1-m0', `//wsl$/Ubuntu${repo}`, `path://wsl$/ubuntu${repo.toLowerCase()}`);
+
+    const r = withHome(() => repairRekeyProjects({ force: true }));
+    expect(r.wslUpgraded).toBe(1);
+    expect(keyOf('W1')).toBe(`git:${root}`);
+  }, 30_000);
+
+  it('a NULL-keyed UNC project_id reaches the git key, or stays NULL for a retry', () => {
+    // No provenance row, so the mirror-only skip does not fire and the main
+    // pass owns these. A bare `path:<posix>` here would be a one-way loss.
+    const repo = join(recallHome, 'Dev', 'Claro');
+    const root = makeRepoAt(repo);
+    insertMessage('W3', 'W3-m0', `//wsl$/Ubuntu${repo}`, null);
+    insertMessage('W4', 'W4-m0', '//wsl$/Ubuntu/home/silver/dev/gone', null);
+
+    const r = withHome(() => repairRekeyProjects({ force: false }));
+    expect(keyOf('W3')).toBe(`git:${root}`);
+    expect(keyOf('W4')).toBeNull();
+    expect(r.wslRetryable).toBe(1);
+    // An unresolved UNC id leaves rows NULL, so the backfill is not complete.
+    expect(r.markerWritten).toBe(false);
+    expect(marker()).toBeUndefined();
   }, 30_000);
 
   it('a transient derivation leaves the rows NULL, the marker absent, and markerWritten false', () => {

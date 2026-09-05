@@ -135,10 +135,14 @@ export function wslUncToPosix(p: string): { distro: string; posix: string } | un
  * `/home/u/dev/Claro`. On a case-sensitive hub `existsSync` says no, and a
  * repair pass that trusted that answer would throw the repository away.
  *
- * The walk is bounded to `homedir()`: it costs one `readdirSync` per level
- * and only inside the owner's own tree. An ambiguous level (two entries that
- * differ only in case) gives up rather than guess.
+ * The walk is bounded to `homedir()` and to `MAX_RESOLVE_DEPTH` levels: it
+ * costs one `readdirSync` per level and only inside the owner's own tree. An
+ * ambiguous level (two entries that differ only in case) gives up rather than
+ * guess. The result is re-tested at the end, because a directory entry that
+ * `readdirSync` lists can still be a dangling symlink or a loop.
  */
+const MAX_RESOLVE_DEPTH = 64;
+
 export function resolveCaseInsensitive(p: string): string | undefined {
   if (existsSync(p)) return p;
   const home = homedir();
@@ -148,8 +152,9 @@ export function resolveCaseInsensitive(p: string): string | undefined {
 
   let current = prefix.slice(0, -1);
   if (!existsSync(current)) return undefined;
-  for (const seg of p.slice(prefix.length).split('/')) {
-    if (!seg) continue;
+  const segments = p.slice(prefix.length).split('/').filter((seg) => seg.length > 0);
+  if (segments.length > MAX_RESOLVE_DEPTH) return undefined;
+  for (const seg of segments) {
     const exact = current + '/' + seg;
     if (existsSync(exact)) { current = exact; continue; }
     let entries: string[];
@@ -159,7 +164,7 @@ export function resolveCaseInsensitive(p: string): string | undefined {
     if (hits.length !== 1) return undefined;
     current = current + '/' + hits[0]!;
   }
-  return current;
+  return existsSync(current) ? current : undefined;
 }
 
 /**
@@ -191,6 +196,13 @@ const upgradeCache = new Map<string, string>();
  * Keys that name no local directory, and keys that already carry a repo
  * identity, are returned unchanged. Negative answers are memoized too: one
  * mirror sweep reads many sidecars of the same project.
+ *
+ * ASSUMPTION: a `path:` key that names a directory under the hub's own home
+ * means the hub's repository at that path. A satellite that mirrors the
+ * hub's home layout while holding DIFFERENT repositories at the same paths
+ * would be unified with the hub's. That is accepted, because those two
+ * projects already carried the one identical `path:` key before this change:
+ * the upgrade sharpens a collision that existed, it does not create one.
  */
 export function upgradeLocalPathKey(key: string): string {
   if (!key.startsWith('path:')) return key;

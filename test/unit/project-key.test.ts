@@ -14,7 +14,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
-  chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync,
+  chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync,
 } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
@@ -506,6 +506,19 @@ describe.skipIf(platform() === 'win32')('resolveCaseInsensitive', () => {
     mkdirSync(join(sandbox, 'Dev', 'CLARO'), { recursive: true });
     expect(resolveCaseInsensitive(join(sandbox, 'dev', 'claro'))).toBeUndefined();
     expect(resolveCaseInsensitive('/etc/PASSWD-not-here')).toBeUndefined();
+  });
+
+  it('rejects a component that readdir lists but that does not resolve', () => {
+    // A dangling symlink IS a directory entry, so the case-insensitive match
+    // finds it. The final existsSync is what keeps a broken path out.
+    mkdirSync(join(sandbox, 'Dev'), { recursive: true });
+    symlinkSync(join(sandbox, 'nowhere'), join(sandbox, 'Dev', 'Claro'));
+    expect(resolveCaseInsensitive(join(sandbox, 'dev', 'claro'))).toBeUndefined();
+  });
+
+  it('gives up past the depth cap', () => {
+    const deep = join(sandbox, Array.from({ length: 70 }, (_, i) => `d${i}`).join('/'));
+    expect(resolveCaseInsensitive(deep)).toBeUndefined();
   });
 });
 
