@@ -41,7 +41,7 @@ import { DOC_PREFIX, EMBED_VERSION, buildEmbedText } from './embed-config.js';
 import { getDb } from '../db.js';
 import { dbPath } from '../paths.js';
 import { normalizePath } from '../url-path-resolver.js';
-import { deriveProjectKey } from './project-key.js';
+import { deriveProjectKey, upgradeLocalPathKey } from './project-key.js';
 import { isUnderRemoteRoot, readMirrorMeta } from './mirror-meta.js';
 import { log } from '../log.js';
 import { parseJsonlFile } from '../adapters/claude/jsonl-reader.js';
@@ -269,11 +269,18 @@ export async function ingestSessionMessages(
   //    transcript the cwd names a directory that does not exist here, so the
   //    key comes from the satellite's sidecar and deriveProjectKey is NEVER
   //    called. Everything else derives locally through the memoized cache.
+  //    A sidecar `path:` key that names a directory THIS machine owns is
+  //    upgraded to the repository identity: a Windows satellite working on a
+  //    WSL repository saw the hub's filesystem through a mount (U3).
+  const sidecarKey = (): string | null => {
+    const k = readMirrorMeta(transcriptPath)?.key;
+    return k === undefined ? null : upgradeLocalPathKey(k);
+  };
   const projectKey = rawProjectId
     ? (options?.projectKey !== undefined
         ? options.projectKey
         : (isUnderRemoteRoot(transcriptPath)
-            ? (readMirrorMeta(transcriptPath)?.key ?? null)
+            ? sidecarKey()
             : (deriveProjectKey(rawProjectId).key ?? null)))
     : null;
 

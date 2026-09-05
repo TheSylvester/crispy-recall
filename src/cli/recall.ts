@@ -1323,6 +1323,10 @@ async function runInstallerSubcommand(cmd: string): Promise<void> {
         `project keys: ${r.projectIds} project_ids, ${r.updated} rows updated, ` +
         `${r.skippedMirror} mirror-only skipped, ${r.transient} transient (left NULL)`,
       );
+      console.log(
+        `wsl-unc keys: ${r.wslRows} rows → ${r.wslUpgraded} upgraded, ` +
+        `${r.wslRetryable} left (retryable)`,
+      );
       if (!r.markerWritten) {
         console.error('recall repair --rekey-projects: incomplete — re-run when git is responsive.');
       }

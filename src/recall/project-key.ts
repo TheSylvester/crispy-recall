@@ -19,12 +19,17 @@
  *   unless `--force` is given.
  * - On Windows, non-git directories unify across casings through the key half
  *   only: the key is fully folded, while `project_id` keeps normalizePath's
- *   drive-letter-only rule.
+ *   drive-letter-only rule. A POSIX-absolute path is exempt from the fold.
+ * - A Windows satellite that works on a WSL repository sees a `\\wsl$\…` UNC
+ *   cwd. That cwd keys by the POSIX path inside the distro, and the hub
+ *   upgrades such a key to the repository identity it can see itself
+ *   (`upgradeLocalPathKey`), so one repository keeps one key.
  *
  * @module recall/project-key
  */
 
-import { existsSync } from 'node:fs';
+import { existsSync, readdirSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import type { SpawnSyncReturns } from 'node:child_process';
 import { normalizePath } from '../url-path-resolver.js';
@@ -48,6 +53,7 @@ const cache = new Map<string, ProjectKeyResult>();
 /** Drop every memoized derivation (long-lived processes: the hub sweep). */
 export function clearProjectKeyCache(): void {
   cache.clear();
+  upgradeCache.clear();
 }
 
 const GIT_TIMEOUT_MS = 3000;
@@ -87,13 +93,138 @@ function isTransient(r: SpawnSyncReturns<string>): boolean {
  * values a Windows satellite wrote (`c:/WinDev/Proj`): without the shape test
  * the hub would key `path:c:/WinDev/Proj` while the satellite keys
  * `path:c:/windev/proj`, and the two would never unify.
+ *
+ * A POSIX-ABSOLUTE path is exempt on every host, win32 included: a Windows
+ * satellite that works on a WSL repository derives `/home/u/Dev/Proj`, and
+ * the Linux hub that owns that directory keys the same string with its case
+ * intact. Folding it on the satellite alone would split the repository again.
  */
 export function foldKeyPath(p: string, platform: NodeJS.Platform = process.platform): string {
-  return platform === 'win32' || /^[A-Za-z]:\//.test(p) ? p.toLowerCase() : p;
+  if (/^[A-Za-z]:\//.test(p)) return p.toLowerCase();
+  if (/^\/(?!\/)/.test(p)) return p;
+  return platform === 'win32' ? p.toLowerCase() : p;
 }
 
+/**
+ * A `\\wsl$\<distro>\<path>` or `\\wsl.localhost\<distro>\<path>` UNC path
+ * split into its distro and the POSIX path INSIDE that distro. Both
+ * separator styles, any case of the host part, separator runs and the
+ * extended-length prefixes `\\?\UNC\` and `\\?\` are accepted. The POSIX
+ * half keeps its case, because POSIX paths are case-sensitive.
+ *
+ * Returns undefined for every other shape — a drive path, a plain POSIX
+ * path, and any other UNC share.
+ */
+export function wslUncToPosix(p: string): { distro: string; posix: string } | undefined {
+  let s = p.trim();
+  // `\\?\UNC\wsl$\Ubuntu\…` is the extended-length spelling of `\\wsl$\…`.
+  if (/^[\\/]{2}\?[\\/]UNC[\\/]/i.test(s)) s = '//' + s.slice(8);
+  else if (/^[\\/]{2}\?[\\/]/.test(s)) s = s.slice(4);
+
+  const m = /^[\\/]{2}(?:wsl\$|wsl\.localhost)[\\/]+([^\\/]+)(?:[\\/]+(.*))?$/i.exec(s);
+  if (!m) return undefined;
+  const rest = (m[2] ?? '').replace(/[\\/]+/g, '/').replace(/^\/+/, '').replace(/\/+$/, '');
+  return { distro: m[1]!, posix: '/' + rest };
+}
+
+/**
+ * The real directory for a POSIX path whose CASE may be wrong.
+ *
+ * Keys written before this fix went through the win32 whole-path fold, so a
+ * stored key names `/home/u/dev/claro` for a directory that is really
+ * `/home/u/dev/Claro`. On a case-sensitive hub `existsSync` says no, and a
+ * repair pass that trusted that answer would throw the repository away.
+ *
+ * The walk is bounded to `homedir()` and to `MAX_RESOLVE_DEPTH` levels: it
+ * costs one `readdirSync` per level and only inside the owner's own tree. An
+ * ambiguous level (two entries that differ only in case) gives up rather than
+ * guess. The result is re-tested at the end, because a directory entry that
+ * `readdirSync` lists can still be a dangling symlink or a loop.
+ */
+const MAX_RESOLVE_DEPTH = 64;
+
+export function resolveCaseInsensitive(p: string): string | undefined {
+  if (existsSync(p)) return p;
+  const home = homedir();
+  if (!home || home === '/') return undefined;
+  const prefix = home.replace(/\/+$/, '') + '/';
+  if (!p.toLowerCase().startsWith(prefix.toLowerCase())) return undefined;
+
+  let current = prefix.slice(0, -1);
+  if (!existsSync(current)) return undefined;
+  const segments = p.slice(prefix.length).split('/').filter((seg) => seg.length > 0);
+  if (segments.length > MAX_RESOLVE_DEPTH) return undefined;
+  for (const seg of segments) {
+    const exact = current + '/' + seg;
+    if (existsSync(exact)) { current = exact; continue; }
+    let entries: string[];
+    try { entries = readdirSync(current); } catch { return undefined; }
+    const lower = seg.toLowerCase();
+    const hits = entries.filter((e) => e.toLowerCase() === lower);
+    if (hits.length !== 1) return undefined;
+    current = current + '/' + hits[0]!;
+  }
+  return existsSync(current) ? current : undefined;
+}
+
+/**
+ * The `path:` key for a directory.
+ *
+ * A `\\wsl$\…` cwd is rewritten to the POSIX path first: the Windows
+ * satellite sees the repository through a mount, while the hub owns the
+ * directory itself. Both must key the one repository the same way.
+ */
 function pathKey(p: string): string {
+  const unc = wslUncToPosix(p);
+  if (unc) return 'path:' + unc.posix;
   return 'path:' + foldKeyPath(normalizePath(p));
+}
+
+/** Memoized `upgradeLocalPathKey`, cleared with the derivation cache. */
+const upgradeCache = new Map<string, string>();
+
+/**
+ * Upgrade a `path:` key that names a directory THIS machine owns.
+ *
+ * The hub receives `path:/home/u/dev/x` from a Windows satellite that reached
+ * the repository through `\\wsl$\Ubuntu\home\u\dev\x`. The satellite could
+ * not see the repository identity across that mount; the hub can. A key still
+ * in the UNC spelling — an old sidecar, or a satellite that has not been
+ * upgraded yet — is converted first, so `repair --full` cannot undo a
+ * completed rekey by re-reading those sidecars.
+ *
+ * Keys that name no local directory, and keys that already carry a repo
+ * identity, are returned unchanged. Negative answers are memoized too: one
+ * mirror sweep reads many sidecars of the same project.
+ *
+ * ASSUMPTION: a `path:` key that names a directory under the hub's own home
+ * means the hub's repository at that path. A satellite that mirrors the
+ * hub's home layout while holding DIFFERENT repositories at the same paths
+ * would be unified with the hub's. That is accepted, because those two
+ * projects already carried the one identical `path:` key before this change:
+ * the upgrade sharpens a collision that existed, it does not create one.
+ */
+export function upgradeLocalPathKey(key: string): string {
+  if (!key.startsWith('path:')) return key;
+  const hit = upgradeCache.get(key);
+  if (hit !== undefined) return hit;
+
+  const answer = ((): string => {
+    const raw = key.slice('path:'.length);
+    const unc = wslUncToPosix(raw);
+    const p = unc ? unc.posix : raw;
+    // POSIX-absolute only: a drive path or a foreign UNC share is not ours.
+    if (!/^\/(?!\/)/.test(p)) return key;
+    // The stored key may carry the win32 fold, so resolve its case too.
+    const dir = resolveCaseInsensitive(p);
+    if (dir === undefined) return key;
+    const r = deriveProjectKey(dir);
+    if (r.key && (r.kind === 'git' || r.kind === 'origin')) return r.key;
+    return key;
+  })();
+
+  upgradeCache.set(key, answer);
+  return answer;
 }
 
 /**

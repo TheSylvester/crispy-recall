@@ -14,7 +14,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
-  chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync,
+  chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync,
 } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
@@ -22,7 +22,8 @@ import { tmpdir, platform } from 'node:os';
 import { randomUUID } from 'node:crypto';
 
 import {
-  clearProjectKeyCache, deriveProjectKey, foldKeyPath, normalizeOrigin,
+  clearProjectKeyCache, deriveProjectKey, foldKeyPath, normalizeOrigin, resolveCaseInsensitive,
+  upgradeLocalPathKey, wslUncToPosix,
 } from '../../src/recall/project-key.js';
 import { normalizePath } from '../../src/url-path-resolver.js';
 import { _setTestRoot, dbPath } from '../../src/paths.js';
@@ -351,9 +352,17 @@ describe('normalizeOrigin', () => {
 });
 
 describe('foldKeyPath', () => {
-  it('lowercases the WHOLE path on win32', () => {
+  it('lowercases a win32 path that is not POSIX-absolute', () => {
     expect(foldKeyPath('C:/WinDev/Proj', 'win32')).toBe('c:/windev/proj');
-    expect(foldKeyPath('/home/u/Dev/Proj', 'win32')).toBe('/home/u/dev/proj');
+    expect(foldKeyPath('//Server/Share/Dev', 'win32')).toBe('//server/share/dev');
+  });
+
+  it('keeps the case of a POSIX-absolute path on win32 too', () => {
+    // A Windows satellite working on a WSL repository derives the POSIX path
+    // the Linux hub owns. POSIX paths are case-sensitive, so folding here
+    // would split the one repository across two keys again.
+    expect(foldKeyPath('/home/u/Dev/Proj', 'win32')).toBe('/home/u/Dev/Proj');
+    expect(foldKeyPath('/home/u/Dev/Proj', 'linux')).toBe('/home/u/Dev/Proj');
   });
 
   it('folds a Windows-SHAPED path on any host, and leaves a POSIX path alone', () => {
@@ -405,5 +414,145 @@ describe.skipIf(platform() === 'win32')('non-ASCII cwd round-trip', () => {
       restore();
       _resetDb();
     }
+  });
+});
+
+describe('wslUncToPosix', () => {
+  it('converts every accepted UNC spelling', () => {
+    expect(wslUncToPosix('\\\\wsl$\\Ubuntu\\home\\silver\\dev\\x'))
+      .toEqual({ distro: 'Ubuntu', posix: '/home/silver/dev/x' });
+    expect(wslUncToPosix('\\\\wsl.localhost\\Ubuntu\\home\\x'))
+      .toEqual({ distro: 'Ubuntu', posix: '/home/x' });
+    expect(wslUncToPosix('//wsl$/Ubuntu/home/x'))
+      .toEqual({ distro: 'Ubuntu', posix: '/home/x' });
+    // The host part is matched in any case; the POSIX half keeps its own.
+    expect(wslUncToPosix('\\\\WSL$\\Ubuntu-22.04\\home\\Silver\\Dev'))
+      .toEqual({ distro: 'Ubuntu-22.04', posix: '/home/Silver/Dev' });
+    // The distro root alone is still the POSIX root.
+    expect(wslUncToPosix('\\\\wsl$\\Ubuntu')).toEqual({ distro: 'Ubuntu', posix: '/' });
+  });
+
+  it('collapses separator runs and accepts the extended-length prefixes', () => {
+    expect(wslUncToPosix('\\\\wsl$\\Ubuntu\\home\\\\silver'))
+      .toEqual({ distro: 'Ubuntu', posix: '/home/silver' });
+    expect(wslUncToPosix('//wsl$//Ubuntu/home/x'))
+      .toEqual({ distro: 'Ubuntu', posix: '/home/x' });
+    expect(wslUncToPosix('\\\\?\\UNC\\wsl$\\Ubuntu\\home\\x'))
+      .toEqual({ distro: 'Ubuntu', posix: '/home/x' });
+  });
+
+  it('leaves every other shape alone', () => {
+    expect(wslUncToPosix('C:\\Users\\u\\dev')).toBeUndefined();
+    expect(wslUncToPosix('c:/Users/u/dev')).toBeUndefined();
+    expect(wslUncToPosix('/home/silver/dev/x')).toBeUndefined();
+    expect(wslUncToPosix('\\\\Server\\Share\\dev')).toBeUndefined();
+    expect(wslUncToPosix('')).toBeUndefined();
+  });
+});
+
+describe.skipIf(platform() === 'win32')('a \\\\wsl$ UNC cwd', () => {
+  it('keys by the POSIX path when git cannot answer', () => {
+    // The hub has no such directory, and a Windows satellite with no git on
+    // PATH answers the same way. Both must land on the POSIX path key.
+    const r = deriveProjectKey('\\\\wsl$\\Ubuntu\\home\\silver\\dev\\antidote-dev');
+    expect(r.kind).toBe('path');
+    expect(r.key).toBe('path:/home/silver/dev/antidote-dev');
+  });
+
+  it('keys the same way through every accepted UNC spelling', () => {
+    // On the hub the UNC cwd itself never exists, so derivation takes the
+    // vanished-directory branch. Every spelling must still land on one key.
+    const expected = 'path:/home/silver/dev/antidote-dev';
+    for (const cwd of [
+      '\\\\wsl.localhost\\Ubuntu\\home\\silver\\dev\\antidote-dev',
+      '//wsl$/Ubuntu/home/silver/dev/antidote-dev',
+      '\\\\?\\UNC\\wsl$\\Ubuntu\\home\\silver\\dev\\antidote-dev',
+    ]) {
+      clearProjectKeyCache();
+      expect(deriveProjectKey(cwd).key).toBe(expected);
+    }
+  });
+
+  it('upgradeLocalPathKey turns a local POSIX path key into the repo key', () => {
+    const repo = makeRepo('unc-repo', 2);
+    const key = 'path:' + repo;
+    expect(upgradeLocalPathKey(key)).toBe('git:' + rootCommit(repo));
+    // A path this machine does not own, and a key that is already a repo
+    // identity, are both returned unchanged.
+    expect(upgradeLocalPathKey('path:/no/such/dir/anywhere')).toBe('path:/no/such/dir/anywhere');
+    expect(upgradeLocalPathKey('path:c:/windev/proj')).toBe('path:c:/windev/proj');
+    expect(upgradeLocalPathKey('git:' + 'a'.repeat(40))).toBe('git:' + 'a'.repeat(40));
+  });
+});
+
+describe.skipIf(platform() === 'win32')('resolveCaseInsensitive', () => {
+  let prevHome: string | undefined;
+  beforeEach(() => { prevHome = process.env['HOME']; process.env['HOME'] = sandbox; });
+  afterEach(() => {
+    if (prevHome === undefined) delete process.env['HOME']; else process.env['HOME'] = prevHome;
+  });
+
+  it('finds a directory whose case the old win32 fold destroyed', () => {
+    const real = join(sandbox, 'Dev', 'Claro');
+    mkdirSync(real, { recursive: true });
+    expect(resolveCaseInsensitive(real)).toBe(real);
+    expect(resolveCaseInsensitive(join(sandbox, 'dev', 'claro'))).toBe(real);
+  });
+
+  it('gives up on an absent path, on ambiguity, and outside the home tree', () => {
+    mkdirSync(join(sandbox, 'Dev', 'Claro'), { recursive: true });
+    expect(resolveCaseInsensitive(join(sandbox, 'dev', 'nope'))).toBeUndefined();
+    // Two entries that differ only in case: guessing could key the wrong repo.
+    mkdirSync(join(sandbox, 'Dev', 'CLARO'), { recursive: true });
+    expect(resolveCaseInsensitive(join(sandbox, 'dev', 'claro'))).toBeUndefined();
+    expect(resolveCaseInsensitive('/etc/PASSWD-not-here')).toBeUndefined();
+  });
+
+  it('rejects a component that readdir lists but that does not resolve', () => {
+    // A dangling symlink IS a directory entry, so the case-insensitive match
+    // finds it. The final existsSync is what keeps a broken path out.
+    mkdirSync(join(sandbox, 'Dev'), { recursive: true });
+    symlinkSync(join(sandbox, 'nowhere'), join(sandbox, 'Dev', 'Claro'));
+    expect(resolveCaseInsensitive(join(sandbox, 'dev', 'claro'))).toBeUndefined();
+  });
+
+  it('gives up past the depth cap', () => {
+    const deep = join(sandbox, Array.from({ length: 70 }, (_, i) => `d${i}`).join('/'));
+    expect(resolveCaseInsensitive(deep)).toBeUndefined();
+  });
+});
+
+describe.skipIf(platform() === 'win32')('upgradeLocalPathKey', () => {
+  let prevHome: string | undefined;
+  beforeEach(() => { prevHome = process.env['HOME']; process.env['HOME'] = sandbox; });
+  afterEach(() => {
+    if (prevHome === undefined) delete process.env['HOME']; else process.env['HOME'] = prevHome;
+  });
+
+  it('upgrades a UNC key and a case-folded key alike', () => {
+    const repo = makeRepo('Claro', 2);
+    const expected = 'git:' + rootCommit(repo);
+    expect(upgradeLocalPathKey('path:' + repo)).toBe(expected);
+    // An old sidecar still carries the UNC spelling; `repair --full` re-reads
+    // those, so it must not undo a completed rekey.
+    clearProjectKeyCache();
+    expect(upgradeLocalPathKey('path://wsl$/ubuntu' + repo.toLowerCase())).toBe(expected);
+  });
+
+  it('memoizes the NEGATIVE answer so one sweep spawns git once', () => {
+    const dir = join(sandbox, 'not-a-repo');
+    mkdirSync(dir, { recursive: true });
+    const marker = join(sandbox, 'git-calls');
+    fakeGit(`echo ran >> "${marker}"\nexit 128`);
+
+    expect(upgradeLocalPathKey('path:' + dir)).toBe('path:' + dir);
+    const after = readFileSync(marker, 'utf-8');
+    expect(upgradeLocalPathKey('path:' + dir)).toBe('path:' + dir);
+    expect(readFileSync(marker, 'utf-8')).toBe(after);
+
+    // Clearing the cache lets the next sweep retry.
+    clearProjectKeyCache();
+    expect(upgradeLocalPathKey('path:' + dir)).toBe('path:' + dir);
+    expect(readFileSync(marker, 'utf-8').length).toBeGreaterThan(after.length);
   });
 });

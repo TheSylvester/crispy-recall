@@ -17,6 +17,7 @@ import { dbPath } from '../paths.js';
 import { classifySession } from '../recall/session-classifier.js';
 import { ingestSessionMessages } from '../recall/message-ingest.js';
 import { sessionIdFromPath } from '../recall/mtime-scan.js';
+import { upgradeLocalPathKey } from '../recall/project-key.js';
 import { mirrorHostPrefix } from './mirror.js';
 import type { AppendMeta, HubVendor } from './protocol.js';
 
@@ -99,11 +100,18 @@ export async function runPushIngest(job: PushIngestJob, deps: PushIngestDeps): P
   }
 
   // 2c. Ingest with the vendor from the URL; force ONLY for a reset request.
+  //     A `path:` key the hub owns is upgraded first: a Windows satellite that
+  //     works on a WSL repository saw the hub's own filesystem through a
+  //     mount, so it could key only the path. The hub knows the repository.
+  const key = job.meta.key === undefined ? undefined : upgradeLocalPathKey(job.meta.key);
+  if (key !== undefined && key !== job.meta.key) {
+    deps.log(`key-upgraded host=${job.host} path=${job.rel} from=${job.meta.key} to=${key}`);
+  }
   let result;
   try {
     result = await ingestSessionMessages(sessionId, job.abs, job.vendor, {
       ...(job.meta.cwd !== undefined ? { projectId: job.meta.cwd } : {}),
-      ...(job.meta.key !== undefined ? { projectKey: job.meta.key } : {}),
+      ...(key !== undefined ? { projectKey: key } : {}),
       ...(job.meta.hook !== undefined ? { hook: job.meta.hook } : {}),
       force: job.reset,
     });

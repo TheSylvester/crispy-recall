@@ -18,7 +18,7 @@ import { getDb, closeDbBeforeChildSpawn, RETRIEVAL_SCHEMA_DDL, PROJECT_KEY_BACKF
 import { dbPath, binDir, remoteRoot } from '../paths.js';
 import { mirrorRoots } from '../hub/mirror.js';
 import { log } from '../log.js';
-import { deriveProjectKey } from '../recall/project-key.js';
+import { deriveProjectKey, upgradeLocalPathKey, wslUncToPosix } from '../recall/project-key.js';
 import { isUnderRemoteRoot } from '../recall/mirror-meta.js';
 import type { CodexRekeyResult } from './codex-rekey-migration.js';
 
@@ -234,6 +234,12 @@ export interface RekeyProjectsResult {
   skippedMirror: number;
   /** project_ids whose derivation failed transiently — rows left NULL. */
   transient: number;
+  /** Rows carrying a `\\wsl$\…` UNC key that this pass rewrote. */
+  wslRows: number;
+  /** Of those, rows that reached a `git:`/`origin:` key. */
+  wslUpgraded: number;
+  /** Of those, rows the hub could not verify — the UNC key is KEPT for a retry. */
+  wslRetryable: number;
   /** Whether the durable 'complete' marker was written (false → re-run). */
   markerWritten: boolean;
 }
@@ -259,6 +265,8 @@ export function repairRekeyProjects(opts: { force: boolean }): RekeyProjectsResu
   ) as Array<{ project_id: string }>).map((r) => r.project_id);
 
   const derived: Array<{ projectId: string; key: string }> = [];
+  /** UNC project_ids the hub could not resolve — left for a later run. */
+  const wslRetryableIds: string[] = [];
   let considered = 0;
   let skippedMirror = 0;
   let transient = 0;
@@ -279,13 +287,63 @@ export function repairRekeyProjects(opts: { force: boolean }): RekeyProjectsResu
     if (allMirrored) { skippedMirror++; continue; }
     considered++;
 
+    // A `\\wsl$\…` project_id must NEVER be keyed by a bare `path:<posix>`:
+    // that path is the one the hub could not verify, and such a key would
+    // fall out of the UNC branch below AND out of every later run. Only a
+    // reached repository identity is written; anything else stays as it is.
+    const unc = wslUncToPosix(projectId);
+    if (unc) {
+      const upgraded = upgradeLocalPathKey('path:' + unc.posix);
+      if (upgraded.startsWith('git:') || upgraded.startsWith('origin:')) {
+        derived.push({ projectId, key: upgraded });
+      } else {
+        wslRetryableIds.push(projectId);
+      }
+      continue;
+    }
+
     const result = deriveProjectKey(projectId);
     if (result.transientFailure || !result.key) { transient++; continue; }
     derived.push({ projectId, key: result.key });
   }
 
+  // WSL UNC keys (U3). A Windows satellite that works on a repository inside
+  // WSL saw a `\\wsl$\<distro>\…` cwd and keyed the mount, not the repository,
+  // so the one repository split into two keys. Such a key is provably wrong,
+  // and this branch corrects it without `--force`.
+  const wslKeys = (d.all(
+    `SELECT DISTINCT project_key AS key FROM messages
+      WHERE project_key LIKE 'path://wsl$/%' OR project_key LIKE 'path://wsl.localhost/%'`,
+  ) as Array<{ key: string }>);
+  const wslRewrites: Array<{ from: string; to: string }> = [];
+  const wslRetryableKeys: string[] = [];
+  for (const row of wslKeys) {
+    const to = upgradeLocalPathKey(row.key);
+    // ONLY a reached repository identity earns an UPDATE. A path the hub
+    // could not verify — a case the old win32 fold destroyed, a directory
+    // that is temporarily absent, a transient git — must keep its UNC key:
+    // rewriting it to a bare `path:<posix>` would drop it out of this branch
+    // and out of the main pass, and no later run could ever correct it.
+    if (to.startsWith('git:') || to.startsWith('origin:')) wslRewrites.push({ from: row.key, to });
+    else wslRetryableKeys.push(row.key);
+  }
+
   let updated = 0;
-  const markerWritten = transient === 0;
+  let wslRows = 0;
+  let wslUpgraded = 0;
+  let wslRetryable = 0;
+
+  // A UNC project_id the hub could not resolve leaves its NULL-keyed rows
+  // NULL, exactly as a transient derivation does, so it blocks the marker the
+  // same way: the backfill is not complete until a later run resolves it.
+  const wslNullRows = wslRetryableIds.reduce((acc, projectId) => {
+    const row = d.get(
+      `SELECT COUNT(*) AS c FROM messages WHERE project_id = ? AND project_key IS NULL`,
+      [projectId],
+    ) as { c?: number } | undefined;
+    return acc + Number(row?.c ?? 0);
+  }, 0);
+  const markerWritten = transient === 0 && wslNullRows === 0;
 
   d.exec('BEGIN IMMEDIATE');
   try {
@@ -293,12 +351,51 @@ export function repairRekeyProjects(opts: { force: boolean }): RekeyProjectsResu
     d.exec('DROP TRIGGER IF EXISTS messages_fts_ad');
     d.exec('DROP TRIGGER IF EXISTS messages_fts_au');
 
+    // `--force` re-keys an already-keyed row, but never a UNC key: that key
+    // is the ONLY handle the rewrite below has on the row, and a derivation
+    // from a UNC project_id cannot beat what the rewrite computes.
     const sql = opts.force
-      ? `UPDATE messages SET project_key = ? WHERE project_id = ?`
+      ? `UPDATE messages SET project_key = ? WHERE project_id = ?
+           AND (project_key IS NULL
+                OR (project_key NOT LIKE 'path://wsl$/%'
+                    AND project_key NOT LIKE 'path://wsl.localhost/%'))`
       : `UPDATE messages SET project_key = ? WHERE project_id = ? AND project_key IS NULL`;
     for (const row of derived) {
       const info = d.run(sql, [row.key, row.projectId]) as { changes?: number } | undefined;
       updated += Number(info?.changes ?? 0);
+    }
+
+    // The UNC rewrite runs after the main pass, which leaves UNC keys alone
+    // under `--force` too, so the two never fight over the same row.
+    for (const row of wslRewrites) {
+      const info = d.run(
+        `UPDATE messages SET project_key = ? WHERE project_key = ?`, [row.to, row.from],
+      ) as { changes?: number } | undefined;
+      const n = Number(info?.changes ?? 0);
+      wslRows += n;
+      wslUpgraded += n;
+    }
+    for (const key of wslRetryableKeys) {
+      const row = d.get(
+        `SELECT COUNT(*) AS c FROM messages WHERE project_key = ?`, [key],
+      ) as { c?: number } | undefined;
+      const n = Number(row?.c ?? 0);
+      wslRows += n;
+      wslRetryable += n;
+    }
+    // The rows a UNC project_id left behind. Rows that ALSO carry a UNC key
+    // are excluded — the loop above already counted those.
+    for (const projectId of wslRetryableIds) {
+      const row = d.get(
+        `SELECT COUNT(*) AS c FROM messages WHERE project_id = ?
+           AND (project_key IS NULL
+                OR (project_key NOT LIKE 'path://wsl$/%'
+                    AND project_key NOT LIKE 'path://wsl.localhost/%'))`,
+        [projectId],
+      ) as { c?: number } | undefined;
+      const n = Number(row?.c ?? 0);
+      wslRows += n;
+      wslRetryable += n;
     }
 
     // Every statement in `fts` is IF NOT EXISTS, so the view, FTS table and
@@ -322,8 +419,12 @@ export function repairRekeyProjects(opts: { force: boolean }): RekeyProjectsResu
     source: 'installer/repair',
     level: 'info',
     summary: `project keys: ${considered} project_ids, ${updated} rows updated, ` +
-      `${skippedMirror} mirror-only skipped, ${transient} transient (left NULL)`,
+      `${skippedMirror} mirror-only skipped, ${transient} transient (left NULL); ` +
+      `wsl-unc keys: ${wslRows} rows → ${wslUpgraded} upgraded, ${wslRetryable} left (retryable)`,
   });
 
-  return { projectIds: considered, updated, skippedMirror, transient, markerWritten };
+  return {
+    projectIds: considered, updated, skippedMirror, transient,
+    wslRows, wslUpgraded, wslRetryable, markerWritten,
+  };
 }
