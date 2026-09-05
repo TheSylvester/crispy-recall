@@ -23,6 +23,7 @@ import { request } from 'node:https';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { recallRoot, runDir } from '../paths.js';
+import { claudeRoot, codexRoot } from '../recall/transcript-roots.js';
 import { detectGpu, type GpuInfo } from './gpu.js';
 
 const execFileAsync = promisify(execFile);
@@ -73,8 +74,7 @@ export interface PreflightOptions {
 
 /** ~/.claude (or $CLAUDE_CONFIG_DIR). */
 export function claudeDir(): string {
-  const override = process.env['CLAUDE_CONFIG_DIR'];
-  return override && override.length > 0 ? override : join(homedir(), '.claude');
+  return claudeRoot();
 }
 export function claudeSettingsPath(): string { return join(claudeDir(), 'settings.json'); }
 export function claudeSkillsDir(): string { return join(claudeDir(), 'skills'); }
@@ -83,8 +83,7 @@ export function claudeMdPath(): string { return join(claudeDir(), 'CLAUDE.md'); 
 
 /** ~/.codex (or $CODEX_HOME). */
 export function codexDir(): string {
-  const override = process.env['CODEX_HOME'];
-  return override && override.length > 0 ? override : join(homedir(), '.codex');
+  return codexRoot();
 }
 export function codexHooksPath(): string { return join(codexDir(), 'hooks.json'); }
 export function codexAgentsPath(): string { return join(codexDir(), 'AGENTS.md'); }

@@ -21,10 +21,9 @@
 
 import { glob } from 'glob';
 import { statSync } from 'node:fs';
-import { homedir } from 'node:os';
-import { join } from 'node:path';
 import { getDb } from '../db.js';
 import { dbPath, transcriptGlob } from '../paths.js';
+import { claudeRoot, codexRoot } from './transcript-roots.js';
 import { log } from '../log.js';
 import { ingestSessionMessages } from './message-ingest.js';
 
@@ -73,10 +72,8 @@ export async function mtimeScan(opts?: MtimeScanOptions): Promise<ScanResult> {
     }
   } else {
     const vendors = opts?.vendors ?? ['claude', 'codex'];
-    const claudeRoot = process.env['CLAUDE_CONFIG_DIR'] ?? join(homedir(), '.claude');
-    const codexRoot = process.env['CODEX_HOME'] ?? join(homedir(), '.codex');
-    if (vendors.includes('claude')) patterns.push([transcriptGlob(claudeRoot, 'projects', '**', '*.jsonl'), 'claude']);
-    if (vendors.includes('codex')) patterns.push([transcriptGlob(codexRoot, 'sessions', '**', '*.jsonl'), 'codex']);
+    if (vendors.includes('claude')) patterns.push([transcriptGlob(claudeRoot(), 'projects', '**', '*.jsonl'), 'claude']);
+    if (vendors.includes('codex')) patterns.push([transcriptGlob(codexRoot(), 'sessions', '**', '*.jsonl'), 'codex']);
   }
 
   const db = getDb(dbPath());

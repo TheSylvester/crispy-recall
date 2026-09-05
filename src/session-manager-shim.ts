@@ -15,9 +15,8 @@
  */
 
 import { globSync } from 'glob';
-import { homedir } from 'node:os';
-import { join } from 'node:path';
 import { transcriptGlob } from './paths.js';
+import { claudeRoot, codexRoot } from './recall/transcript-roots.js';
 import { mirrorRoots } from './hub/mirror.js';
 import type { TranscriptEntry } from './transcript.js';
 
@@ -59,13 +58,11 @@ export async function loadSession(_sessionId: string): Promise<TranscriptEntry[]
  */
 export function listAllSessions(opts?: { vendors?: ('claude' | 'codex')[] }): ShimSessionInfo[] {
   const vendors = opts?.vendors ?? ['claude', 'codex'];
-  const claudeRoot = process.env['CLAUDE_CONFIG_DIR'] ?? join(homedir(), '.claude');
-  const codexRoot = process.env['CODEX_HOME'] ?? join(homedir(), '.codex');
 
   const out: ShimSessionInfo[] = [];
 
   if (vendors.includes('claude')) {
-    const files = globSync(transcriptGlob(claudeRoot, 'projects', '**', '*.jsonl'), { nodir: true });
+    const files = globSync(transcriptGlob(claudeRoot(), 'projects', '**', '*.jsonl'), { nodir: true });
     for (const file of files) {
       out.push({
         sessionId: sessionIdFromPath(file, 'claude'),
@@ -76,7 +73,7 @@ export function listAllSessions(opts?: { vendors?: ('claude' | 'codex')[] }): Sh
     }
   }
   if (vendors.includes('codex')) {
-    const files = globSync(transcriptGlob(codexRoot, 'sessions', '**', '*.jsonl'), { nodir: true });
+    const files = globSync(transcriptGlob(codexRoot(), 'sessions', '**', '*.jsonl'), { nodir: true });
     for (const file of files) {
       out.push({
         sessionId: sessionIdFromPath(file, 'codex'),

@@ -17,10 +17,10 @@ import {
   appendFileSync, closeSync, mkdirSync, openSync, readFileSync, readSync,
   statSync, unlinkSync, utimesSync, writeFileSync,
 } from 'node:fs';
-import { homedir } from 'node:os';
 import { join, relative, resolve } from 'node:path';
 import { glob } from 'glob';
 import { logsDir, runDir, transcriptGlob } from '../paths.js';
+import { transcriptRoots } from '../recall/transcript-roots.js';
 import { deriveProjectKey } from '../recall/project-key.js';
 import { readSatelliteConfig } from '../installer/config.js';
 import {
@@ -149,12 +149,12 @@ function pushLog(line: string): void {
 
 export interface VendorRoot { vendor: HubVendor; root: string }
 
-/** The two transcript roots, honoring CLAUDE_CONFIG_DIR / CODEX_HOME. */
+/** The two transcript roots, honoring CLAUDE_CONFIG_DIR / CODEX_HOME. The
+ *  shared resolver's hub guard cannot fire here: it needs a registered host
+ *  record, and a satellite has none — the pusher always reads what it is
+ *  configured to push. */
 export function vendorRoots(): VendorRoot[] {
-  return [
-    { vendor: 'claude', root: process.env['CLAUDE_CONFIG_DIR'] ?? join(homedir(), '.claude') },
-    { vendor: 'codex', root: process.env['CODEX_HOME'] ?? join(homedir(), '.codex') },
-  ];
+  return transcriptRoots();
 }
 
 function vendorPattern(v: VendorRoot): string {
