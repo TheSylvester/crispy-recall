@@ -252,6 +252,34 @@ describe.skipIf(platform() === 'win32')('repairRekeyProjects', () => {
     expect(marker()).toBeUndefined();
   }, 30_000);
 
+  it('a UNC project_id the hub REACHED is keyed like any local one', () => {
+    // The directory exists but is not a repository. The hub verified the
+    // path, so the row is keyed `path:<resolved dir>` and the backfill is
+    // complete — "reached but not a repo" is not "unreachable".
+    const plain = join(recallHome, 'Dev', 'Plain');
+    mkdirSync(plain, { recursive: true });
+    insertMessage('W5', 'W5-m0', `//wsl$/Ubuntu${plain}`, null);
+
+    const r = withHome(() => repairRekeyProjects({ force: false }));
+    expect(keyOf('W5')).toBe(`path:${plain}`);
+    expect(r.wslRetryable).toBe(0);
+    expect(r.transient).toBe(0);
+    expect(r.markerWritten).toBe(true);
+  }, 30_000);
+
+  it('a transient git under a UNC project_id counts as transient, not retryable', () => {
+    const plain = join(recallHome, 'Dev', 'Plain');
+    mkdirSync(plain, { recursive: true });
+    insertMessage('W6', 'W6-m0', `//wsl$/Ubuntu${plain}`, null);
+    fakeTransientGit();
+
+    const r = withHome(() => repairRekeyProjects({ force: false }));
+    expect(r.transient).toBe(1);
+    expect(r.wslRetryable).toBe(0);
+    expect(keyOf('W6')).toBeNull();
+    expect(r.markerWritten).toBe(false);
+  }, 30_000);
+
   it('a transient derivation leaves the rows NULL, the marker absent, and markerWritten false', () => {
     // A project_id that EXISTS on disk is the only one that reaches git.
     const live = join(recallHome, 'live-project');

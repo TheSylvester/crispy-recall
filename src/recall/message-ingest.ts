@@ -41,7 +41,7 @@ import { DOC_PREFIX, EMBED_VERSION, buildEmbedText } from './embed-config.js';
 import { getDb } from '../db.js';
 import { dbPath } from '../paths.js';
 import { normalizePath } from '../url-path-resolver.js';
-import { deriveProjectKey, upgradeLocalPathKey } from './project-key.js';
+import { deriveProjectKey, upgradeLocalPathKey, wslUncToPosix } from './project-key.js';
 import { isUnderRemoteRoot, readMirrorMeta } from './mirror-meta.js';
 import { log } from '../log.js';
 import { parseJsonlFile } from '../adapters/claude/jsonl-reader.js';
@@ -272,6 +272,13 @@ export async function ingestSessionMessages(
   //    A sidecar `path:` key that names a directory THIS machine owns is
   //    upgraded to the repository identity: a Windows satellite working on a
   //    WSL repository saw the hub's filesystem through a mount (U3).
+  //    A hub-LOCAL transcript can still carry a `\\wsl$\…` cwd, which derives
+  //    through the vanished-directory branch; the hub may own the POSIX
+  //    directory it names, so upgrade that key too (U3).
+  const localKey = (): string | null => {
+    const k = deriveProjectKey(rawProjectId!).key ?? null;
+    return k !== null && wslUncToPosix(rawProjectId!) ? upgradeLocalPathKey(k) : k;
+  };
   const sidecarKey = (): string | null => {
     const k = readMirrorMeta(transcriptPath)?.key;
     return k === undefined ? null : upgradeLocalPathKey(k);
@@ -281,7 +288,7 @@ export async function ingestSessionMessages(
         ? options.projectKey
         : (isUnderRemoteRoot(transcriptPath)
             ? sidecarKey()
-            : (deriveProjectKey(rawProjectId).key ?? null)))
+            : localKey()))
     : null;
 
   // 4. Strip tool content, filter sub-agent entries and meta boilerplate.
