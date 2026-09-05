@@ -7,11 +7,14 @@
 
 import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, openSync } from 'node:fs';
+import { globSync } from 'glob';
 import { getDb } from '../db.js';
 import { readHubConfig, writeHubConfig } from '../installer/config.js';
 import { dbPath, logsDir, remoteRoot, runDir } from '../paths.js';
 import { getBinaryPath, getModelPath } from '../recall/embedder.js';
-import { mirrorHostSummary, mirrorHosts } from './mirror.js';
+import { sessionIdFromPath } from '../recall/mtime-scan.js';
+import { defaultClaudeRoot, defaultCodexRoot } from '../recall/transcript-roots.js';
+import { mirrorHostSummary, mirrorHosts, mirrorRoots } from './mirror.js';
 import { WIRE_VERSION } from './protocol.js';
 import { hubDaemonAlive, hubLogPath, readHostRecords, readPackageVersion } from './runtime.js';
 import { checkBindPolicy, startHubServer } from './server.js';
@@ -29,6 +32,7 @@ export interface HubCliFlags {
   host?: string;
   revoke?: string;
   json: boolean;
+  yes: boolean;
 }
 
 export function hubUsage(): string {
@@ -38,6 +42,7 @@ export function hubUsage(): string {
     '  recall hub token --host <name> | --revoke <name>',
     '  recall hub status [--json]',
     '  recall hub install-service',
+    '  recall hub release-foreign-scans [--yes]',
   ].join('\n');
 }
 
@@ -46,6 +51,7 @@ export async function runHubCommand(sub: string | undefined, f: HubCliFlags): Pr
     case 'serve': return runServe(f);
     case 'token': return runToken(f);
     case 'status': return runStatus(f.json);
+    case 'release-foreign-scans': return runReleaseForeignScans({ apply: f.yes });
     case 'install-service': {
       const r = runInstallService();
       for (const m of r.messages) console.log(m);
@@ -246,6 +252,123 @@ function runStatus(json: boolean): number {
     console.log(`  files ${h.files}, bytes ${h.bytes}, sidecar-less ${h.sidecarless}`);
     console.log(`  last push ${h.lastPushAt ?? 'never'}, last query ${h.lastQueryAt ?? 'never'}`);
     console.log(`  last full manifest ${h.lastFullManifestAt ?? 'never'}, refused collisions ${h.refusedCollisions}`);
+  }
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
+// release-foreign-scans
+// ---------------------------------------------------------------------------
+
+/**
+ * Hand sessions back to the satellite that owns them (the 2026-09-05 defect).
+ *
+ * A hub process that ran with `CODEX_HOME=/mnt/c/…` scanned a Windows tree and
+ * claimed those sessions as LOCAL. The provenance row then names a path that
+ * no sweep ever advances, and every push of the same id from the satellite is
+ * refused as a collision. Dropping the provenance row and the local watermark
+ * lets the mirror path re-adopt the session; the messages stay, because the
+ * message ids are identical and `INSERT OR IGNORE` dedupes them.
+ */
+export interface ForeignScanRow {
+  sessionId: string;
+  vendor: 'claude' | 'codex';
+  localPath: string;
+  mirrorPath: string;
+  host: string;
+}
+
+/** Forward-slashed, with one trailing separator — the containment idiom. */
+function prefixOf(dir: string): string {
+  const p = dir.replace(/\\/g, '/');
+  return p.endsWith('/') ? p : `${p}/`;
+}
+
+/** sessionId → the first mirror file that carries it, per vendor. */
+function mirrorIndex(): Map<string, { path: string; host: string }> {
+  const out = new Map<string, { path: string; host: string }>();
+  const remotePrefix = prefixOf(remoteRoot());
+  for (const { root, vendor } of mirrorRoots()) {
+    const host = root.replace(/\\/g, '/').slice(remotePrefix.length).split('/')[0] ?? '';
+    for (const file of globSync(`${root}/**/*.jsonl`, { nodir: true })) {
+      const norm = file.replace(/\\/g, '/');
+      const key = `${vendor}:${sessionIdFromPath(norm, vendor)}`;
+      if (!out.has(key)) out.set(key, { path: norm, host });
+    }
+  }
+  return out;
+}
+
+/** Provenance rows that came from an env-override root AND exist in a mirror. */
+export function findForeignScans(): ForeignScanRow[] {
+  const db = getDb(dbPath());
+  const rows = db.all(
+    `SELECT session_id AS sid, vendor, transcript_path AS path
+       FROM session_provenance
+      WHERE transcript_path IS NOT NULL AND transcript_path <> ''`,
+  ) as Array<{ sid: string; vendor: string; path: string }>;
+  const known = [prefixOf(remoteRoot()), prefixOf(defaultClaudeRoot()), prefixOf(defaultCodexRoot())];
+  const mirrors = mirrorIndex();
+  const out: ForeignScanRow[] = [];
+  for (const row of rows) {
+    if (row.vendor !== 'claude' && row.vendor !== 'codex') continue;
+    const local = row.path.replace(/\\/g, '/');
+    if (known.some((k) => local.startsWith(k))) continue;
+    const hit = mirrors.get(`${row.vendor}:${row.sid}`);
+    if (!hit) continue;
+    out.push({ sessionId: row.sid, vendor: row.vendor, localPath: row.path, mirrorPath: hit.path, host: hit.host });
+  }
+  return out;
+}
+
+export interface ReleaseOptions {
+  apply?: boolean;
+  /** Test seam — never signal a real process from a unit test. */
+  kill?: (pid: number, signal: NodeJS.Signals) => void;
+}
+
+export function runReleaseForeignScans(opts: ReleaseOptions = {}): number {
+  const rows = findForeignScans();
+  for (const r of rows) {
+    console.log(`release sid=${r.sessionId} local=${r.localPath} mirror=${r.mirrorPath} host=${r.host}`);
+  }
+  if (rows.length === 0) {
+    console.log('recall hub: no foreign-scanned sessions — nothing to release.');
+    return 0;
+  }
+  if (!opts.apply) {
+    console.log(`${rows.length} session(s) would be released. Re-run with --yes to apply.`);
+    return 0;
+  }
+
+  // BEGIN IMMEDIATE: take the write lock up front so a running daemon's sweep
+  // never interleaves. The transaction stays short (two deletes per row).
+  const db = getDb(dbPath());
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    for (const r of rows) {
+      db.run('DELETE FROM session_provenance WHERE session_id = ?', [r.sessionId]);
+      db.run('DELETE FROM ingest_watermark WHERE transcript_path = ?', [r.localPath]);
+    }
+    db.exec('COMMIT');
+  } catch (e) {
+    try { db.exec('ROLLBACK'); } catch { /* ignore */ }
+    console.error(`recall hub: release failed, nothing changed: ${(e as Error).message}`);
+    return 1;
+  }
+  console.log(`released ${rows.length} session(s); messages were left untouched.`);
+
+  const { alive, record } = hubDaemonAlive();
+  if (alive && record) {
+    const kill = opts.kill ?? ((pid: number, signal: NodeJS.Signals) => { process.kill(pid, signal); });
+    try {
+      kill(record.pid, 'SIGUSR1');
+      console.log(`sweep requested pid=${record.pid}`);
+    } catch (e) {
+      console.error(`recall hub: could not signal pid ${record.pid}: ${(e as Error).message}`);
+    }
+  } else {
+    console.log('daemon not running: the next sweep adopts them');
   }
   return 0;
 }
