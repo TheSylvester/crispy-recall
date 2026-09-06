@@ -22,6 +22,7 @@
  */
 
 import { dualPathSearch } from '../recall/vector-search.js';
+import { parseDateBounds } from '../recall/date-bounds.js';
 import { disposeEmbedder } from '../recall/embedder.js';
 import { getDb, closeDb } from '../db.js';
 import { getDbPath, listSessions } from '../recall/memory-queries.js';
@@ -785,14 +786,7 @@ async function runSearch(query: string) {
   initDb();
   const ceiling = limit > 0 ? limit : 200;
   const scope = projectScope();
-  const createdFrom = since ? Date.parse(since) : undefined;
-  const createdTo = until ? Date.parse(/^\d{4}-\d{2}-\d{2}$/.test(until) ? until + 'T23:59:59.999' : until) : undefined;
-  for (const [flag, value, parsed] of [['since', since, createdFrom], ['until', until, createdTo]] as const) {
-    if (parsed !== undefined && !Number.isFinite(parsed)) {
-      console.error(`Invalid --${flag} date: "${value}" (expected ISO-8601)`);
-      exit(1);
-    }
-  }
+  const { createdFrom, createdTo } = parseDateBounds(since, until);
   const r = await dualPathSearch(query, {
     limit: ceiling,
     createdFrom,

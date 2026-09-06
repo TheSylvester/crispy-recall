@@ -12,6 +12,7 @@
  */
 
 import { getDb } from '../db.js';
+import { parseDateBounds } from './date-bounds.js';
 import { dbPath } from '../paths.js';
 import { readClaudeTurnContent, type TurnContent } from '../adapters/claude/jsonl-reader.js';
 import { readCodexTurnContent } from '../adapters/codex/codex-jsonl-reader.js';
@@ -70,16 +71,14 @@ export function listSessions(
   // readable, but never appear in the default session list.
   const conditions: string[] = [`m.retrieval_class = 'hot'`];
 
-  if (since) {
-    // messages.created_at is INTEGER (epoch ms) — convert ISO string to epoch ms
-    const sinceMs = new Date(since).getTime();
+  const { createdFrom, createdTo } = parseDateBounds(since, until);
+  if (createdFrom !== undefined) {
     conditions.push('m.created_at >= ?');
-    params.push(sinceMs);
+    params.push(createdFrom);
   }
-  if (until) {
-    const untilMs = new Date(until + 'T23:59:59.999').getTime();
+  if (createdTo !== undefined) {
     conditions.push('m.created_at <= ?');
-    params.push(untilMs);
+    params.push(createdTo);
   }
   if (excludeSessionId) {
     conditions.push('m.session_id != ?');
