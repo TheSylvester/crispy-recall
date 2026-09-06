@@ -14,6 +14,7 @@ import { spawn } from 'node:child_process';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { binDir } from '../paths.js';
+import { upgradeLocalPathKey } from '../recall/project-key.js';
 import { normalizePath } from '../url-path-resolver.js';
 import {
   KEY_RE, MAX_ARGV, MAX_ARGV_STRING, QUERY_FLAG_ALLOWLIST, REJECTED_POSITIONALS,
@@ -83,7 +84,15 @@ export function buildHubArgv(req: QueryRequest): { ok: true; argv: string[] } | 
   let expectValue = false;
   for (let i = 0; i < req.argv.length; i++) {
     const a = req.argv[i]!;
-    if (expectValue) { out.push(a); expectValue = false; continue; }
+    if (expectValue) {
+      // L5: the value slot is NOT a hole in the allowlist. Without this,
+      // `['--limit', '--commit']` walks an arbitrary flag past the `--`
+      // check straight into the child's own `hasFlag('--commit')`.
+      if (a.startsWith('-')) return { ok: false, reason: `value for ${req.argv[i - 1]!} must not begin with -` };
+      out.push(a);
+      expectValue = false;
+      continue;
+    }
     if (a === '--context') { i++; continue; }
     if (a === '--project' || a === '--project-key') return { ok: false, reason: '--project must be resolved on the satellite' };
     if (a.startsWith('--')) {
@@ -96,7 +105,12 @@ export function buildHubArgv(req: QueryRequest): { ok: true; argv: string[] } | 
     out.push(a);
   }
   if (!out.includes('--all')) {
-    if (req.key) out.push('--project-key', req.key);
+    // M3: the satellite could only derive `path:` for a repository it reached
+    // across a mount (`\\wsl$\…`), while ingest stored those rows under the
+    // `git:`/`origin:` key the hub derived itself (ingest-queue.ts). Forwarding
+    // the raw key would scope the query to a key no row carries. Memoized in
+    // project-key.ts (`upgradeCache`), so this costs git once per key.
+    if (req.key) out.push('--project-key', upgradeLocalPathKey(req.key));
     out.push('--project', normalizePath(req.cwd));
   }
   out.push('--no-catchup');
