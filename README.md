@@ -21,9 +21,9 @@ recall downloads a local embedding runtime and model, sets up a `Stop` hook in C
 
 ### More than one machine (experimental satellite mode)
 
-**Experimental, platform dependent:** satellite mode is available in the `0.4.0-sat.3` prerelease branch and tarball; the stable `0.3.x` npm release does not include it. Previous live checks covered a Linux/WSL hub, a Linux laptop satellite, and a Windows-native satellite. macOS satellite operation has not been verified. Automatic hub service registration requires Linux with systemd; Windows and macOS hubs must run `recall hub serve` under a supervisor you configure. A WSL hub must remain running and reachable from the laptop. Previous live checks also covered laptop Codex; noninteractive SSH shells must select the intended Node/Codex installation explicitly when nvm is absent from PATH.
+**Experimental, platform dependent:** satellite mode is available in the `0.4.0-sat.4` prerelease branch and tarball; the stable `0.3.x` npm release does not include it. Previous live checks covered a Linux/WSL hub, a Linux laptop satellite, and a Windows-native satellite. macOS satellite operation has not been verified. Automatic hub service registration requires Linux with systemd; Windows and macOS hubs must run `recall hub serve` under a supervisor you configure. A WSL hub must remain running and reachable from the laptop. Previous live checks also covered laptop Codex; noninteractive SSH shells must select the intended Node/Codex installation explicitly when nvm is absent from PATH.
 
-Build the experimental package from `feat/satellite-mode` with `npm ci`, `npm test`, and `npm pack`, then install the generated tarball on each machine with `npm install -g /path/to/crispy-recall-0.4.0-sat.3.tgz`. Run `recall install` on the hub before registering satellites. The upgrade fixes tracked for 0.4.0 must land before a stable release.
+Build the experimental package from `feat/satellite-mode` with `npm ci`, `npm test`, and `npm pack`, then install the generated tarball on each machine with `npm install -g /path/to/crispy-recall-0.4.0-sat.4.tgz`. Run `recall install` on the hub before registering satellites. This remains a prerelease; platform acceptance beyond the configurations listed above is still pending.
 
 A **hub** is the machine that keeps the database and runs the embedding model. A **satellite** is a machine that only pushes its transcripts to the hub and forwards its queries there; it needs no database, no model and no native addon, and it runs on Node.js 20–22 or 24+ (Node 23 is unsupported). The npm package still depends on `better-sqlite3`, even though the satellite runtime does not load or stage it.
 
@@ -134,7 +134,7 @@ recall --blame src/foo.ts:42 src/bar.ts:10-20 --limit 20
 
 Matching is structural: recall compares edits recorded in sessions with commit diffs instead of guessing from timestamps. A commit message summarizes intent; the conversation holds the reasoning, tradeoffs, and rejected alternatives.
 
-Commit and blame attribution currently scans Claude Code transcripts. Codex sessions remain searchable by text and meaning, but aren't yet attributed to commits.
+Commit and blame attribution scans local Claude Code edits and Codex `apply_patch` records. It compares recorded changes with git diffs; edits made by arbitrary shell commands may not carry enough structured evidence for attribution.
 
 **`git blame` tells you who. `recall --blame` tells you why.**
 
@@ -190,7 +190,7 @@ Install-time backfill indexes the Claude Code and Codex sessions still present o
 - Claude Code (required); Codex session indexing and search are also configured when Codex is detected
 - Linux x64/arm64, macOS x64/arm64, or Windows x64
 - macOS 14+ on Apple Silicon or macOS 13.7+ on Intel
-- 500 MB free recommended for installation; upgrading also needs free space for retained rollback snapshots — roughly the database size when upgrading from 0.2.x, and roughly twice that from 0.1.x (which keeps two snapshots)
+- 500 MB free recommended for installation; upgrading also needs free space for retained rollback snapshots — up to twice the database size when upgrading from 0.2.x, and up to three times that from 0.1.x
 
 Node 23 is unsupported because no prebuilt SQLite binding is available for it.
 
@@ -226,11 +226,15 @@ recall install
 - **From 0.2.x**, the installer runs the retrieval-class migration: it reclassifies any subagent (agent-leaf) messages as durable-but-excluded-from-default-search, rebuilds the FTS index, and re-embeds affected rows in the background.
 - **From 0.3.x on a hub**, `recall install` also runs the attended Codex message-id migration, which re-ingests and re-embeds your Codex history in the background — semantic recall over Codex sessions is degraded until `recall doctor` reports the embedding gap at 0 — and it offers `recall repair --rekey-projects` to fill the new project key on existing rows.
 
-Before it changes anything, the retrieval-class migration writes a `~/.recall/recall.db.pre-retrieval-<stamp>` snapshot; a 0.1.x upgrade therefore keeps two retained snapshots (pre-upgrade and pre-retrieval). Keep free disk roughly equal to the current database size — twice that when upgrading from 0.1.x — and delete the snapshots only after you're satisfied.
+Each migration takes a consistent SQLite backup before changing the database and aborts if the backup fails. Snapshot names identify the migration: `recall.db.pre-upgrade-<stamp>`, `recall.db.pre-retrieval-<stamp>`, and `recall.db.pre-codex-rekey-<stamp>`. A 0.1.x upgrade can retain all three; a 0.2.x upgrade can retain two. Allow that many database-sized copies in free space and delete them only after you are satisfied.
 
 If a live session or a running backfill holds the database, the installer aborts cleanly so you can exit it and rerun `recall install`. Search remains available during migration; use `recall status` to watch progress, and the background re-embed resumes after interruption or reboot.
 
-Migration works from `recall.db`, not the source transcripts, so indexed history is preserved even when the original JSONL has already been cleaned up. Your database is the store of record; if old transcripts are gone, `recall repair --full` cannot recreate them. Don't downgrade to `<=0.1.6` after converting the database.
+The retrieval-class migration works from `recall.db`, so it preserves indexed history after source cleanup. Codex re-keying needs readable source transcripts; missing or pruned rollouts cannot be recovered. Your database is the store of record; if old transcripts are gone, `recall repair --full` cannot recreate them. Don't downgrade to `<=0.1.6` after converting the database.
+
+Upgrading the npm package alone does not complete the Codex migration: normal commands fail closed, and Stop hooks cannot ingest until `recall install` completes it. The default install backfill also recovers available sessions that previously inserted no rows; `--no-backfill` and `repair --rekey-codex` alone do not. A clean migration marker or residue count does not prove that this backfill has finished.
+
+For installations exposed to the earlier sequence or fork-ID bugs, run `recall repair --messages` after upgrading. It re-reads known transcripts to recover missed turns and repair ordering without deleting indexed history whose source is gone. It invalidates affected vectors; follow with `recall backfill --auto-embed`. Status and doctor report persistent embedding failures so an unavailable runtime or bad input cannot silently stall catch-up.
 
 ## Command reference
 
@@ -241,14 +245,15 @@ Migration works from `recall.db`, not the source transcripts, so indexed history
 | `recall <session-id> [<message-id>]` | Read a session, optionally centered on a match. IDs are opaque — full stored IDs or literal prefixes (UUIDs, `agent-<hex>` leaves, `codex-jsonl-*` messages) all resolve. |
 | `recall read <session-ref> [<message-ref>]` | Explicit read for any stored ID shape; a failed read exits nonzero and never falls back to search. |
 | `recall search <terms…>` | Force a search when a term would otherwise look like a session/message ID. |
-| `recall --commit <hash>` | Find Claude Code sessions that produced a commit. |
-| `recall --blame <path>[:line[-line]]` | Trace current code back to its producing Claude Code conversations. |
+| `recall --commit <hash>` | Find local Claude Code or Codex sessions that produced a commit. |
+| `recall --blame <path>[:line[-line]]` | Trace current code back to its producing local conversations. |
 | `recall install` | Install or upgrade the hooks, skills, local assets, and history index. |
 | `recall backfill [--auto-embed] [--vendor <v>] [--detach]` | Index session transcripts currently on disk, optionally for one vendor or as a detached job. |
 | `recall backfill --purge-meta [--dry-run]` | Delete machine boilerplate rows indexed before the ingest filter existed; `--dry-run` opens the database read-only and only reports. |
 | `recall status` | Show database size, message counts, embedding gap/migration progress, and active backfill state. |
 | `recall doctor [--integrity]` | Run read-only install and database checks. |
 | `recall repair --fts \| --vectors \| --full` | Rebuild FTS5, clear vectors for re-embedding, or fully reingest on-disk transcripts. |
+| `recall repair --messages` | Re-read known transcripts to recover missed turns, fork history and ordering without clearing the index (hub only). |
 | `recall repair --rekey-codex` | Run the one-time Codex message-id migration to full session UUIDs (hub only). |
 | `recall repair --rekey-projects [--force]` | Fill `project_key` on existing rows; `--force` also re-keys already-keyed rows (hub only). |
 | `recall "<query>" --project-key K` | Scope by an already-derived repo key (`git:`/`origin:`/`path:`), skipping derivation. |
@@ -260,6 +265,8 @@ Migration works from `recall.db`, not the source transcripts, so indexed history
 | `recall push [--full]` | Push pending transcripts to the hub now; `--full` re-offers every transcript (satellite only). |
 | `recall statusline [--suggest]` | Print the session-id chip or integration guidance. |
 | `recall uninstall [--purge]` | Remove the integration; `--purge` also deletes recall's data. |
+
+Date-only `--since` and `--until` bounds cover UTC calendar days; explicit timestamps retain their stated offset. Both text and semantic searches apply these bounds before selecting candidates.
 
 Run `recall --help` for the full search and read flag set. Add `--json` to `install`, `uninstall`, `status`, or `doctor` for machine-readable output. Installer options include `--offline`, `--no-backfill`, `--auto-backfill`, `--statusline`, and `--no-statusline`.
 

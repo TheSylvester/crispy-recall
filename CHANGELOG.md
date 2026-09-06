@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.0-sat.4 (experimental, unreleased)
+
+- Preserve foreign commands and prompt hooks grouped beside recall during install, migration, and uninstall; retain user wrapper commands.
+- Bound failed embedding retries, sanitize NUL input, and report stalled messages in status/doctor. Unreadable transcripts now fail visibly without advancing watermarks or purging existing history.
+- Report actual inserted rows; preserve copied Claude fork messages; repair sequence ordering and missed turns with non-destructive `recall repair --messages`.
+- Apply search dates before both candidate limits; use consistent UTC date-only bounds in search and lists.
+- Attribute local Codex patches (including moves) and Windows paths; reuse transcript parsing across blame commits.
+- Fail open on malformed hook payloads, retry transient hook database contention, and require consistent migration snapshots before upgrades proceed.
+- Share Codex child classification between live ingest and migration; preserve role/nickname metadata; decode retained chunked readers safely across UTF-8 boundaries.
+- Mark multi-machine support experimental and document tested platforms and recovery steps. This package is not published as a stable release.
+
+
 ## 0.4.0 (unreleased)
 
 _2026-09-04_
