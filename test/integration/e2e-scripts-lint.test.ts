@@ -22,7 +22,7 @@
  * but the rule stays.)
  */
 import { describe, expect, it } from 'vitest';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -36,8 +36,18 @@ const STATE_CHANGING = ['33-hub-hardening.sh', '44-laptop-failures.sh', '50-win-
 const HELPERS = [
   'pass', 'fail', 'step', 'load_tokens', 'nonce', 'hub_sql', 'lap', 'lap_put', 'lap_stdin',
   'win_cmd', 'wait_until', 'hub_health', 'require_hub_up', 'mirror_dir', 'log_file', 'write_token_file',
-  'rows', 'hub_sql_file', 'scan_list', 'in_list',
+  'rows', 'hub_sql_file', 'scan_list', 'in_list', 'require_e2e_env',
 ];
+
+/**
+ * Machine-specific literals from the owner's own boxes. None may survive in a
+ * line of code; a comment may still show one as an example.
+ */
+const PERSONAL =
+  /100\.79\.117|100\.64\.125|\/home\/silver|\/home\/sylvester|Users\/silve|silverera2|sylvester-laptop|v22\.18\.0/;
+
+/** Every environment variable name the kit reads, so README.md can be checked. */
+const ENV_NAME = /RECALL_E2E_[A-Z0-9_]+|RECALL_(?:MAIN_CHECKOUT|INT_WORKTREE|BASE_WORKTREE|NODE|PARITY_[A-Z]+|TOKEN_FILE)/g;
 
 const text = (f: string) => readFileSync(join(DIR, f), 'utf8');
 const lines = (f: string) => text(f).split('\n');
@@ -158,7 +168,11 @@ describe('contrib/satellite/e2e — script lint', () => {
       if (!m) continue;
       const target = m[1].replace(/"/g, '');
       expect(
-        ['$HOME', '$HOME/.recall', '$HOME/.claude', '/mnt/c/Users/silve/.recall', '/', '$1', '$*'],
+        [
+          '$HOME', '$HOME/.recall', '$HOME/.claude',
+          '$WIN_HOME', '$WIN_HOME/.recall', '$WIN_HOME/.claude',
+          '/mnt/c/Users/silve/.recall', '/', '$1', '$*',
+        ],
         `${f} line ${i + 1}`,
       ).not.toContain(target);
       // An unbraced variable at the path root is only allowed when it is quoted.
@@ -201,6 +215,37 @@ describe('contrib/satellite/e2e — script lint', () => {
       { env: { ...process.env, CLAUDECODE: '1', RECALL_E2E_LOG_DIR: tmp, HOME: tmp }, encoding: 'utf8' },
     );
     expect(out).toBe('[unset]');
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  // Nobody but the owner can run a script that hard-codes the owner's machines.
+  // Comments may keep an example; a line of code may not.
+  it.each(SCRIPTS)('%s carries no personal literal in code', (f) => {
+    const hits = code(f).filter((l) => PERSONAL.test(l));
+    expect(hits.join('\n')).toBe('');
+  });
+
+  // A variable a script reads but the README never names is undiscoverable.
+  it('README.md documents every environment variable the scripts read', () => {
+    const readme = readFileSync(join(DIR, 'README.md'), 'utf8');
+    const used = new Set<string>();
+    for (const f of SCRIPTS) for (const m of text(f).matchAll(ENV_NAME)) used.add(m[0]);
+    const undocumented = [...used].sort().filter((n) => !readme.includes(n));
+    expect(undocumented).toEqual([]);
+  });
+
+  // lib.sh must survive an almost-empty environment: it is sourced by scripts
+  // that have not yet been told which machines to drive, and by this suite.
+  // Every machine-specific default is therefore empty and gated lazily by
+  // require_e2e_env, and every derived value uses `${VAR:-}` under `set -u`.
+  it('lib.sh sources cleanly with an empty environment', () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'e2e-lint-'));
+    const res = spawnSync('bash', ['-c', `. "${join(DIR, 'lib.sh')}"`], {
+      env: { HOME: tmp, RECALL_E2E_LOG_DIR: tmp, PATH: process.env.PATH ?? '/usr/bin:/bin' },
+      encoding: 'utf8',
+    });
+    expect(res.stderr).toBe('');
+    expect(res.status).toBe(0);
     rmSync(tmp, { recursive: true, force: true });
   });
 
