@@ -10,7 +10,7 @@ No daemon, no cron, no cloud on a single machine — a Stop hook and a SQLite fi
 
 ## Quick start
 
-Requires Claude Code and either Node.js 22 LTS (`>=22.16`) or Node.js 24+. Install recall in the same environment where you run Claude Code:
+Requires Claude Code and either Node.js 22 LTS (`>=22.16`) or Node.js 24+ on a hub — the ordinary single-machine install (satellites: see [Requirements](#requirements)). Install recall in the same environment where you run Claude Code:
 
 ```bash
 npm install -g crispy-recall
@@ -21,11 +21,11 @@ recall downloads a local embedding runtime and model, sets up a `Stop` hook in C
 
 ### More than one machine (experimental satellite mode)
 
-**Experimental, platform dependent:** satellite mode is available in the `0.4.0-sat.4` prerelease branch and tarball; the stable `0.3.x` npm release does not include it. Previous live checks covered a Linux/WSL hub, a Linux laptop satellite, and a Windows-native satellite. macOS satellite operation has not been verified. Automatic hub service registration requires Linux with systemd; Windows and macOS hubs must run `recall hub serve` under a supervisor you configure. A WSL hub must remain running and reachable from the laptop. Previous live checks also covered laptop Codex; noninteractive SSH shells must select the intended Node/Codex installation explicitly when nvm is absent from PATH.
+**Experimental, platform dependent:** satellite mode is available in the `0.4.0-sat.4` prerelease branch and tarball; the stable `0.3.x` npm release does not include it. The live checks were run against the earlier `0.4.0-sat.3` build and covered a Linux/WSL hub, a Linux laptop satellite, and a Windows-native satellite; the scripted Windows check drove a synthetic Stop-hook payload, and a later manual real Windows turn also passed on that build. The fixes in `sat.4` and later have **not** been re-run live on any of those machines. macOS operation in satellite mode, as either hub or satellite, is unverified. Automatic hub service registration requires Linux with systemd; Windows and macOS hubs must run `recall hub serve` under a supervisor you configure. A WSL hub must remain running and reachable from the laptop. The live checks also covered laptop Codex; noninteractive SSH shells must select the intended Node/Codex installation explicitly when nvm is absent from PATH.
 
-Build the experimental package from `feat/satellite-mode` with `npm ci`, `npm test`, and `npm pack`, then install the generated tarball on each machine with `npm install -g /path/to/crispy-recall-0.4.0-sat.4.tgz`. Run `recall install` on the hub before registering satellites. This remains a prerelease; platform acceptance beyond the configurations listed above is still pending.
+Build the experimental package from `main` at the `0.4.0-sat.x` prerelease commit (the satellite branch is merged; `main` carries the fixes) with `npm ci`, `npm test`, and `npm pack`, then install the generated tarball on each machine with `npm install -g /path/to/crispy-recall-0.4.0-sat.4.tgz`. Run `recall install` on the hub before registering satellites. This remains a prerelease; platform acceptance beyond the configurations listed above is still pending.
 
-A **hub** is the machine that keeps the database and runs the embedding model. A **satellite** is a machine that only pushes its transcripts to the hub and forwards its queries there; it needs no database, no model and no native addon, and it runs on Node.js 20–22 or 24+ (Node 23 is unsupported). The npm package still depends on `better-sqlite3`, even though the satellite runtime does not load or stage it.
+A **hub** is the machine that keeps the database and runs the embedding model. A **satellite** is a machine that only pushes its transcripts to the hub and forwards its queries there; it needs no database, no model and no native addon, and it runs on Node.js 20, 22 or 24+ (Node 21 and 23 are unsupported). The npm package still depends on `better-sqlite3`, even though the satellite runtime never loads or stages it — and on Node 20 there is no prebuilt binding, so npm compiles better-sqlite3 from source. A Node 20 satellite therefore needs python3, make and a C/C++ compiler installed. Node 22 or 24+ avoids that compile entirely.
 
 Install the hub first with the route above, then issue one token per satellite and start the daemon:
 
@@ -36,7 +36,7 @@ recall hub serve --bind <tailnet-address> --detach   # first run without --bind 
 
 A non-loopback `--bind` requires at least one token, so issue the token first; `recall hub serve` runs in the foreground (for systemd) unless you pass `--detach`. `--bind`/`--port` are persisted on the first `hub serve`. `recall hub token` prints a ready-made `recall install --hub <url> --token -` line from that persisted address; before the first `hub serve` has persisted one it falls back to `http://127.0.0.1:7877`, so substitute your `--bind` address by hand, or re-run `recall hub token --host <name>` once the daemon is up (re-running rotates that host's token).
 
-`recall hub install-service` registers a systemd user unit on Linux so the daemon starts at login; when lingering is not already enabled it prints the `loginctl enable-linger <user>` command, which is what makes the daemon survive a logout or a reboot. On each satellite, install recall in that environment too and register it against the hub:
+`recall hub install-service` registers a systemd user unit on Linux so the daemon starts at login; when lingering is not already enabled it prints the `loginctl enable-linger <user>` command, which is what the daemon is intended to survive a logout or a reboot with (reboot behaviour has not been verified on a live hub). On each satellite, install recall in that environment too and register it against the hub:
 
 ```bash
 npm install -g crispy-recall
@@ -186,13 +186,15 @@ Install-time backfill indexes the Claude Code and Codex sessions still present o
 ### Requirements
 
 - Node.js 22 LTS (`>=22.16`) or Node.js 24+ on a hub — the machine that keeps the database and runs the embedding model. This is the default install.
-- Node.js 20–22 or 24+ (excluding Node 23) on a satellite — a machine that only pushes transcripts and forwards queries. It stages no database, model or native addon.
+- Node.js 20, 22 or 24+ on a satellite — a machine that only pushes transcripts and forwards queries. Node 21 and Node 23 are unsupported. It stages no database, model or native addon.
 - Claude Code (required); Codex session indexing and search are also configured when Codex is detected
 - Linux x64/arm64, macOS x64/arm64, or Windows x64
 - macOS 14+ on Apple Silicon or macOS 13.7+ on Intel
 - 500 MB free recommended for installation; upgrading also needs free space for retained rollback snapshots — up to twice the database size when upgrading from 0.2.x, and up to three times that from 0.1.x
 
-Node 23 is unsupported because no prebuilt SQLite binding is available for it.
+Node 21 and Node 23 are unsupported because no prebuilt SQLite binding is published for their ABIs.
+
+On Node 20 npm also has no prebuilt SQLite binding and compiles `better-sqlite3` from source, so python3, make and a C/C++ compiler must be installed — even though a satellite never loads it. Node 22 or 24+ installs from a prebuild and needs no toolchain.
 
 ```bash
 npm install -g crispy-recall
