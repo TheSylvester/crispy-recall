@@ -152,11 +152,18 @@ export function insertMessages(
       for (const id of opts.sourceMessageIds) { ids?.add(id); ids?.add(`session:${sid}:${id}`); }
     }
     const partialSessions = new Map<string, number>();
+    // Highest message_seq this session already holds, tracked in memory and
+    // bumped as we insert. `messages` has no (session_id, message_seq) index,
+    // so the per-row `WHERE message_seq >= ?` probe this replaces made a
+    // first-time or forced ingest of an N-row session O(N^2).
+    const maxStoredSeq = new Map<string, number>();
     for (const [sid, ids] of sourceIds) {
       const stored = d.all('SELECT message_id, message_seq FROM messages WHERE session_id = ?', [sid]) as Array<{ message_id: string; message_seq: number }>;
+      const max = stored.reduce((acc, r) => Math.max(acc, r.message_seq), -1);
+      maxStoredSeq.set(sid, max);
       // A rotated/truncated source cannot establish a replacement global order.
       // Keep the indexed prefix and append new rows rather than colliding with it.
-      if (stored.some(r => !ids.has(r.message_id))) partialSessions.set(sid, stored.reduce((max, r) => Math.max(max, r.message_seq), -1));
+      if (stored.some(r => !ids.has(r.message_id))) partialSessions.set(sid, max);
     }
     for (const m of messages) {
       // Preserve legacy UUID anchors for the owning session. Forked transcripts
@@ -171,7 +178,9 @@ export function insertMessages(
         sequence = existing?.message_seq ?? partialSessions.get(m.session_id)! + 1;
         partialSessions.set(m.session_id, Math.max(partialSessions.get(m.session_id)!, sequence));
       }
-      const insertsPredecessor = !existing && d.get('SELECT 1 FROM messages WHERE session_id = ? AND message_seq >= ? LIMIT 1', [m.session_id, sequence]);
+      // Equivalent to the old `EXISTS(seq >= sequence)` probe: a stored row at
+      // or after this sequence exists iff the session's max reaches it.
+      const insertsPredecessor = !existing && sequence <= (maxStoredSeq.get(m.session_id) ?? -1);
       if ((existing && existing.message_seq !== sequence) || insertsPredecessor) {
         // Renumber old filtered-basis rows on every reingest. Their adjacency
         // vectors are stale; invalidate the entire session atomically.
@@ -181,6 +190,7 @@ export function insertMessages(
         }
         d.run('UPDATE messages SET message_seq = ? WHERE message_id = ? AND session_id = ?', [sequence, id, m.session_id]);
       }
+      maxStoredSeq.set(m.session_id, Math.max(maxStoredSeq.get(m.session_id) ?? -1, sequence));
       inserted += (stmt.run([
         id,
         m.session_id,
