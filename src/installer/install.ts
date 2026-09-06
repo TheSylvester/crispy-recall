@@ -39,7 +39,7 @@ import { buildManifest, buildSatelliteManifest, renderManifest } from './manifes
 import { runGpuPhase, type GpuPhaseResult, type GpuProbeArgs, type OffloadProbeResult } from './gpu.js';
 import {
   mergeStopHook, removeStopHook, backupFile, mergeStatusLine, removeStatusLine,
-  ensureCleanupPeriodDays,
+  ensureCleanupPeriodDays, writeFileAtomic,
 } from './settings-merge.js';
 import { detectStatusline, renderStatuslineSuggestion } from './statusline-suggest.js';
 import {
@@ -540,7 +540,11 @@ export async function runInstall(opts: InstallOptions = {}): Promise<InstallResu
   const restoreQuiescedHooks = () => {
     for (const [p, contents] of hookFileBackups) {
       try {
-        if (contents !== null) writeFileSync(p, contents);
+        // Atomic, like every other settings write (settings-merge.writeFileAtomic):
+        // this restores ~/.claude/settings.json on an ABORT path, so a crash or
+        // ENOSPC mid-write must not leave the file that gates Claude Code's
+        // startup half-written.
+        if (contents !== null) writeFileAtomic(p, contents);
       } catch (e) {
         log({ source: 'installer/install', level: 'warn', summary: `could not restore hook file ${p}: ${(e as Error).message}` });
       }

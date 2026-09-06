@@ -15,7 +15,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
-  mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync,
+  mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, readdirSync,
 } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -338,6 +338,10 @@ describe('migration safety regressions', () => {
     expect(check.pragma('journal_mode', { simple: true })).toBe('delete');
     expect(check.prepare('SELECT COUNT(*) AS n FROM messages').get()).toEqual({ n: 2 });
     check.close();
+    // Restored byte-for-byte, and atomically: no `.tmp` residue is left beside
+    // the settings file (restoreQuiescedHooks uses writeFileAtomic like every
+    // other settings write).
     expect(readFileSync(join(claudeDir, 'settings.json'), 'utf8')).toBe(before);
+    expect(readdirSync(claudeDir).filter((f) => f.includes('.tmp.'))).toEqual([]);
   });
 });
