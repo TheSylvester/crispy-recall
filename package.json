@@ -1,7 +1,7 @@
 {
   "name": "crispy-recall",
-  "version": "0.4.0-sat.4",
-  "description": "Local session transcript memory for Claude Code and Codex \u2014 search past sessions with FTS5 + semantic vectors.",
+  "version": "0.4.0-sat.5",
+  "description": "Local session transcript memory for Claude Code and Codex — search past sessions with FTS5 + semantic vectors.",
   "license": "MIT",
   "author": "Sylvester Wong",
   "homepage": "https://github.com/TheSylvester/crispy-recall#readme",
