@@ -38,11 +38,11 @@ step "token.txt written (not shown)"
 
 OUT=$(win_cmd 50-install <<CMD
 @echo off
-call "$WIN_NPM_W" install -g $WIN_DIR_W\crispy-recall.tgz
+call "$WIN_NPM_W" install -g "$WIN_DIR_W\crispy-recall.tgz"
 if errorlevel 1 exit /b 1
 where recall
-set /p RECALL_HUB_TOKEN=<$WIN_DIR_W\token.txt
-call $WIN_RECALL_W install --hub $HUB_URL --yes
+set /p RECALL_HUB_TOKEN=<"$WIN_DIR_W\token.txt"
+call "$WIN_RECALL_W" install --hub $HUB_URL --yes
 exit /b %ERRORLEVEL%
 CMD
 ); RC=$?

@@ -14,6 +14,16 @@ require_e2e_env RECALL_E2E_HUB_ADDR RECALL_E2E_LAPTOP RECALL_E2E_LAPTOP_HOME
 load_tokens laptop
 require_hub_up
 [ -n "$TGZ" ] && [ -f "$TGZ" ] || fail "$NAME" "set RECALL_E2E_TGZ to the packed tarball"
+# Reject legacy overrides before making any remote changes: every acceptance
+# step must exercise the package installed below, even when Node comes from nvm.
+[ "${RECALL_E2E_LAPTOP_RECALL_BIN:-$LAPTOP_CANDIDATE_BIN}" = "$LAPTOP_CANDIDATE_BIN" ] \
+  || fail "$NAME" "RECALL_E2E_LAPTOP_RECALL_BIN must be $LAPTOP_CANDIDATE_BIN (the candidate install)"
+EXPECTED_VERSION=$(python3 - "$TGZ" <<'PYVERSION'
+import json, sys, tarfile
+with tarfile.open(sys.argv[1]) as archive:
+    print(json.load(archive.extractfile('package/package.json'))['version'])
+PYVERSION
+) || fail "$NAME" "could not read candidate version from tarball"
 mask() { sed "s/$RECALL_E2E_TOKEN/<token>/g"; }
 step "REMOTE STATE THIS SCRIPT CHANGES: laptop ~/.claude/settings.json (backup ~/.claude/settings.json.pre-e2e, restored by 90-teardown.sh), a global npm install under ~/.local, and a satellite ~/.recall"
 
@@ -31,17 +41,22 @@ print('cleanupPeriodDays set to 30')
 PY" || fail "$NAME" "could not set cleanupPeriodDays to 30"
 
 lap_put "$TGZ" /tmp/crispy-recall.tgz
-INST=$(lap 'npm install -g --prefix "$HOME/.local" /tmp/crispy-recall.tgz 2>&1') \
+INST=$(lap "export PATH=\"$LAPTOP_PATH_PREFIX:\$PATH\"; npm install -g --prefix \"\$HOME/.local\" /tmp/crispy-recall.tgz 2>&1") \
   || { printf '%s\n' "$INST" | sed 's/^/    /'; fail "$NAME" "npm install -g failed on the laptop"; }
 printf '%s\n' "$INST" | tail -20 | sed 's/^/    /'
 printf '%s\n' "$INST" | grep -q 'EBADENGINE' && fail "$NAME" "npm reported EBADENGINE on Node 20"
 WHICH=$(lap "export PATH=\"$LAPTOP_PATH_PREFIX:\$PATH\"; command -v recall")
 step "laptop command -v recall → $WHICH"
-EXPECT_RECALL=${RECALL_E2E_LAPTOP_RECALL_BIN:-$LAPTOP_HOME/.local/bin/recall}
+EXPECT_RECALL=$LAPTOP_CANDIDATE_BIN
 [ "$WHICH" = "$EXPECT_RECALL" ] || fail "$NAME" "recall resolved to ${WHICH:-<nothing>}, expected $EXPECT_RECALL"
 
+ACTUAL_VERSION=$(lap "export PATH=\"$LAPTOP_PATH_PREFIX:\$PATH\"; \"$LAPTOP_CANDIDATE_BIN\" --version") \
+  || fail "$NAME" "could not run the installed candidate"
+[ "$ACTUAL_VERSION" = "$EXPECTED_VERSION" ] \
+  || fail "$NAME" "installed candidate version $ACTUAL_VERSION does not match tarball $EXPECTED_VERSION"
+
 step "installing in satellite mode against $HUB_URL"
-SAT=$(lap_stdin "read -r T; export PATH=\"$LAPTOP_PATH_PREFIX:\$PATH\"; RECALL_HUB_TOKEN=\"\$T\" recall install --hub $HUB_URL --yes 2>&1" <<<"$RECALL_E2E_TOKEN") \
+SAT=$(lap_stdin "read -r T; export PATH=\"$LAPTOP_PATH_PREFIX:\$PATH\"; RECALL_HUB_TOKEN=\"\$T\" \"$LAPTOP_CANDIDATE_BIN\" install --hub $HUB_URL --yes 2>&1" <<<"$RECALL_E2E_TOKEN") \
   || { printf '%s\n' "$SAT" | mask | sed 's/^/    /'; fail "$NAME" "recall install --hub failed on the laptop"; }
 printf '%s\n' "$SAT" | mask | tail -25 | sed 's/^/    /'
 
@@ -71,7 +86,7 @@ BAK=$(lap "ls -1 ~/.claude/settings.json.bak.* 2>/dev/null | wc -l")
 step "settings.json.bak.* files: $BAK"
 [ "$BAK" -ge 1 ] || fail "$NAME" "the retention change left no .bak backup"
 
-DOC=$(lap "export PATH=\"$LAPTOP_PATH_PREFIX:\$PATH\"; recall doctor 2>&1"); DRC=$?
+DOC=$(lap "export PATH=\"$LAPTOP_PATH_PREFIX:\$PATH\"; \"$LAPTOP_CANDIDATE_BIN\" doctor 2>&1"); DRC=$?
 printf '%s\n' "$DOC" | sed 's/^/    /'
 [ "$DRC" = 0 ] || fail "$NAME" "recall doctor exited $DRC on the satellite"
 for line in 'hub reachable' 'auth ok' 'hub version' 'last push' 'pending bytes' 'git' 'cleanupPeriodDays'; do

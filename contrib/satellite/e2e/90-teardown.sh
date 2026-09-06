@@ -41,7 +41,7 @@ printf '%s\n' "$LAPOUT" | sed 's/^/    /'
 step "windows: uninstalling"
 win_cmd 90-teardown <<CMD
 @echo off
-call $WIN_RECALL_W uninstall --purge --yes
+call "$WIN_RECALL_W" uninstall --purge --yes
 call "$WIN_NPM_W" uninstall -g crispy-recall
 exit /b %ERRORLEVEL%
 CMD

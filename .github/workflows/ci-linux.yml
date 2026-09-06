@@ -13,8 +13,8 @@
 #   2. typecheck, build, and the FULL vitest suite — no continue-on-error
 #      anywhere in this file. A red here is a red build.
 #   3. The packaging contract: `npm pack` produces exactly the intended file set
-#      with no native/wasm sidecar, and `postpack` restores the working-tree
-#      binding afterwards (otherwise a local dev's dist/ is silently broken by
+#      with no native/wasm sidecar, and packing leaves the working-tree
+#      binding in place (otherwise a local dev's dist/ is silently broken by
 #      any pack).
 #   4. The prebuild guard: every Node major `engines` admits is either a hub
 #      major with darwin+linux+win32 prebuilds or a documented satellite-only
@@ -97,16 +97,16 @@ jobs:
       - name: Test (full suite — this is a gate)
         run: npx vitest run
 
-      - name: Pack — assert the tarball contract and the postpack restore
+      - name: Pack — assert the tarball contract and that packing is non-destructive
         run: |
           set -euo pipefail
           npm pack --pack-destination "$RUNNER_TEMP"
           node scripts/ci/assert-tarball.mjs "$RUNNER_TEMP"/crispy-recall-*.tgz
-          # prepack strips dist/better_sqlite3.node; postpack must put it back, or
-          # every `npm pack` silently leaves the working tree unable to open a DB.
+          # The package.json `files` allowlist leaves dist/better_sqlite3.node out
+          # of the tarball; nothing may delete it from the working tree.
           test -f dist/better_sqlite3.node \
-            || { echo "::error::dist/better_sqlite3.node missing after npm pack — the postpack build did not restore the working-tree binding"; exit 1; }
-          echo "tarball contract OK; working-tree binding restored by postpack."
+            || { echo "::error::dist/better_sqlite3.node missing after npm pack — packing must not touch the working-tree binding"; exit 1; }
+          echo "tarball contract OK; working-tree binding untouched by npm pack."
 
       - name: Prebuild guard — engines vs better-sqlite3 release assets
         run: |

@@ -25,7 +25,12 @@
     "recall-stop-hook": "./dist/stop-hook.js"
   },
   "files": [
-    "dist/",
+    "dist/recall.js",
+    "dist/stop-hook.js",
+    "dist/embed-pending.js",
+    "dist/statusline.js",
+    "dist/push-pending.js",
+    "dist/SKILL.md.template",
     "README.md",
     "LICENSE",
     "THIRD-PARTY-LICENSES"
@@ -38,9 +43,8 @@
     "typecheck": "tsc --noEmit",
     "pretest": "npm run build",
     "test": "vitest run",
-    "prepack": "npm run build && rm -f dist/better_sqlite3.node",
-    "postpack": "node scripts/build.mjs",
-    "prepublishOnly": "npm run build && rm -f dist/better_sqlite3.node"
+    "prepack": "npm run build",
+    "prepublishOnly": "npm run build"
   },
   "dependencies": {
     "better-sqlite3": "^12.11.1"

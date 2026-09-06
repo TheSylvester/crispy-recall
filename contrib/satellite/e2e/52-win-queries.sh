@@ -36,7 +36,7 @@ SYNTHETIC_USED=0
 OUT=$(win_cmd 52a <<CMD
 @echo off
 cd /d C:\winDev\starcon-research
-call $WIN_RECALL_W "SAT-WIN-$WIN_NONCE"
+call "$WIN_RECALL_W" "SAT-WIN-$WIN_NONCE"
 exit /b %ERRORLEVEL%
 CMD
 ) || fail "$NAME" "the query from C:\\winDev\\starcon-research exited nonzero"
@@ -52,7 +52,7 @@ printf '%s\n' "$OUT" | grep -q "$WIN_SID_PATH" \
 OUT2=$(win_cmd 52b <<CMD
 @echo off
 cd /d c:\WINDEV\starcon-research
-call $WIN_RECALL_W "SAT-WIN-$WIN_NONCE"
+call "$WIN_RECALL_W" "SAT-WIN-$WIN_NONCE"
 exit /b %ERRORLEVEL%
 CMD
 ) || fail "$NAME" "the query from the differently-cased path exited nonzero"
@@ -120,7 +120,7 @@ N=$(nonce)
 FOUT=$(win_cmd 52d <<CMD
 @echo off
 cd /d C:\winDev\starcon-research
-call $WIN_CLAUDE_W -p "Reply with exactly this test phrase and nothing else: SAT-WIN-FLASH-$N" --model haiku
+call "$WIN_CLAUDE_W" -p "Reply with exactly this test phrase and nothing else: SAT-WIN-FLASH-$N" --model haiku
 exit /b %ERRORLEVEL%
 CMD
 ); FRC=$?

@@ -3,14 +3,14 @@
  * Assert the published npm tarball contains EXACTLY the intended file set.
  *
  * WHY: two independent ways the tarball can go wrong, both silent.
- *   1. `prepack` strips `dist/better_sqlite3.node` so the published package does
- *      not carry a host-ABI native binding. If that strip ever regresses, users
- *      get a binding compiled for the publisher's Node, which then fails to load
- *      on theirs. So: NO entry may end in `.node` (or `.wasm`, a leftover from
- *      the node-sqlite3-wasm era).
- *   2. `files` in package.json is a coarse `dist/` glob. A new build artifact —
- *      a source map, a stray fixture, a debug bundle — lands in the tarball
- *      without anyone noticing. So the set is asserted EXACTLY, not as a subset.
+ *   1. `dist/better_sqlite3.node` is the builder's host-ABI binding, staged for
+ *      local dev by scripts/build.mjs. package.json `files` is an explicit
+ *      allowlist that leaves it out; if that allowlist ever widens back to
+ *      `dist/`, users get a binding compiled for the publisher's Node, which
+ *      then fails to load on theirs. So: NO entry may end in `.node` (or
+ *      `.wasm`, a leftover from the node-sqlite3-wasm era).
+ *   2. A new build artifact — a source map, a stray fixture, a debug bundle —
+ *      must not ship unnoticed. So the set is asserted EXACTLY, not as a subset.
  *
  * Usage: node scripts/ci/assert-tarball.mjs <path/to/crispy-recall-x.y.z.tgz>
  */
@@ -62,7 +62,7 @@ export function checkTarballEntries(entries) {
     for (const u of unexpected) lines.push(`  + ${u}`);
   }
   if (forbidden.length) {
-    lines.push(`FORBIDDEN (${FORBIDDEN_EXTENSIONS.join('/')} must never ship — prepack must strip them):`);
+    lines.push(`FORBIDDEN (${FORBIDDEN_EXTENSIONS.join('/')} must never ship — the package.json files allowlist must leave them out):`);
     for (const f of forbidden) lines.push(`  ! ${f}`);
   }
 

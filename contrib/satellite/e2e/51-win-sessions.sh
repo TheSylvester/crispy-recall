@@ -97,7 +97,7 @@ win_claude_turn() {
   out=$(win_cmd "$tag" <<CMD
 @echo off
 cd /d $wcwd
-call $WIN_CLAUDE_W -p "$prompt" --model haiku
+call "$WIN_CLAUDE_W" -p "$prompt" --model haiku
 exit /b %ERRORLEVEL%
 CMD
 ); rc=$?
@@ -143,7 +143,7 @@ step "(b) a hub-only phrase answered from C:\\winDev\\crispy without --all"
 OUTC=$(win_cmd 51c <<CMD
 @echo off
 cd /d C:\winDev\crispy
-call $WIN_RECALL_W "$PHRASE"
+call "$WIN_RECALL_W" "$PHRASE"
 exit /b %ERRORLEVEL%
 CMD
 ) || fail "$NAME" "the Windows forwarded query exited nonzero"

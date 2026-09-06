@@ -13,7 +13,7 @@
 - Narrow `engines.node` to `>=20.0.0 <21 || >=22.0.0 <23 || >=24.0.0`. Node 21 and Node 23 are excluded: `better-sqlite3` publishes no prebuild for ABI 120 or 131, so npm would fall into a source compile there. `recall install` refuses both roles on those majors.
 - Document the Node 20 satellite toolchain requirement. Node 20 (ABI 115) also has no prebuilt binding, so npm compiles `better-sqlite3` from source even though a satellite never loads it: python3, make and a C/C++ compiler must be present. Node 22 or 24+ installs from a prebuild.
 - Add a Linux CI workflow that runs the full test suite on Node 22 and 24, asserts `npm ci` uses a prebuild rather than a node-gyp compile, and exercises the Node 20 satellite floor. The macOS vitest job became a required gate on push instead of a dispatch-only, never-blocking one. The prebuild guard is now exhaustive over every Node major `engines` admits, and reports hub coverage and satellite-only source builds separately.
-- Restore `dist/better_sqlite3.node` after `npm pack` via a `postpack` build, so packing no longer leaves a working tree that cannot open a database, and assert the published tarball's exact file set (no `.node` or `.wasm` sidecar).
+- Package through an explicit `files` allowlist (the five bundles and the skill template) instead of `dist/` plus a prepack `rm` of `dist/better_sqlite3.node`. Packing and publishing no longer delete the working-tree binding at any point, and `scripts/ci/assert-tarball.mjs` asserts the published tarball's exact file set (no `.node` or `.wasm` sidecar).
 
 
 ## 0.4.0 (unreleased)

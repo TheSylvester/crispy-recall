@@ -83,11 +83,12 @@ chmodSync(join(root, 'dist/push-pending.js'), 0o755);
 // unchanged. One copy serves all three bundles (they share dist/).
 //
 // NOTE (publish): this stages the *builder's* platform addon, which is correct
-// for local build/test only. `package.json` `files` includes `dist/`, so a
-// naive `npm publish` would ship this platform's `.node` to every user — the
+// for local build/test only. `package.json` `files` is an explicit allowlist of
+// the five bundles + SKILL.md.template, so `npm pack`/`npm publish` never pick
+// this `.node` up and nothing has to delete it from the working tree — the
 // user-side restage in install.ts (resolved from the installer's own
-// node_modules) is what keeps each machine ABI-correct. The publish phase must
-// exclude dist/better_sqlite3.node from the tarball.
+// node_modules) is what keeps each machine ABI-correct. scripts/ci/
+// assert-tarball.mjs asserts the packed file set.
 const nativeBinding = findNativeBinding(join(root, 'node_modules', 'better-sqlite3'));
 if (nativeBinding) {
   copyFileSync(nativeBinding, join(root, 'dist/better_sqlite3.node'));

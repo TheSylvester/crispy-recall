@@ -55,8 +55,8 @@ stays silent.
 | --- | --- | --- | --- |
 | `RECALL_E2E_LOG_DIR` | `$HOME/.recall/logs/e2e` | all | Where each script tees its log. |
 | `RECALL_E2E_HUB_PORT` | `7877` | 30–34, 40–46, 50–52, 62 | Hub API port. |
-| `RECALL_E2E_LAPTOP_PATH_PREFIX` | `$HOME/.local/bin` (expanded on the SATELLITE) | 40–45, 90 | Prepended to `PATH` in every remote command. See the nvm trap below. |
-| `RECALL_E2E_LAPTOP_RECALL_BIN` | `<RECALL_E2E_LAPTOP_HOME>/.local/bin/recall` | 40 | Where `command -v recall` must resolve on the satellite. |
+| `RECALL_E2E_LAPTOP_PATH_PREFIX` | `$HOME/.local/bin` (expanded on the SATELLITE) | 40–45, 90 | Added after the candidate `~/.local/bin` in remote `PATH` to select Node/npm. See the nvm trap below. |
+| `RECALL_E2E_LAPTOP_RECALL_BIN` | `<RECALL_E2E_LAPTOP_HOME>/.local/bin/recall` | 40 | Legacy assertion override; must equal the candidate path in `~/.local/bin` (other paths are rejected). |
 | `RECALL_E2E_WIN_NPM_W` | `C:\Program Files\nodejs\npm.cmd` | 50, 90 | Windows `npm` shim, in Windows path form. |
 | `RECALL_E2E_HUB_RECALL_BIN` | `$(dirname "$RECALL_E2E_NODE")/recall` | 50 | Where `which -a recall` must resolve in the WSL shell after the Windows install. |
 | `RECALL_E2E_BACKUP_SCRIPT` | `$HOME/.local/bin/wsl-backup` | 61 | The backup script §9.5.3 edits so the mirror travels with it. |
@@ -108,9 +108,11 @@ non-login shell. Ubuntu's stock `~/.bashrc` returns early for exactly that case,
 so nvm is never sourced and the remote `PATH` is the bare system one — a `recall`
 installed under `~/.nvm/versions/node/*/bin` is then invisible, and `command -v
 recall` comes back empty even though an interactive login finds it. Set
-`RECALL_E2E_LAPTOP_PATH_PREFIX` to that node `bin` directory (and
-`RECALL_E2E_LAPTOP_RECALL_BIN` to the binary inside it) when recall lives under
-nvm on the satellite. The value is sent to the remote shell verbatim, so a
+`RECALL_E2E_LAPTOP_PATH_PREFIX` to that Node `bin` directory when Node/npm come from
+nvm on the satellite. Script 40 always installs the tarball under `~/.local`,
+checks its version against the tarball metadata, and invokes that installed
+binary explicitly. All later laptop scripts prefer `~/.local/bin` over nvm;
+do not point `RECALL_E2E_LAPTOP_RECALL_BIN` at an older nvm copy. The value is sent to the remote shell verbatim, so a
 literal `$HOME` in it is expanded THERE, not on the seat.
 
 ## Windows without an interactive login

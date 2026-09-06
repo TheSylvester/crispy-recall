@@ -92,20 +92,19 @@ jobs:
       - name: Install deps
         run: npm ci
 
-      - name: Build → strip sibling .node → pack (mirror the published tarball)
+      - name: Build → pack (the files allowlist mirrors the published tarball)
         run: |
           set -euo pipefail
           npm run build
-          # build.mjs stages dist/better_sqlite3.node for local dev; the PUBLISHED
-          # tarball is stripped of it. On npm >=7 `npm pack` DOES run `prepack`,
-          # which already strips it (and `postpack` rebuilds it afterwards), so
-          # this rm is belt-and-braces for an older npm. Either way the packed
-          # tarball must carry no sibling .node, or it would short-circuit
-          # candidate #1 of resolveNativeBinding (src/db.ts) and we'd never
-          # exercise the npm-global resolution path (candidate #2) real users hit.
-          # ci-linux.yml asserts the resulting file set with assert-tarball.mjs.
-          rm -f dist/better_sqlite3.node
+          # build.mjs stages dist/better_sqlite3.node for local dev; the
+          # package.json `files` allowlist leaves it out of the tarball, so the
+          # packed tarball carries no sibling .node (it would otherwise
+          # short-circuit candidate #1 of resolveNativeBinding in src/db.ts and
+          # we'd never exercise the npm-global resolution path real users hit).
+          # Nothing deletes the working-tree binding. assert-tarball.mjs proves
+          # the file set right here.
           npm pack
+          node scripts/ci/assert-tarball.mjs ./crispy-recall-*.tgz
           ls -1 crispy-recall-*.tgz
 
       - name: Global install + classify better-sqlite3 install path
@@ -285,9 +284,9 @@ jobs:
   # scripts/mac-acceptance/bootstrap.sh the operator will run, in --ci mode
   # (headless, deterministic), against THIS run's own freshly-packed tarball —
   # not the uploaded artifact (that's for the operator's `gh run download`). The
-  # `rm -f dist/better_sqlite3.node` before pack is LOAD-BEARING: it mirrors the
-  # published stripped tarball so the rehearsal exercises the npm-global binding
-  # resolution real users hit (see smoke-local's pack step for the full rationale).
+  # package.json `files` allowlist keeps dist/better_sqlite3.node out of the
+  # tarball, so the rehearsal exercises the npm-global binding resolution real
+  # users hit (see smoke-local's pack step for the full rationale).
   #
   # SCOPE: the rehearsal covers the script through its embedded self-check
   # (preflight → brew/node no-ops → recall install → seed → backfill → doctor →
@@ -324,16 +323,15 @@ jobs:
       - name: Install deps
         run: npm ci
 
-      - name: Build → strip sibling .node → pack (mirror the published tarball)
+      - name: Build → pack (the files allowlist mirrors the published tarball)
         run: |
           set -euo pipefail
           npm run build
-          # See smoke-local: on npm >=7 `prepack` already strips
-          # dist/better_sqlite3.node (and `postpack` rebuilds it), so this rm is
-          # belt-and-braces — it keeps candidate #2 of resolveNativeBinding the
-          # path under test on any npm.
-          rm -f dist/better_sqlite3.node
+          # See smoke-local: the package.json `files` allowlist leaves
+          # dist/better_sqlite3.node out, which keeps candidate #2 of
+          # resolveNativeBinding the path under test.
           npm pack
+          node scripts/ci/assert-tarball.mjs ./crispy-recall-*.tgz
           ls -1 crispy-recall-*.tgz
 
       - name: Rehearse bootstrap.sh --ci against this run's tarball
@@ -386,8 +384,7 @@ jobs:
           set -euo pipefail
           npm ci
           npm run build
-          rm -f dist/better_sqlite3.node
-          npm pack
+          npm pack   # the files allowlist keeps dist/better_sqlite3.node out
           npm install -g ./crispy-recall-*.tgz
           RECALL_BIN=$(command -v recall)
           echo "RECALL_BIN=$RECALL_BIN" >> "$GITHUB_ENV"

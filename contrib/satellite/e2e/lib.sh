@@ -34,8 +34,10 @@ LAPTOP_HOME=${RECALL_E2E_LAPTOP_HOME:-}
 LAPTOP_REPO=${RECALL_E2E_LAPTOP_REPO:-}
 # Sent to the REMOTE shell verbatim, so `$HOME` must survive this expansion:
 # it is the laptop's home, not the seat's. Point it at the laptop's node bin
-# directory when recall lives under nvm (a non-interactive ssh never loads nvm).
-LAPTOP_PATH_PREFIX=${RECALL_E2E_LAPTOP_PATH_PREFIX:-\$HOME/.local/bin}
+# directory to select Node/npm (a non-interactive ssh never loads nvm).
+# Always prefer the candidate installed by script 40 over an older nvm recall.
+LAPTOP_PATH_PREFIX=\$HOME/.local/bin${RECALL_E2E_LAPTOP_PATH_PREFIX:+:$RECALL_E2E_LAPTOP_PATH_PREFIX}
+LAPTOP_CANDIDATE_BIN=${LAPTOP_HOME:-}/.local/bin/recall
 WIN_HOST=${RECALL_E2E_WIN_HOST:-}
 WIN_USER=${RECALL_E2E_WIN_USER:-}
 WIN_HOME=/mnt/c/Users/${WIN_USER:-}
@@ -269,14 +271,17 @@ lap_put() { # $1 local file, $2 remote absolute path — no SFTP on this tailnet
   [ "$local_sum" = "$remote_sum" ] || fail "${NAME:-lib}" "sha256 mismatch after copying $1 to $2"
 }
 
-# --- windows (WSL interop; NO double quotes on the interop command line) -----
+# --- windows (WSL interop; run a relative batch name from its directory) -----
 
 # win_cmd <name>  — the .cmd body is read from this function's stdin.
 win_cmd() {
   local name=$1 rc
   mkdir -p "$WIN_DIR"
   sed 's/$/\r/' > "$WIN_DIR/$name.cmd"
-  ( cd /mnt/c && timeout "$WIN_TIMEOUT" cmd.exe /c $WIN_DIR_W\\$name.cmd ) 2>&1 | tr -d '\r'
+  # WSL maps this DrvFs working directory to Windows. A relative batch name
+  # avoids cmd.exe /c quote stripping for profiles with spaces.
+  [[ "$name" =~ ^[A-Za-z0-9_-]+$ ]] || return 2
+  ( cd "$WIN_DIR" && timeout "$WIN_TIMEOUT" cmd.exe /c "$name.cmd" ) 2>&1 | tr -d '\r'
   rc=${PIPESTATUS[0]}
   return "$rc"
 }

@@ -2,11 +2,12 @@
  * scripts/ci/assert-tarball.mjs — the published-tarball file-set contract.
  *
  * Two silent failure modes this pins:
- *   1. `prepack` strips dist/better_sqlite3.node. If that ever regresses, the
- *      tarball ships a binding compiled for the publisher's Node ABI, which then
- *      refuses to load on the user's — so no entry may end in .node or .wasm.
- *   2. `files: ["dist/", ...]` is a glob: any new build artifact ships silently.
- *      So the entry set is asserted EXACTLY, not as a subset.
+ *   1. dist/better_sqlite3.node is left out by the package.json `files`
+ *      allowlist. If that allowlist ever widens back to `dist/`, the tarball
+ *      ships a binding compiled for the publisher's Node ABI, which then refuses
+ *      to load on the user's — so no entry may end in .node or .wasm.
+ *   2. Any new build artifact must not ship silently, so the entry set is
+ *      asserted EXACTLY, not as a subset.
  *
  * Synthetic entry lists only — no `npm pack` is run here (CI does that, then
  * calls the same checker on the real tarball). The checker is a plain .mjs so CI
@@ -47,7 +48,7 @@ describe('assert-tarball contract', () => {
     expect(r.ok).toBe(true);
   });
 
-  it('REJECTS a native binding that prepack failed to strip', () => {
+  it('REJECTS a native binding the files allowlist let through', () => {
     const r = checkTarballEntries([...EXPECTED_ENTRIES, 'package/dist/better_sqlite3.node']);
     expect(r.ok).toBe(false);
     expect(r.forbidden).toEqual(['package/dist/better_sqlite3.node']);
