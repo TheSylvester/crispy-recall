@@ -19,9 +19,13 @@ recall install
 
 recall downloads a local embedding runtime and model, sets up a `Stop` hook in Claude Code, installs the recall Agent Skill, and starts indexing the session history still on disk. If Codex is detected, recall sets up the same integration there.
 
-### More than one machine (satellite mode)
+### More than one machine (experimental satellite mode)
 
-A **hub** is the machine that keeps the database and runs the embedding model. A **satellite** is a machine that only pushes its transcripts to the hub and forwards its queries there; it needs no database, no model and no native addon, and it runs on Node.js 20+.
+**Experimental, platform dependent:** satellite mode is available in the `0.4.0-sat.3` prerelease branch and tarball; the stable `0.3.x` npm release does not include it. Previous live checks covered a Linux/WSL hub, a Linux laptop satellite, and a Windows-native satellite. macOS satellite operation has not been verified. Automatic hub service registration requires Linux with systemd; Windows and macOS hubs must run `recall hub serve` under a supervisor you configure. A WSL hub must remain running and reachable from the laptop. Previous live checks also covered laptop Codex; noninteractive SSH shells must select the intended Node/Codex installation explicitly when nvm is absent from PATH.
+
+Build the experimental package from `feat/satellite-mode` with `npm ci`, `npm test`, and `npm pack`, then install the generated tarball on each machine with `npm install -g /path/to/crispy-recall-0.4.0-sat.3.tgz`. Run `recall install` on the hub before registering satellites. The upgrade fixes tracked for 0.4.0 must land before a stable release.
+
+A **hub** is the machine that keeps the database and runs the embedding model. A **satellite** is a machine that only pushes its transcripts to the hub and forwards its queries there; it needs no database, no model and no native addon, and it runs on Node.js 20–22 or 24+ (Node 23 is unsupported). The npm package still depends on `better-sqlite3`, even though the satellite runtime does not load or stage it.
 
 Install the hub first with the route above, then issue one token per satellite and start the daemon:
 
@@ -182,7 +186,7 @@ Install-time backfill indexes the Claude Code and Codex sessions still present o
 ### Requirements
 
 - Node.js 22 LTS (`>=22.16`) or Node.js 24+ on a hub — the machine that keeps the database and runs the embedding model. This is the default install.
-- Node.js 20+ on a satellite — a machine that only pushes transcripts and forwards queries. It stages no database, model or native addon.
+- Node.js 20–22 or 24+ (excluding Node 23) on a satellite — a machine that only pushes transcripts and forwards queries. It stages no database, model or native addon.
 - Claude Code (required); Codex session indexing and search are also configured when Codex is detected
 - Linux x64/arm64, macOS x64/arm64, or Windows x64
 - macOS 14+ on Apple Silicon or macOS 13.7+ on Intel
