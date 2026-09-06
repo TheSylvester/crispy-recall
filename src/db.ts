@@ -253,6 +253,20 @@ function ensureStemScratch(db: RecallDb): void {
 /** The durable marker row that says the retrieval-class schema is in place. */
 export const RETRIEVAL_MIGRATION_KEY = 'retrieval_class_migration';
 
+/**
+ * SQLITE_BUSY on a marker read is TRANSIENT, not "migration pending".
+ * Misclassifying it raised MigrationPendingError, which the stop hook's
+ * retryBusyIngest (it matches /database is locked|SQLITE_BUSY/) never retries,
+ * so a contended Stop hook dropped the turn outright. Rethrow busy; every
+ * other error (missing table, corrupt page) still fails closed as pending.
+ */
+function rethrowIfBusy(err: unknown): void {
+  const code = (err as { code?: unknown } | null)?.code;
+  const message = (err as { message?: unknown } | null)?.message;
+  if ((typeof code === 'string' && code.startsWith('SQLITE_BUSY'))
+    || (typeof message === 'string' && /database is locked|SQLITE_BUSY/i.test(message))) throw err;
+}
+
 /** The durable marker row that says every existing row carries a project_key.
  *  Written for free on a FRESH database; on a pre-existing one it is written
  *  only by the attended `recall repair --rekey-projects` (spec §4.3). */
@@ -279,7 +293,8 @@ export function isRetrievalMigrationPending(d: RecallDb): boolean {
       [RETRIEVAL_MIGRATION_KEY],
     ) as { value?: string } | undefined;
     return row?.value !== 'complete';
-  } catch {
+  } catch (err) {
+    rethrowIfBusy(err);
     // Unreadable state → treat as pending (fail closed).
     return true;
   }
@@ -322,7 +337,8 @@ export function isCodexRekeyPending(d: RecallDb): boolean {
       [CODEX_REKEY_MIGRATION_KEY],
     ) as { value?: string } | undefined;
     return row?.value !== 'complete';
-  } catch {
+  } catch (err) {
+    rethrowIfBusy(err);
     // Unreadable state → treat as pending (fail closed).
     return true;
   }
