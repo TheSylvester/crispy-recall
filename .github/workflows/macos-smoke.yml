@@ -11,12 +11,16 @@
 # RUNNERS: this repo is PUBLIC → GitHub-hosted macOS minutes are free/unlimited.
 # We pin `macos-26` (arm64, 3-vCPU M1, 7 GB RAM, 14 GB SSD): `macos-latest` is
 # mid-migration 15→26 and `macos-14` deprecates 2026-07-06. The macOS concurrency
-# cap is 5, so the PUSH path keeps macOS jobs at EXACTLY 5 (smoke-local×2 +
-# regression-abi-mismatch + minos-floor-static + bootstrap-rehearsal). Adding
-# bootstrap-rehearsal (Phase 3) would have pushed the count to 6, so smoke-registry
-# moved to workflow_dispatch-only (its published-0.2.0 result is informational, not
-# a per-push gate). vitest-macos is likewise workflow_dispatch-only; prebuild-coverage
-# runs on ubuntu.
+# cap is 5, so the PUSH path stays at 4 macOS jobs: smoke-local×2 +
+# regression-abi-mismatch + vitest-macos. vitest-macos was promoted onto the push
+# path and made a REAL gate (no `continue-on-error`) — macOS was the one platform
+# whose suite nothing ever ran. To pay for it without exceeding the cap, the two
+# jobs whose inputs are pinned constants — bootstrap-rehearsal (a rehearsal kit)
+# and minos-floor-static (the b5300 assets' Mach-O minos vs a source constant) —
+# became workflow_dispatch-only: they cannot change from a code push that does not
+# touch them, so re-running them per push bought no signal. smoke-registry stays
+# dispatch-only (informational, published-release check). prebuild-coverage runs on
+# ubuntu, and the full Linux suite now lives in ci-linux.yml.
 #
 # METAL: llama.cpp's macOS build uses the Apple Paravirtual Metal device on these
 # runners (llama.cpp CI runs -ngl tests here). It can flake — a flake is SIGNAL:
@@ -28,6 +32,7 @@ name: macos-smoke
 on:
   push:
     branches:
+      - main
       - 'fix/**'
   workflow_dispatch:
     inputs:
@@ -91,12 +96,14 @@ jobs:
         run: |
           set -euo pipefail
           npm run build
-          # LOAD-BEARING: build.mjs stages dist/better_sqlite3.node for local dev,
-          # but the PUBLISHED tarball is stripped of it by prepublishOnly. `npm
-          # pack` does NOT run prepublishOnly, so without this rm the tarball would
-          # ship a sibling .node that short-circuits candidate #1 of
-          # resolveNativeBinding (src/db.ts) — and we'd never exercise the
-          # npm-global resolution path (candidate #2) that real users hit.
+          # build.mjs stages dist/better_sqlite3.node for local dev; the PUBLISHED
+          # tarball is stripped of it. On npm >=7 `npm pack` DOES run `prepack`,
+          # which already strips it (and `postpack` rebuilds it afterwards), so
+          # this rm is belt-and-braces for an older npm. Either way the packed
+          # tarball must carry no sibling .node, or it would short-circuit
+          # candidate #1 of resolveNativeBinding (src/db.ts) and we'd never
+          # exercise the npm-global resolution path (candidate #2) real users hit.
+          # ci-linux.yml asserts the resulting file set with assert-tarball.mjs.
           rm -f dist/better_sqlite3.node
           npm pack
           ls -1 crispy-recall-*.tgz
@@ -219,17 +226,17 @@ jobs:
           limit-access-to-actor: true
 
   # ===========================================================================
-  # INFORMATIONAL — does the PUBLISHED 0.2.0 (stripped tarball) install clean on
+  # INFORMATIONAL — does the PUBLISHED npm `latest` (0.3.1, stripped tarball) install clean on
   # a Mac? Its outcome is a headline finding either way, but it must NEVER block
   # the matrix: the step self-reports PASS/FAIL to the run summary and exits 0.
   # ===========================================================================
   smoke-registry:
-    name: smoke-registry (crispy-recall@0.2.0)
+    name: smoke-registry (crispy-recall@0.3.1)
     runs-on: macos-26
     timeout-minutes: 40
-    # workflow_dispatch-only: keeps the PUSH macOS set at the concurrency cap of 5
-    # once bootstrap-rehearsal joins. Informational either way (records PASS/FAIL to
-    # the summary, never blocks), so demoting it off the push path costs no signal.
+    # workflow_dispatch-only: informational either way (records PASS/FAIL to the
+    # summary, never blocks), so keeping it off the push path costs no signal.
+    # Pinned to 0.3.1 — the current npm `latest`; bump it when a new one publishes.
     if: ${{ github.event_name == 'workflow_dispatch' }}
     continue-on-error: true
     steps:
@@ -259,16 +266,16 @@ jobs:
             [ "$rc" -ne 0 ] && FAIL="$name"
             return 0
           }
-          step install-global 'npm install -g crispy-recall@0.2.0'
+          step install-global 'npm install -g crispy-recall@0.3.1'
           step recall-install 'mkdir -p ~/.claude && recall install --yes --no-backfill'
           step doctor 'recall doctor --json > reg-doctor.json || true; cat reg-doctor.json; node scripts/ci/assert-doctor.mjs reg-doctor.json'
           step seed 'node scripts/ci/seed-sessions.mjs --token "xylophone quantum cheese" --sessions 2 > reg-seed.json'
           step backfill 'recall backfill --auto-embed'
           step search 'recall "xylophone quantum cheese" --raw --all > reg-search.json || true; node scripts/ci/assert-search.mjs reg-search.json'
           if [ -z "$FAIL" ]; then
-            echo "## smoke-registry (crispy-recall@0.2.0, Node 24): ✅ PASS" >> "$GITHUB_STEP_SUMMARY"
+            echo "## smoke-registry (crispy-recall@0.3.1, Node 24): ✅ PASS" >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "## smoke-registry (crispy-recall@0.2.0, Node 24): ❌ FAIL at stage \`$FAIL\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "## smoke-registry (crispy-recall@0.3.1, Node 24): ❌ FAIL at stage \`$FAIL\`" >> "$GITHUB_STEP_SUMMARY"
           fi
           exit 0
 
@@ -290,13 +297,17 @@ jobs:
   # setup-node (the script's "Node already suitable" branch); the `brew install
   # node` branch is validated live on the rented Mac.
   #
-  # Triggers on push + workflow_dispatch. It is the 5th (cap) PUSH macOS job;
-  # smoke-registry was demoted to workflow_dispatch-only to make room.
+  # workflow_dispatch-ONLY. Its input is a pinned rehearsal kit
+  # (scripts/mac-acceptance/bootstrap.sh) whose behaviour does not change from an
+  # unrelated code push, so running it per push bought no signal — and the macOS
+  # concurrency cap of 5 is better spent on vitest-macos, which is now a real gate.
+  # Dispatch it before any rented-Mac acceptance run, and after touching the kit.
   # ===========================================================================
   bootstrap-rehearsal:
     name: bootstrap-rehearsal (mac-acceptance kit, --ci)
     runs-on: macos-26
     timeout-minutes: 40
+    if: ${{ github.event_name == 'workflow_dispatch' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -317,9 +328,10 @@ jobs:
         run: |
           set -euo pipefail
           npm run build
-          # LOAD-BEARING (see smoke-local): the published tarball is stripped of
-          # dist/better_sqlite3.node by prepublishOnly; `npm pack` does not run it,
-          # so strip manually to exercise candidate #2 of resolveNativeBinding.
+          # See smoke-local: on npm >=7 `prepack` already strips
+          # dist/better_sqlite3.node (and `postpack` rebuilds it), so this rm is
+          # belt-and-braces — it keeps candidate #2 of resolveNativeBinding the
+          # path under test on any npm.
           rm -f dist/better_sqlite3.node
           npm pack
           ls -1 crispy-recall-*.tgz
@@ -451,6 +463,12 @@ jobs:
     name: minos-floor-static (b5300 macOS assets)
     runs-on: macos-26
     timeout-minutes: 15
+    # workflow_dispatch-ONLY: both sides of this equality are pinned constants
+    # (the b5300 assets' Mach-O minos and MACOS_MIN_VERSION in embedder.ts), so it
+    # can only change when embedder.ts changes — dispatch it then, and before any
+    # release. Freeing this slot keeps the push path under the macOS cap of 5 now
+    # that vitest-macos is a real per-push gate.
+    if: ${{ github.event_name == 'workflow_dispatch' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -511,12 +529,14 @@ jobs:
           [ "$X64" = "$EXP_X64" ] || { echo "::error::x64 asset minos=$X64 != embedder.ts MACOS_MIN_VERSION.x64=$EXP_X64 — floor drifted from the shipped binary"; exit 1; }
 
   # ===========================================================================
-  # REGRESSION GUARD — defect 3 (Node-23 prebuild hole). Static, on ubuntu (cheap).
-  # better-sqlite3 ships NO darwin prebuild for ABI 131 (Node 23), so the defect-3
-  # fix narrows engines.node to `>=22.16.0 <23 || >=24.0.0`. This leg evaluates the
-  # engines range and asserts EVERY allowed major has a darwin prebuild (and that
-  # smoke-local's Node 22/24 are allowed + covered). It goes RED if engines ever
-  # re-admits a prebuild-less major (Node 23 creeping back in).
+  # REGRESSION GUARD — the prebuild hole. Static, on ubuntu (cheap). better-sqlite3
+  # ships NO prebuild for ABI 115 (Node 20), 120 (Node 21) or 131 (Node 23), so
+  # engines.node is narrowed to `>=20.0.0 <21 || >=22.0.0 <23 || >=24.0.0`. This leg
+  # evaluates that range EXHAUSTIVELY and asserts every hub major (22/24/25/26) has
+  # darwin+linux+win32 prebuilds, that Node 20 is reported as the documented
+  # satellite-only source build, and that no other major sneaks in. It goes RED if
+  # engines re-admits a prebuild-less major (Node 21 or 23 creeping back in).
+  # ci-linux.yml runs the same guard; this copy keeps macos-smoke self-contained.
   # ===========================================================================
   prebuild-coverage-static:
     name: prebuild-coverage-static (better-sqlite3 darwin ABIs)
@@ -541,16 +561,18 @@ jobs:
           node scripts/ci/prebuild-coverage.mjs assets.txt >> "$GITHUB_STEP_SUMMARY"
 
   # ===========================================================================
-  # Full vitest suite on Apple hardware. workflow_dispatch-ONLY to keep the push
-  # path at exactly 5 macOS jobs (the concurrency cap). Informational: a red here
-  # never blocks — review failures against the known-flake list.
+  # Full vitest suite on Apple hardware — a REAL GATE, on every push.
+  #
+  # It used to be workflow_dispatch-only AND continue-on-error, which meant recall
+  # shipped with the macOS suite having never blocked anything. It now runs on push
+  # and a red here fails the workflow. Slots for it were freed by demoting
+  # bootstrap-rehearsal and minos-floor-static (pinned-constant inputs) to
+  # workflow_dispatch, keeping the push path under the macOS concurrency cap of 5.
   # ===========================================================================
   vitest-macos:
     name: vitest-macos
     runs-on: macos-26
     timeout-minutes: 30
-    if: ${{ github.event_name == 'workflow_dispatch' }}
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
@@ -561,13 +583,20 @@ jobs:
       - name: Install deps + build
         run: npm ci && npm run build
 
-      - name: Run vitest (informational)
+      # `npx` resolves the LOCAL devDependency vitest — never `npx crispy-recall`.
+      # No `set +e`, no `|| true`: a failing suite must fail the step.
+      - name: Run vitest (gate)
         run: |
-          set -uo pipefail
-          if npm test 2>&1 | tee vitest.log; then
-            echo "## vitest-macos: ✅ suite passed" >> "$GITHUB_STEP_SUMMARY"
+          set -euo pipefail
+          npx vitest run 2>&1 | tee vitest.log
+
+      - name: Step summary
+        if: always()
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "## vitest-macos: ✅ suite passed (gate)" >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "## vitest-macos: ❌ failures — review against the known-flake list" >> "$GITHUB_STEP_SUMMARY"
+            echo "## vitest-macos: ❌ suite FAILED — this blocks the workflow" >> "$GITHUB_STEP_SUMMARY"
             echo '```' >> "$GITHUB_STEP_SUMMARY"
             grep -iE 'fail|✗|×|✘' vitest.log | tail -40 >> "$GITHUB_STEP_SUMMARY" || true
             echo '```' >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,166 @@
+# The Linux gate — the first CI that actually runs recall's test suite.
+#
+# WHY THIS EXISTS: before this workflow, NO CI ever ran vitest. macos-smoke
+# triggered on push only for `fix/**`, and its `vitest-macos` leg was
+# workflow_dispatch-only AND continue-on-error, so a red suite could never block
+# anything. Everything recall develops on is Linux/WSL, so the cheap, fast,
+# unlimited-minutes ubuntu runner is where the suite belongs.
+#
+# WHAT IT GATES, in order of what a red pinpoints:
+#   1. `npm ci` installs better-sqlite3 from a PREBUILD, not a node-gyp compile
+#      (Node 22/24 have prebuilds; a compile here means the dependency or the
+#      ABI table drifted and the release would break users without a toolchain).
+#   2. typecheck, build, and the FULL vitest suite — no continue-on-error
+#      anywhere in this file. A red here is a red build.
+#   3. The packaging contract: `npm pack` produces exactly the intended file set
+#      with no native/wasm sidecar, and `postpack` restores the working-tree
+#      binding afterwards (otherwise a local dev's dist/ is silently broken by
+#      any pack).
+#   4. The prebuild guard: every Node major `engines` admits is either a hub
+#      major with darwin+linux+win32 prebuilds or a documented satellite-only
+#      source build.
+#
+# A second job proves the Node 20 SATELLITE floor still installs and that the
+# satellite-specific suites pass there. On Node 20 better-sqlite3 has no prebuild
+# (ABI 115), so a source compile is EXPECTED — it is warned about, not failed,
+# because that is exactly the documented satellite requirement.
+
+name: ci-linux
+
+on:
+  push:
+    branches:
+      - main
+      - 'fix/**'
+      - 'feat/**'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Supersede an in-flight run on a rapid re-push of the same ref.
+concurrency:
+  group: ci-linux-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ===========================================================================
+  # PRIMARY GATE — typecheck + build + full suite + packaging + prebuild guard
+  # on the two majors a hub supports.
+  # ===========================================================================
+  test:
+    name: test (node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24]
+    env:
+      # Never let a test touch the runner's real home. Suites that spawn children
+      # need these in the environment, not just via _setTestRoot (which does not
+      # cross a process boundary).
+      RECALL_HOME: ${{ runner.temp }}/recall-home
+      CLAUDE_CONFIG_DIR: ${{ runner.temp }}/claude-home
+      CODEX_HOME: ${{ runner.temp }}/codex-home
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - name: Install deps — assert a PREBUILD, not a node-gyp compile
+        run: |
+          set -euo pipefail
+          mkdir -p "$RECALL_HOME" "$CLAUDE_CONFIG_DIR" "$CODEX_HOME"
+          # --foreground-scripts surfaces better-sqlite3's install output so a
+          # compile is visible instead of being swallowed by npm's spinner.
+          npm ci --foreground-scripts 2>&1 | tee npm-ci.log
+          if grep -qE 'gyp info spawn args|CXX\(target\)|SOLINK_MODULE' npm-ci.log; then
+            echo "::error::better-sqlite3 was COMPILED from source on Node ${{ matrix.node }} — a prebuild was expected. engines/ABI drift, or the dependency stopped publishing this ABI."
+            exit 1
+          fi
+          echo "better-sqlite3 installed from a prebuild (no node-gyp compile)."
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
+
+      # `npx` here resolves the LOCAL devDependency vitest from node_modules/.bin.
+      # It is NOT `npx crispy-recall` and never fetches anything from the registry.
+      - name: Test (full suite — this is a gate)
+        run: npx vitest run
+
+      - name: Pack — assert the tarball contract and the postpack restore
+        run: |
+          set -euo pipefail
+          npm pack --pack-destination "$RUNNER_TEMP"
+          node scripts/ci/assert-tarball.mjs "$RUNNER_TEMP"/crispy-recall-*.tgz
+          # prepack strips dist/better_sqlite3.node; postpack must put it back, or
+          # every `npm pack` silently leaves the working tree unable to open a DB.
+          test -f dist/better_sqlite3.node \
+            || { echo "::error::dist/better_sqlite3.node missing after npm pack — the postpack build did not restore the working-tree binding"; exit 1; }
+          echo "tarball contract OK; working-tree binding restored by postpack."
+
+      - name: Prebuild guard — engines vs better-sqlite3 release assets
+        run: |
+          set -euo pipefail
+          BSQL=$(node -e 'const l=require("./package-lock.json");process.stdout.write(l.packages?.["node_modules/better-sqlite3"]?.version||"")')
+          [ -n "$BSQL" ] || { echo "::error::could not resolve better-sqlite3 version from package-lock.json"; exit 1; }
+          echo "better-sqlite3 = $BSQL"
+          gh api "repos/WiseLibs/better-sqlite3/releases/tags/v${BSQL}" --jq '.assets[].name' > assets.txt
+          node scripts/ci/prebuild-coverage.mjs assets.txt | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # ===========================================================================
+  # SATELLITE FLOOR — Node 20 must still install and run the satellite paths.
+  # A satellite loads no native addon, but npm still installs better-sqlite3 and
+  # there is no ABI 115 prebuild, so a source compile here is EXPECTED and is the
+  # documented toolchain requirement — warned, never failed.
+  # ===========================================================================
+  satellite-node20:
+    name: satellite-node20
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RECALL_HOME: ${{ runner.temp }}/recall-home
+      CLAUDE_CONFIG_DIR: ${{ runner.temp }}/claude-home
+      CODEX_HOME: ${{ runner.temp }}/codex-home
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install deps on the Node 20 floor
+        run: |
+          set -euo pipefail
+          mkdir -p "$RECALL_HOME" "$CLAUDE_CONFIG_DIR" "$CODEX_HOME"
+          npm ci --foreground-scripts 2>&1 | tee npm-ci.log
+          if grep -qE 'gyp info spawn args|CXX\(target\)|SOLINK_MODULE' npm-ci.log; then
+            echo "::warning::better-sqlite3 was compiled from source on Node 20 (ABI 115 has no prebuild). This is expected and supported for SATELLITES, but it means a Node 20 satellite install requires python3, make and a C/C++ compiler on the machine — even though a satellite never loads the binding."
+          else
+            echo "better-sqlite3 installed from a prebuild on Node 20 (a prebuild for ABI 115 now exists)."
+          fi
+
+      - name: Build
+        run: npm run build
+
+      # `npx` resolves the LOCAL devDependency vitest — never `npx crispy-recall`.
+      # Only the satellite-relevant suites: the rest of the suite is gated on
+      # Node 22/24 above, and a satellite is the only role that runs Node 20.
+      - name: Test the satellite paths
+        run: |
+          npx vitest run \
+            test/unit/preflight-satellite.test.ts \
+            test/integration/satellite-cli.test.ts \
+            test/integration/satellite-install.test.ts \
+            test/integration/satellite-stop-hook.test.ts \
+            test/integration/push-pending.test.ts
