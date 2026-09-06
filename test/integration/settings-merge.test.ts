@@ -152,6 +152,35 @@ describe('hook ownership and grouped entries', () => {
     expect(JSON.parse(readFileSync(p, 'utf8')).hooks.Stop).toEqual([entry]);
   });
 
+  // A wrapper we do not own is still an invocation that RUNS. Appending our own
+  // entry beside it would fire the Stop hook twice per turn (two ingests, two
+  // embed-pending spawns), so merge must treat it as already present.
+  it.each([
+    `sh -c 'my-notify; ${CMD}'`,
+    `${CMD} && my-notify`,
+  ])('does not add a second entry beside a wrapper running the same invocation: %s', (command) => {
+    const entry = { matcher: '', hooks: [{ type: 'command', command }] };
+    const p = setup(JSON.stringify({ hooks: { Stop: [entry], SubagentStop: [entry] } }));
+    expect(mergeStopHook(p, HOOK).changed).toBe(false);
+    const hooks = JSON.parse(readFileSync(p, 'utf8')).hooks;
+    expect(hooks.Stop).toHaveLength(1);
+    expect(hooks.SubagentStop).toHaveLength(1);
+    expect(hooks.Stop[0]).toEqual(entry);
+    // Still not ours: removal leaves the user's wrapper alone.
+    expect(removeStopHook(p).changed).toBe(false);
+  });
+
+  it('still adds the recall entry beside a wrapper running a DIFFERENT hook path', () => {
+    const command = `sh -c 'my-notify; "${process.execPath}" "/home/u/old/.recall/bin/stop-hook.js"'`;
+    const entry = { matcher: '', hooks: [{ type: 'command', command }] };
+    const p = setup(JSON.stringify({ hooks: { Stop: [entry], SubagentStop: [entry] } }));
+    expect(mergeStopHook(p, HOOK).changed).toBe(true);
+    const stop = JSON.parse(readFileSync(p, 'utf8')).hooks.Stop;
+    expect(stop).toHaveLength(2);
+    expect(stop[0]).toEqual(entry);
+    expect(stop[1].hooks[0].command).toBe(CMD);
+  });
+
   it('heals quoted Windows Node/script paths', () => {
     const p = setup(JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: 'command',
       command: String.raw`"C:\Program Files\nodejs\node.exe" "C:\Users\u\.recall\bin\stop-hook.js"` }] }] } }));
