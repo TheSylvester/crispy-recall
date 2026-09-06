@@ -481,3 +481,71 @@ describe('findSessionsForBlame', () => {
     expect(matches).toEqual([]);
   });
 });
+
+describe('Windows path normalization and Codex attribution', () => {
+  it('normalizes Windows-native and slash edit paths without changing cwd slug inputs', async () => {
+    const dir = tmpDir('recall-windows-edits-');
+    try {
+      for (const [root, raw, expected] of [
+        ['D:\\work\\repo', 'D:\\work\\repo\\src\\a.ts', 'src/a.ts'],
+        ['D:\\work\\repo', 'd:/work/repo/src/a.ts', 'src/a.ts'],
+        ['d:/work/repo/', 'D:\\work\\repo\\src\\a.ts', 'src/a.ts'],
+        ['D:\\work\\repo', 'src\\a.ts', 'src/a.ts'],
+        ['D:\\work\\repo', 'D:/work/repository/src/a.ts', 'd:/work/repository/src/a.ts'],
+        ['/work/repo', '/work/Repo/src/a.ts', process.platform === 'win32' ? 'src/a.ts' : '/work/Repo/src/a.ts'],
+      ]) {
+        const file = writeSessionJsonl(dir, 'windows', [editEvent({ tool: 'Edit', filePath: raw!, newString: 'a\nb\nc', ts: isoMinutesAgo(1) })]);
+        expect((await extractSessionEdits(file, { repoRoot: root })).edits[0]!.file).toBe(expected);
+      }
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('attributes Codex apply_patch to its metadata UUID for commit and blame, excluding another cwd', async () => {
+    const dir = tmpDir('recall-codex-attribution-');
+    try {
+      const repo = path.join(dir, 'repo');
+      const codexDir = path.join(dir, 'sessions');
+      fs.mkdirSync(repo);
+      initRepo(repo);
+      commit(repo, 'base', [{ file: 'base.txt', content: 'base' }], isoMinutesAgo(10));
+      const text = 'const first = 1;\nconst second = 2;\nexport const sum = first + second;\n';
+      const hash = commit(repo, 'codex edit', [{ file: 'src/a.ts', content: text }], isoMinutesAgo(2));
+      const patch = '*** Begin Patch\n*** Add File: src/a.ts\n' + text.trimEnd().split('\n').map(l => '+' + l).join('\n') + '\n*** End Patch';
+      const event = (type: string, payload: object) => JSON.stringify({ type, timestamp: isoMinutesAgo(3), payload });
+      const nested = path.join(codexDir, '2026', '09', '06');
+      writeSessionJsonl(nested, 'rollout-date-valid', [
+        event('session_meta', { id: 'codex-real-uuid', cwd: repo, agent_role: 'worker', source: { subagent: { thread_spawn: { parent_thread_id: 'parent-uuid' } } } }),
+        event('response_item', { type: 'custom_tool_call', name: 'apply_patch', call_id: 'call1', input: patch }),
+      ]);
+      writeSessionJsonl(nested, 'rollout-date-unrelated', [
+        event('session_meta', { id: 'codex-unrelated', cwd: path.join(dir, 'other-repo') }),
+        event('response_item', { type: 'custom_tool_call', name: 'apply_patch', call_id: 'call2', input: patch }),
+      ]);
+      const opts = { repoRoot: repo, sessionsDir: path.join(dir, 'missing-claude'), codexSessionsDir: codexDir };
+      const matches = await findSessionsForCommit(hash, opts);
+      expect(matches.map(m => m.session)).toEqual(['codex-real-uuid']);
+      expect(matches[0]).toMatchObject({ matched_files: ['src/a.ts'], surviving_ratio: 1, parent_session_id: 'parent-uuid', agent_type: 'worker' });
+      expect((await findSessionsForBlame([{ path: 'src/a.ts' }], opts)).map(m => m.session)).toEqual(['codex-real-uuid']);
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('uses Codex turn cwd changes and preserves streaming parse diagnostics', async () => {
+    const dir = tmpDir('recall-codex-turn-cwd-');
+    try {
+      const event = (type: string, payload: object, timestamp = isoMinutesAgo(3)) => JSON.stringify({ type, timestamp, payload });
+      const patch = '*** Begin Patch\n*** Update File: ../src/a.ts\n@@\n-old\n+one\n+two\n+three\n*** End Patch';
+      const file = writeSessionJsonl(dir, 'rollout', [
+        event('session_meta', { id: 'uuid', cwd: '/repo' }),
+        event('turn_context', { cwd: '/repo/nested' }),
+        '{broken',
+        event('response_item', { type: 'custom_tool_call', name: 'apply_patch', call_id: 'a', input: patch }),
+        event('response_item', { type: 'custom_tool_call', name: 'apply_patch', call_id: 'b', input: patch }, 'invalid'),
+      ]);
+      const trace = await extractSessionEdits(file, { repoRoot: '/repo' });
+      expect(trace).toMatchObject({ sessionId: 'uuid', skippedLines: 1, skippedEvents: 1 });
+      expect(trace.edits).toHaveLength(1);
+      expect(trace.edits[0]).toMatchObject({ file: 'src/a.ts', content: 'one\ntwo\nthree' });
+      expect(Number.isFinite(trace.edits[0]!.ts)).toBe(true);
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+});

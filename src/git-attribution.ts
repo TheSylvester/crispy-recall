@@ -1,5 +1,5 @@
 /**
- * Git Attribution — match git commits to the Claude Code session(s) that
+ * Git Attribution — match git commits to the Claude Code/Codex session(s) that
  * produced their edits.
  *
  * Given a commit hash (or a list of file paths), scan local Claude Code
@@ -26,7 +26,7 @@
  *
  * Scope: pure function. Inputs are a repo path + a commit hash or file
  * paths; output is a chronologically sorted `SessionMatch[]`. Shells out to
- * `git`; reads from `~/.claude/projects/<slug>/`. No DB writes, no recall
+ * `git`; reads Claude project and Codex session roots. No DB writes, no recall
  * index dependency.
  *
  * Boundary: this module does NOT format CLI output, does NOT promote
@@ -44,7 +44,7 @@ import {
   type SessionEditTrace,
 } from './adapters/claude/transcript-edits.js';
 import { log } from './log.js';
-import { claudeRoot } from './recall/transcript-roots.js';
+import { claudeRoot, codexRoot } from './recall/transcript-roots.js';
 
 // ============================================================================
 // Types
@@ -99,6 +99,8 @@ export interface AttributionOptions {
    * `~/.claude/projects/<slug(repoRoot)>`.
    */
   sessionsDir?: string;
+  /** Codex rollout root; defaults to $CODEX_HOME/sessions. */
+  codexSessionsDir?: string;
   /**
    * Window padding after commit time, in milliseconds. Edits with timestamps
    * up to `commitTime + windowAfterMs` are considered. Default: 1 hour.
@@ -299,16 +301,11 @@ async function matchCommit(
 
   const sessionsDir = opts.sessionsDir ?? defaultSessionsDir(opts.repoRoot);
 
-  if (!fs.existsSync(sessionsDir)) {
-    log({
-      source: 'git-attribution',
-      level: 'warn',
-      summary: `sessions dir not found: ${sessionsDir}`,
-    });
-    return [];
-  }
-
   const candidates = collectCandidates(sessionsDir, lower, info.commitTime);
+  // An explicit Claude-only fixture directory keeps historical callers isolated;
+  // normal CLI attribution scans both vendors, including Codex-only machines.
+  const codexDir = opts.codexSessionsDir ?? (opts.sessionsDir ? undefined : path.join(codexRoot(), 'sessions'));
+  if (codexDir) candidates.push(...collectCodexCandidates(codexDir, lower));
 
   const addedTriByFile = new Map<string, Set<string>>();
   for (const [file, lines] of info.addedLines) {
@@ -388,8 +385,8 @@ async function matchCommit(
     const lastEditTs = inWindow.reduce((m, e) => (e.ts > m ? e.ts : m), -Infinity);
     matches.push({
       session: trace.sessionId,
-      parent_session_id: cand.parentSessionId,
-      agent_type: cand.agentType,
+      parent_session_id: trace.parentSessionId ?? cand.parentSessionId,
+      agent_type: trace.agentType ?? cand.agentType,
       commit: info.hash,
       matched_files: [...touchedFiles],
       content_hits: contentHits,
@@ -473,6 +470,27 @@ function collectCandidates(
     }
   }
 
+  return out;
+}
+
+/** Codex uses year/month/day directories; session_meta supplies the UUID and cwd. */
+function collectCodexCandidates(root: string, lower: number): CandidateFile[] {
+  const out: CandidateFile[] = [];
+  const walk = (dir: string) => {
+    let entries: fs.Dirent[];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (entry.isFile() && entry.name.endsWith('.jsonl')) {
+        try {
+          // No upper mtime cutoff: a rollout may continue long after a commit.
+          if (fs.statSync(full).mtimeMs >= lower - 60_000) out.push({ jsonlPath: full, parentSessionId: null, agentType: null });
+        } catch { /* rotated between enumeration and stat */ }
+      }
+    }
+  };
+  walk(root);
   return out;
 }
 
