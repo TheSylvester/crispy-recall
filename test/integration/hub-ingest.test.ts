@@ -521,6 +521,52 @@ describe.skipIf(win32)('M2: sidecar merge + later-key adoption through the wire'
     expect(await runPushIngest(relabelled, deps())).toBe('ingested');
     expect(getDb(dbPath()).all('SELECT project_key FROM messages WHERE session_id = ?', [sid])).toEqual([{ project_key: other }]);
   });
+
+  it('a failed adoption is a failed ingest: rows roll back, no watermark advance, and the plain sweep repairs the identity with no new push', async () => {
+    const sid = randomUUID();
+    const rel = `projects/-m2d/${sid}.jsonl`;
+    const cwd = '/home/u/m2d';
+    const db = getDb(dbPath());
+    // Chunk 1 arrives keyless (the live NULL-key shape).
+    const c1 = claudeEntry(sid, 0, 'keyless first chunk, long enough to clear the fifty character embedding floor', { cwd });
+    const job1 = stageMirror('sat1', rel, c1, { cwd });
+    expect(await runPushIngest(job1, deps())).toBe('ingested');
+    expect(db.all('SELECT project_key FROM messages WHERE session_id = ?', [sid])).toEqual([{ project_key: null }]);
+    const wm1 = db.get('SELECT last_size FROM ingest_watermark WHERE transcript_path = ?', [job1.abs]) as { last_size: number };
+    expect(wm1.last_size).toBe(c1.length);
+
+    // Chunk 2 appends bytes AND teaches the key (the server has already merged
+    // the sidecar and enqueued this job when the fault hits).
+    const c2 = claudeEntry(sid, 1, 'keyed second chunk, long enough to clear the fifty character embedding floor', { cwd });
+    appendFileSync(job1.abs, c2);
+    writeSidecar(job1.abs, { host: 'sat1', cwd, key: KEY, updatedAt: new Date().toISOString(), v: 1 });
+    const st = statSync(job1.abs);
+    const job2: PushIngestJob = { ...job1, meta: { cwd, key: KEY }, mtimeInt: Math.floor(st.mtimeMs), size: st.size };
+
+    // Fault injection: the adoption UPDATE hits a busy database.
+    db.exec(`CREATE TRIGGER rr_fail_adopt BEFORE UPDATE OF project_key ON messages
+             BEGIN SELECT RAISE(ABORT, 'database is locked'); END`);
+    const d2 = deps();
+    try {
+      expect(await runPushIngest(job2, d2)).toBe('failed');
+    } finally {
+      db.exec('DROP TRIGGER rr_fail_adopt');
+    }
+    expect(d2.lines.some((l) => l.startsWith('push-ingest-failed host=sat1') && l.includes('database is locked'))).toBe(true);
+    // The whole chunk rolled back: the old row is still NULL, the new row is absent,
+    // and the watermark still points at chunk 1 — not at the failed job.
+    expect(db.all('SELECT message_seq, project_key FROM messages WHERE session_id = ? ORDER BY message_seq', [sid]))
+      .toEqual([{ message_seq: 0, project_key: null }]);
+    expect(db.get('SELECT last_size FROM ingest_watermark WHERE transcript_path = ?', [job1.abs])).toEqual({ last_size: c1.length });
+
+    // No new satellite push: the ordinary mirror sweep sees size > watermark,
+    // re-ingests through the sidecar key, and adoption succeeds this time.
+    const sweep = await runMirrorSweep();
+    expect(sweep.ingested).toBeGreaterThanOrEqual(1);
+    expect(db.all('SELECT message_seq, project_id, project_key FROM messages WHERE session_id = ? ORDER BY message_seq', [sid]))
+      .toEqual([{ message_seq: 0, project_id: cwd, project_key: KEY }, { message_seq: 1, project_id: cwd, project_key: KEY }]);
+    expect(db.get('SELECT last_size FROM ingest_watermark WHERE transcript_path = ?', [job1.abs])).toEqual({ last_size: c1.length + c2.length });
+  });
 });
 
 describe.skipIf(win32)('doctor hub section', () => {

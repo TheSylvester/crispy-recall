@@ -529,8 +529,8 @@ jobs:
   # REGRESSION GUARD — the prebuild hole. Static, on ubuntu (cheap). better-sqlite3
   # ships NO prebuild for ABI 115 (Node 20), 120 (Node 21) or 131 (Node 23), so
   # engines.node is narrowed to `>=20.0.0 <21 || >=22.0.0 <23 || >=24.0.0`. This leg
-  # evaluates that range EXHAUSTIVELY and asserts every hub major (22/24/25/26) has
-  # darwin+linux+win32 prebuilds, that Node 20 is reported as the documented
+  # evaluates that range over its known ABI table (Node 20–26) and asserts every hub major (22/24/25/26) has
+  # a prebuild for every documented os-arch pair, that Node 20 is reported as the documented
   # satellite-only source build, and that no other major sneaks in. It goes RED if
   # engines re-admits a prebuild-less major (Node 21 or 23 creeping back in).
   # ci-linux.yml runs the same guard; this copy keeps macos-smoke self-contained.

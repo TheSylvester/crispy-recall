@@ -354,6 +354,11 @@ export async function ingestSessionMessages(
       ...(options?.force ? { replaceSessionId: canonicalId } : {}),
       provenance,
       aliases,
+      // Same identity this chunk's own rows get; back-fills the session's
+      // NULL-identity rows atomically with the insert (M2). Runs on every
+      // ingest path — push, sweep, backfill — so a sweep of a mirror whose
+      // sidecar now carries the key repairs rows without a new push.
+      adopt: { sessionId: canonicalId, projectKey, projectId },
     });
   } catch (err) {
     return {

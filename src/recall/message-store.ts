@@ -107,6 +107,18 @@ export function insertMessages(
     replaceSessionId?: string;
     provenance?: SessionProvenanceRecord;
     aliases?: SessionAliasRecord[];
+    /**
+     * Identity a later chunk taught us, applied to this session's rows that
+     * were stored blind (NULL project_key / empty project_id) INSIDE this
+     * transaction. Rows go in with INSERT OR IGNORE, so without this a row
+     * written while the satellite had no cwd/key keeps NULL forever and the
+     * session is reachable only through `--all`. Strictly NULL-only: a row
+     * that already carries an identity was keyed by something that knew more.
+     * Being in the transaction makes adoption part of ingest success: if it
+     * fails, the chunk's rows roll back too, the caller reports an error, no
+     * watermark advances, and the next sweep/retry re-ingests and adopts.
+     */
+    adopt?: { sessionId: string; projectKey: string | null; projectId: string | null };
     /** Includes omitted meta UUIDs, so old meta rows do not mimic truncation. */
     sourceMessageIds?: string[];
   },
@@ -239,6 +251,16 @@ export function insertMessages(
            (SELECT message_id FROM messages WHERE session_id = ?)`,
           [p.sessionId],
         );
+      }
+    }
+
+    if (opts?.adopt) {
+      const { sessionId, projectKey, projectId } = opts.adopt;
+      if (projectKey !== null) {
+        d.run('UPDATE messages SET project_key = ? WHERE session_id = ? AND project_key IS NULL', [projectKey, sessionId]);
+      }
+      if (projectId !== null && projectId !== '') {
+        d.run("UPDATE messages SET project_id = ? WHERE session_id = ? AND (project_id IS NULL OR project_id = '')", [projectId, sessionId]);
       }
     }
 
