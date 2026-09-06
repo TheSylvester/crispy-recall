@@ -23,6 +23,8 @@ import { META_RESIDUE_SQL } from '../recall/purge-meta.js';
 import { mirrorHostSummary, mirrorHosts } from '../hub/mirror.js';
 import { hubDaemonAlive, readHostRecords, REFUSED_RECENT_MAX } from '../hub/runtime.js';
 import { classifyBind } from '../hub/server.js';
+import { sessionIdFromPath } from '../recall/mtime-scan.js';
+import { readEmbedFailure, type EmbedFailure } from '../recall/embed-failures.js';
 
 export interface DoctorOptions {
   json?: boolean;
@@ -66,6 +68,9 @@ export interface BindingHealth {
    *  schema). embedCoverage cannot serve: its denominator counts only rows
    *  that HAVE a vector, so a vector purge leaves coverage at 1.0. */
   embedGap: number | null;
+  /** Watermarked transcripts with no indexed session; may be metadata-only. */
+  emptyWatermarkedTranscripts: number | null;
+  embedFailure: EmbedFailure | null;
   problems: string[];
 }
 
@@ -518,7 +523,7 @@ export function checkBindingHealth(): BindingHealth {
       installed: false, markerPresent: false, abiOk: null, pinnedNodeOk: null,
       bindingLoads: false, journalMode: null, embedCoverage: null, metaResidue: null,
       projectKeyBackfillPending: null,
-      codexRekeyPending: null, legacyCodexSessions: null, embedGap: null,
+      codexRekeyPending: null, legacyCodexSessions: null, embedGap: null, emptyWatermarkedTranscripts: null, embedFailure: readEmbedFailure(),
       problems: ['recall is not installed — run `recall install`'],
     };
   }
@@ -560,6 +565,7 @@ export function checkBindingHealth(): BindingHealth {
   let codexRekeyPending: boolean | null = null;
   let legacyCodexSessions: number | null = null;
   let embedGap: number | null = null;
+  let emptyWatermarkedTranscripts: number | null = null;
   const localBinding = stagedBindingPath();
   const dbFile = dbPath();
   if (existsSync(dbFile)) {
@@ -663,6 +669,20 @@ export function checkBindingHealth(): BindingHealth {
       } catch {
         embedGap = null; // pre-migration schema
       }
+      // A single scan of each table avoids an unindexed path-suffix join.
+      // Provenance resolves canonical child IDs; filenames cover sessions that
+      // never inserted a row. This is informational: metadata-only files count.
+      try {
+        const sessions = new Set((raw.prepare('SELECT DISTINCT session_id FROM messages').all() as { session_id: string }[])
+          .map(row => row.session_id));
+        const provenance = new Map((raw.prepare('SELECT transcript_path, session_id FROM session_provenance').all() as { transcript_path: string; session_id: string }[])
+          .map(row => [row.transcript_path, row.session_id]));
+        emptyWatermarkedTranscripts = 0;
+        for (const row of raw.prepare('SELECT transcript_path, vendor FROM ingest_watermark').iterate() as Iterable<{ transcript_path: string; vendor: 'claude' | 'codex' }>) {
+          const id = provenance.get(row.transcript_path) ?? sessionIdFromPath(row.transcript_path.replace(/\\/g, '/'), row.vendor);
+          if (!sessions.has(id)) emptyWatermarkedTranscripts++;
+        }
+      } catch { emptyWatermarkedTranscripts = null; }
       raw.close();
       if (journalMode !== 'wal') {
         problems.push(
@@ -694,9 +714,12 @@ export function checkBindingHealth(): BindingHealth {
     }
   }
 
+  const embedFailure = readEmbedFailure();
+  if (embedFailure) problems.push(`embedding stalled for ${embedFailure.failedMessageIds.length} messages: ${embedFailure.reason} — retry recall backfill --auto-embed after resolving the error`);
+
   return {
     installed, markerPresent, abiOk, pinnedNodeOk, bindingLoads, journalMode,
-    embedCoverage, metaResidue, projectKeyBackfillPending, codexRekeyPending, legacyCodexSessions, embedGap, problems,
+    embedCoverage, metaResidue, projectKeyBackfillPending, codexRekeyPending, legacyCodexSessions, embedGap, emptyWatermarkedTranscripts, embedFailure, problems,
   };
 }
 
@@ -733,6 +756,10 @@ export function printBinding(b: BindingHealth): void {
   }
   if (b.embedGap !== null && b.embedGap > 0) {
     console.log(`Embed gap:      ${b.embedGap} messages awaiting vectors — run: recall backfill --auto-embed`);
+  }
+  if (b.emptyWatermarkedTranscripts !== null) {
+    console.log(`Watermarked without rows: ${b.emptyWatermarkedTranscripts}` +
+      (b.emptyWatermarkedTranscripts > 0 ? ' — may be metadata-only; inspect transcripts or retry with recall repair --messages' : ''));
   }
   if (b.problems.length) {
     console.log('  Issues:');

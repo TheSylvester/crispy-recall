@@ -17,6 +17,7 @@ import { EMBED_VERSION } from '../recall/embed-config.js';
 import { readEmbedderConfig, readSatelliteConfig } from './config.js';
 import { summarizePushLog } from '../satellite/push.js';
 import { logsDir } from '../paths.js';
+import { readEmbedFailure, type EmbedFailure } from '../recall/embed-failures.js';
 
 /** What `recall status` prints on a satellite: everything resolvable LOCALLY,
  *  so `getStatus()` stays synchronous (printStatus calls it synchronously and
@@ -45,6 +46,7 @@ export interface StatusReport {
   backfillPid: number | null;
   backfillRunning: boolean;
   embedder: 'gpu' | 'cpu';
+  embedFailure: EmbedFailure | null;
 }
 
 export function getStatus(): StatusReport | SatelliteStatusReport {
@@ -103,6 +105,7 @@ export function getStatus(): StatusReport | SatelliteStatusReport {
     backfillPid,
     backfillRunning,
     embedder: readEmbedderConfig().mode,
+    embedFailure: readEmbedFailure(),
   };
 }
 
@@ -129,6 +132,7 @@ export function printStatus(json: boolean): void {
   console.log(`Messages:      ${s.messageCount} searchable${s.agentMessageCount > 0 ? ` (+${s.agentMessageCount} agent-leaf, cold/explicit-read only)` : ''}`);
   console.log(`Last ingest:   ${s.lastIngest ?? 'never'}`);
   console.log(`Embedding gap: ${s.embeddingGap.gapCount} of ${s.embeddingGap.totalMessages} unembedded`);
+  if (s.embedFailure) console.log(`Embed failures: ${s.embedFailure.failedMessageIds.length} messages — ${s.embedFailure.reason} (${s.embedFailure.updatedAt})`);
   if (s.embedVersions.coverage < 1) {
     const pct = Math.round(s.embedVersions.coverage * 100);
     console.log(`Embed migration: ${s.embedVersions.current} of ${s.embedVersions.total} at v${EMBED_VERSION} (${pct}%)`);
