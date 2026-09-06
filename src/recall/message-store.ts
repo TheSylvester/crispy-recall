@@ -979,7 +979,7 @@ export function getEmbeddingGapStats(): { totalMessages: number; gapCount: numbe
       `SELECT
         COUNT(*) as total,
         SUM(CASE WHEN NOT EXISTS (SELECT 1 FROM message_vectors mv WHERE mv.message_id = m.message_id AND mv.embed_version = ?)
-                       AND (LENGTH(m.message_text) >= ${MIN_EMBED_CHARS}
+                       AND (LENGTH(m.message_text) >= ${MIN_EMBED_CHARS} OR INSTR(m.message_text, char(0)) > 0
                             OR EXISTS (SELECT 1 FROM messages p WHERE p.session_id = m.session_id AND p.message_seq < m.message_seq AND p.retrieval_class = 'hot'))
                        THEN 1 ELSE 0 END) as gap
        FROM messages m WHERE m.message_text != '' AND m.retrieval_class = 'hot'`,
@@ -1004,7 +1004,7 @@ export function getSessionsWithEmbeddingGap(): string[] {
       `SELECT DISTINCT m.session_id FROM messages m
        WHERE m.message_text != ''
          AND m.retrieval_class = 'hot'
-         AND (LENGTH(m.message_text) >= ${MIN_EMBED_CHARS}
+         AND (LENGTH(m.message_text) >= ${MIN_EMBED_CHARS} OR INSTR(m.message_text, char(0)) > 0
               OR EXISTS (SELECT 1 FROM messages p WHERE p.session_id = m.session_id AND p.message_seq < m.message_seq AND p.retrieval_class = 'hot'))
          AND NOT EXISTS (SELECT 1 FROM message_vectors mv WHERE mv.message_id = m.message_id AND mv.embed_version = ?)
        ORDER BY m.created_at DESC`,
@@ -1045,7 +1045,7 @@ export function getUnembeddedMessages(limit: number): UnembeddedMessage[] {
        WHERE m.message_text != ''
          AND m.message_id NOT IN (SELECT value FROM json_each(?))
          AND m.retrieval_class = 'hot'
-         AND (LENGTH(m.message_text) >= ${MIN_EMBED_CHARS}
+         AND (LENGTH(m.message_text) >= ${MIN_EMBED_CHARS} OR INSTR(m.message_text, char(0)) > 0
               OR EXISTS (SELECT 1 FROM messages p2 WHERE p2.session_id = m.session_id AND p2.message_seq < m.message_seq AND p2.retrieval_class = 'hot'))
          AND NOT EXISTS (SELECT 1 FROM message_vectors mv WHERE mv.message_id = m.message_id AND mv.embed_version = ?)
        ORDER BY m.created_at DESC

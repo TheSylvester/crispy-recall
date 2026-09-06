@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { _setTestRoot, dbPath } from '../../src/paths.js';
 import { _resetDb, getDb } from '../../src/db.js';
-import { ingestSessionMessages, embedMessageBatch } from '../../src/recall/message-ingest.js';
+import { ingestSessionMessages, embedMessageBatch, embedSessionMessages } from '../../src/recall/message-ingest.js';
 import { getMessageByUuid, getUnembeddedMessages, insertMessages, insertMessageVectors } from '../../src/recall/message-store.js';
 import { parseJsonlFile, readLinesFromOffset } from '../../src/adapters/claude/jsonl-reader.js';
 import { parseCodexJsonlFile } from '../../src/adapters/codex/codex-jsonl-reader.js';
@@ -103,6 +103,8 @@ it('bounds failed row retries, releases later candidates, and leaves diagnostic 
   expect(getUnembeddedMessages(1)[0]?.message_id).toBe('later-message');
   expect(readEmbedFailure()?.failedMessageIds).toContain('permanent-failure');
   expect(readEmbedFailure()?.attempts).toBe(3);
+  expect(await embedSessionMessages('permanent-failure')).toBe(0);
+  expect(embedBatch).toHaveBeenCalledTimes(9);
   embedBatch.mockResolvedValue([new Float32Array([1, 0])]);
   expect(await embedMessageBatch([{ message_id: ids[0]!, message_text: 'recovered' }])).toBe(1);
   expect(readEmbedFailure()).toBeNull();
@@ -153,4 +155,12 @@ it('preserves indexed prefix order when a source was shortened and appends new t
   expect(getDb(dbPath()).all("SELECT message_id, message_seq FROM messages WHERE session_id='shortened' ORDER BY message_seq")).toEqual([
     { message_id: 'old-a', message_seq: 0 }, { message_id: 'old-b', message_seq: 1 }, { message_id: 'new-c', message_seq: 2 },
   ]);
+});
+
+
+it('selects legacy leading-NUL text before normalization', () => {
+  insertMessages([{ message_id: 'leading-nul', session_id: 'leading-nul-session', message_seq: 0, message_text: '\0' + 'meaningful text '.repeat(8), project_id: null, created_at: 1, message_role: 'user' }]);
+  const pending = getUnembeddedMessages(10);
+  expect(pending).toHaveLength(1);
+  expect(pending[0]?.embed_text).not.toContain('\0');
 });

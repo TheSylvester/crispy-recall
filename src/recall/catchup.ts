@@ -1,3 +1,4 @@
+import { resetEmbedRetries } from './embed-failures.js';
 /**
  * Recall Catch-up — FTS5 catch-up + embedding backfill orchestration
  *
@@ -200,6 +201,9 @@ export async function runEmbeddingBackfill(): Promise<void> {
     return;
   }
 
+  // Attended/installer backfill retries failed content only after owning the
+  // lock; automatic Stop/T2 drains retain their durable cooldown.
+  resetEmbedRetries();
   const heartbeat = startLockHeartbeat(embedLockPath());
 
   try {

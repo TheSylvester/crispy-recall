@@ -1,4 +1,4 @@
-import { recordEmbedFailure, recordEmbedSuccess } from './embed-failures.js';
+import { recordEmbedFailure, recordEmbedSuccess, exhaustedEmbedMessageIds } from './embed-failures.js';
 /**
  * Message Ingest — Per-session message-level ingestion for the recall pipeline
  *
@@ -501,8 +501,10 @@ export async function embedSessionMessages(
     force ? [sessionId] : [sessionId, EMBED_VERSION],
   ) as Array<Record<string, unknown>>;
 
+  const exhausted = new Set(force ? [] : exhaustedEmbedMessageIds());
   const validRows: Array<{ messageId: string; text: string }> = [];
   for (const r of rows) {
+    if (exhausted.has(r.message_id as string)) continue;
     const messageText = (r.message_text as string).trim();
     if (!messageText) continue;
     const prevText = (r.prev_text as string) ?? null;

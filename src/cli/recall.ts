@@ -1203,10 +1203,6 @@ async function runBackfill() {
   }
 
   const autoEmbed = hasFlag('--auto-embed');
-  if (autoEmbed) {
-    const { resetEmbedRetries } = await import('../recall/embed-failures.js');
-    resetEmbedRetries();
-  }
   const vendors = parseVendors();
 
   await startRecallCatchup({ autoEmbed, ...(vendors ? { vendors } : {}) });
