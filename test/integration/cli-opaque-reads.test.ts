@@ -281,3 +281,26 @@ describe.skipIf(platform() === 'win32')('CLI opaque reads (built bundle)', () =>
     expect(parsed.target_message_id).toBe(`codex-jsonl-${UUID_SESSION.slice(0, 8)}-1`);
   }, 60_000);
 });
+
+
+it('reads copied fork UUIDs by original exact UUID, prefix, and stored scoped ID', () => {
+  const common = { message_seq: 0, message_text: 'fork inherited history sentinel', project_id: null, created_at: Date.now(), message_role: 'user' };
+  insertMessages([{ ...common, session_id: 'fork-parent', message_id: 'fork-history-uuid' }]);
+  insertMessages([{ ...common, session_id: 'fork-child', message_id: 'fork-history-uuid' }]);
+  for (const ref of ['fork-history-uuid', 'fork-history', 'session:fork-child:fork-history-uuid']) {
+    const result = runCli(['read', 'fork-child', ref]);
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain('fork inherited history sentinel');
+  }
+});
+
+
+it('centers sparse transcript sequence numbers using stored row offsets', () => {
+  const common = { session_id: 'sparse-sequence', project_id: null, created_at: Date.now(), message_role: 'user' };
+  insertMessages([{ ...common, message_seq: 0, message_id: 'sparse-first', message_text: 'first' }, { ...common, message_seq: 10000, message_id: 'sparse-target', message_text: 'sparse sequence target sentinel' }]);
+  for (const flags of [[], ['--reverse']]) {
+    const result = runCli(['read', 'sparse-sequence', 'sparse-target', '--raw', ...flags]);
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain('sparse sequence target sentinel');
+  }
+});

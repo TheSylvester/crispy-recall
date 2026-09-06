@@ -228,7 +228,8 @@ export async function runEmbeddingBackfill(): Promise<void> {
     let consecutiveFailures = 0;
     const embedStartTime = Date.now();
 
-    while (!cancelRequested && !memoryPressure()) {
+    let rounds = 0;
+    while (!cancelRequested && !memoryPressure() && rounds++ < 10_000) {
       // Fetch 2 batches worth of messages, split into concurrent work
       const allMessages = getUnembeddedMessages(CATCHUP_BATCH_SIZE * 2);
       if (allMessages.length === 0) break;
@@ -242,6 +243,7 @@ export async function runEmbeddingBackfill(): Promise<void> {
       try {
         const results = await Promise.all(batches.map(b => embedMessageBatch(b)));
         const batchTotal = results.reduce((sum, n) => sum + n, 0);
+        if (batchTotal === 0) throw new Error('Embedding made no progress; pending messages remain searchable by keyword');
         totalEmbedded += batchTotal;
         consecutiveFailures = 0;
 

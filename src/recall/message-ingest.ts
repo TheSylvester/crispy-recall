@@ -1,3 +1,4 @@
+import { recordEmbedFailure, recordEmbedSuccess } from './embed-failures.js';
 /**
  * Message Ingest — Per-session message-level ingestion for the recall pipeline
  *
@@ -31,6 +32,7 @@
 import { stripToolContent, shouldDropAsMeta } from './transcript-utils.js';
 import {
   insertMessages,
+  hasSessionMessages,
   insertMessageVectors,
 } from './message-store.js';
 import type {
@@ -59,6 +61,8 @@ export interface IngestResult {
    *  the requested id — e.g. a Codex child resolved to its rollout UUID). */
   sessionId: string;
   chunksCreated: number;
+  /** Indexable records offered; chunksCreated counts newly inserted rows. */
+  recordsOffered?: number;
   skipped: boolean;
   error?: string;
   /** How the session was classified ('agent' = cold leaf). Callers use this
@@ -92,11 +96,11 @@ export interface IngestOptions {
 export function extractEntryText(entry: TranscriptEntry): string {
   const msg = entry.message;
   if (!msg) return '';
-  if (typeof msg.content === 'string') return msg.content.trim();
+  if (typeof msg.content === 'string') return msg.content.replaceAll('\0', '').trim();
   if (Array.isArray(msg.content)) {
     return msg.content
       .filter(b => b.type === 'text')
-      .map(b => (b as { text?: string }).text?.trim())
+      .map(b => (b as { text?: string }).text?.replaceAll('\0', '').trim())
       .filter(Boolean)
       .join('\n\n');
   }
@@ -295,13 +299,15 @@ export async function ingestSessionMessages(
   //    shouldDropAsMeta whitelists task notifications and cross-session
   //    messages — those carry real signal despite the isMeta flag.
   const filtered = stripToolContent(rawEntries);
-  const topLevel = filtered.filter(e => !e.parentToolUseID && !shouldDropAsMeta(e));
+  const topLevel = filtered.filter(e => !e.parentToolUseID);
 
   // 5. Extract text per entry, build MessageRecords
   const records: MessageRecord[] = [];
 
   for (let i = 0; i < topLevel.length; i++) {
     const entry = topLevel[i]!;
+    // Count meta entries in the stable file-order sequence, even when omitted.
+    if (shouldDropAsMeta(entry)) continue;
 
     // Skip entries without uuid — can't be the PK
     if (!entry.uuid) continue;
@@ -340,8 +346,11 @@ export async function ingestSessionMessages(
   // When force is set, the session's existing rows are cleared inside the
   // SAME transaction as the insert (atomic replace) so a crash can't leave
   // the session transiently empty in the index.
+  let inserted = 0;
+  const previouslyIndexed = hasSessionMessages(canonicalId);
   try {
-    insertMessages(records, {
+    inserted = insertMessages(records, {
+      sourceMessageIds: topLevel.flatMap(e => e.uuid ? [e.uuid] : []),
       ...(options?.force ? { replaceSessionId: canonicalId } : {}),
       provenance,
       aliases,
@@ -356,9 +365,13 @@ export async function ingestSessionMessages(
     };
   }
 
+  if (!previouslyIndexed && inserted < records.length) {
+    log({ source: 'recall:ingest', level: 'warn', summary: `Session ${canonicalId}: ${records.length} records offered, ${inserted} inserted (duplicate message IDs)` });
+  }
   return {
     sessionId: canonicalId,
-    chunksCreated: records.length,
+    chunksCreated: inserted,
+    recordsOffered: records.length,
     skipped: false,
     retrievalClass,
   };
@@ -409,10 +422,11 @@ async function embedRowsResilient(
   // here so it survives both the whole-batch path and the SAFE_EMBED_CHARS
   // fallback slice (which slices from index 0, keeping the prefix at the front).
   // Only the embed *input* is prefixed; the stored message_text is untouched.
-  rows = rows.map((r) => ({ messageId: r.messageId, text: DOC_PREFIX + r.text }));
+  rows = rows.map((r) => ({ messageId: r.messageId, text: DOC_PREFIX + r.text.replaceAll('\0', '') }));
 
   const toRecord = (messageId: string, f32: Float32Array): MessageVectorRecord => {
     const { q8, scale } = quantizeToQ8(f32);
+    recordEmbedSuccess(messageId);
     return { messageId, embeddingQ8: q8, norm: computeNorm(f32), quantScale: scale };
   };
 
@@ -430,6 +444,7 @@ async function embedRowsResilient(
           const [v] = await embedBatch([r.text.slice(0, SAFE_EMBED_CHARS)]);
           records.push(toRecord(r.messageId, v!));
         } catch (err) {
+          recordEmbedFailure(r.messageId, String(err));
           log({
             source: 'recall:embed',
             level: 'warn',
@@ -538,7 +553,10 @@ export async function embedMessageBatch(
       text: text.length > MAX_EMBED_CHARS ? text.slice(0, MAX_EMBED_CHARS) : text,
     });
   }
-  if (truncated.length === 0) return 0;
+  if (truncated.length === 0) {
+    for (const m of messages) recordEmbedFailure(m.message_id, 'No non-whitespace embedding input');
+    return 0;
+  }
 
   // Resilient embed: a single message that still exceeds the token budget after
   // truncation no longer 500s the whole batch (and stalls the backfill).

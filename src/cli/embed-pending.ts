@@ -76,12 +76,13 @@ const HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000;
       }
       // Sweep loop: keep going while there's work and failures stay low.
       let consecutiveFailures = 0;
-      while (consecutiveFailures < MAX_CONSECUTIVE_FAILURES) {
+      let rounds = 0;
+      while (consecutiveFailures < MAX_CONSECUTIVE_FAILURES && rounds++ < 10_000) {
         const batch = getUnembeddedMessages(CATCHUP_BATCH_SIZE);
         if (batch.length === 0) break;
         try {
-          await embedMessageBatch(batch);
-          consecutiveFailures = 0;
+          const embedded = await embedMessageBatch(batch);
+          consecutiveFailures = embedded === 0 ? consecutiveFailures + 1 : 0;
         } catch {
           consecutiveFailures++;
         }
@@ -99,12 +100,13 @@ const HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000;
     // 1-cycle recovery into an N-cycle recovery.
     if (scan.ingested > 0) {
       let consecutiveFailures = 0;
-      while (consecutiveFailures < MAX_CONSECUTIVE_FAILURES) {
+      let rounds = 0;
+      while (consecutiveFailures < MAX_CONSECUTIVE_FAILURES && rounds++ < 10_000) {
         const batch = getUnembeddedMessages(CATCHUP_BATCH_SIZE);
         if (batch.length === 0) break;
         try {
-          await embedMessageBatch(batch);
-          consecutiveFailures = 0;
+          const embedded = await embedMessageBatch(batch);
+          consecutiveFailures = embedded === 0 ? consecutiveFailures + 1 : 0;
         } catch {
           consecutiveFailures++;
         }

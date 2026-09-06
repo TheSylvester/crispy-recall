@@ -1,3 +1,4 @@
+import { StringDecoder } from 'node:string_decoder';
 // ============================================================================
 // JSONL Reader
 // Parses Claude Code transcript files for history display
@@ -198,6 +199,7 @@ export function readLinesFromOffset(
     const buffer = Buffer.alloc(Math.min(bytesToRead, READ_BUFFER_SIZE * 16)); // Cap at 1MB chunks
     let currentOffset = startOffset;
     let remainder = "";
+    const decoder = new StringDecoder('utf8');
     let lastCompleteLineOffset = startOffset;
 
     // Read in chunks and process lines
@@ -212,7 +214,7 @@ export function readLinesFromOffset(
       currentOffset += bytesRead;
 
       // Combine remainder from previous chunk with new data
-      const chunk = remainder + buffer.toString("utf-8", 0, bytesRead);
+      const chunk = remainder + decoder.write(buffer.subarray(0, bytesRead));
       const lines = chunk.split("\n");
 
       // Last element may be incomplete (no trailing newline)
@@ -305,6 +307,7 @@ export function scanUserMessages(
     const buffer = Buffer.alloc(READ_BUFFER_SIZE);
     let currentOffset = startOffset;
     let remainder = '';
+    const decoder = new StringDecoder('utf8');
     let lastCompleteLineOffset = startOffset;
     let lineStartOffset = startOffset;
 
@@ -314,7 +317,7 @@ export function scanUserMessages(
 
       if (bytesRead === 0) break;
 
-      const chunk = remainder + buffer.toString('utf-8', 0, bytesRead);
+      const chunk = remainder + decoder.write(buffer.subarray(0, bytesRead));
       const lines = chunk.split('\n');
 
       remainder = lines.pop() || '';
@@ -463,6 +466,7 @@ export function scanFirstUserUuids(
     const buffer = Buffer.alloc(READ_BUFFER_SIZE);
     let currentOffset = 0;
     let remainder = '';
+    const decoder = new StringDecoder('utf8');
     let lineStartOffset = 0;
 
     while (currentOffset < fileSize && results.length < count) {
@@ -471,7 +475,7 @@ export function scanFirstUserUuids(
 
       if (bytesRead === 0) break;
 
-      const chunk = remainder + buffer.toString('utf-8', 0, bytesRead);
+      const chunk = remainder + decoder.write(buffer.subarray(0, bytesRead));
       const lines = chunk.split('\n');
 
       remainder = lines.pop() || '';
@@ -557,6 +561,7 @@ export function findDivergenceOffset(
     const buffer = Buffer.alloc(READ_BUFFER_SIZE);
     let currentOffset = 0;
     let remainder = '';
+    const decoder = new StringDecoder('utf8');
     let lineStartOffset = 0;
 
     while (currentOffset < fileSize) {
@@ -565,7 +570,7 @@ export function findDivergenceOffset(
 
       if (bytesRead === 0) break;
 
-      const chunk = remainder + buffer.toString('utf-8', 0, bytesRead);
+      const chunk = remainder + decoder.write(buffer.subarray(0, bytesRead));
       const lines = chunk.split('\n');
 
       remainder = lines.pop() || '';
@@ -654,6 +659,7 @@ export function readResponsePreview(
     const buffer = Buffer.alloc(READ_BUFFER_SIZE);
     let currentOffset = byteOffset;
     let remainder = '';
+    const decoder = new StringDecoder('utf8');
     let lastAssistantText: string | null = null;
     let skippedFirstLine = false;
 
@@ -663,7 +669,7 @@ export function readResponsePreview(
 
       if (bytesRead === 0) break;
 
-      const chunk = remainder + buffer.toString('utf-8', 0, bytesRead);
+      const chunk = remainder + decoder.write(buffer.subarray(0, bytesRead));
       const lines = chunk.split('\n');
 
       remainder = lines.pop() || '';
@@ -810,6 +816,7 @@ export function readClaudeTurnContent(
     const buffer = Buffer.alloc(READ_BUFFER_SIZE);
     let currentOffset = byteOffset;
     let remainder = '';
+    const decoder = new StringDecoder('utf8');
     let userPrompt: string | null = null;
     const assistantParts: string[] = [];
     let parsedFirstLine = false;
@@ -819,7 +826,7 @@ export function readClaudeTurnContent(
       const bytesRead = fs.readSync(fd, buffer, 0, chunkSize, currentOffset);
       if (bytesRead === 0) break;
 
-      const chunk = remainder + buffer.toString('utf-8', 0, bytesRead);
+      const chunk = remainder + decoder.write(buffer.subarray(0, bytesRead));
       const lines = chunk.split('\n');
       remainder = lines.pop() || '';
 
@@ -1028,7 +1035,7 @@ export function parseJsonlFile(filepath: string): ClaudeTranscriptEntry[] {
     return entries;
   } catch (error) {
     log({ level: 'error', source: 'jsonl-reader', summary: `Failed to read JSONL file ${filepath}: ${error instanceof Error ? error.message : String(error)}`, data: { filepath, error: String(error) } });
-    return [];
+    throw error;
   }
 }
 

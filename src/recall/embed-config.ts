@@ -29,6 +29,8 @@ export const ENRICH_SEP = '\n';
 /** Build the embed INPUT for a message: prepend bounded preceding-turn context for
  *  short messages; long messages embed as-is. Never mutates stored/FTS text. */
 export function buildEmbedText(messageText: string, prevText: string | null): string {
+  messageText = messageText.replaceAll('\0', '');
+  prevText = prevText?.replaceAll('\0', '') ?? null;
   if (messageText.length >= ENRICH_MAX_CHARS || !prevText) return messageText;
   return prevText.slice(-ENRICH_PREV_CHARS) + ENRICH_SEP + messageText;
 }

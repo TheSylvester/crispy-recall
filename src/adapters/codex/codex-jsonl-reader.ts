@@ -1,3 +1,4 @@
+import { StringDecoder } from 'node:string_decoder';
 /**
  * codex-jsonl-reader.ts
  *
@@ -110,7 +111,7 @@ export function parseCodexJsonlFile(filepath: string): CodexJsonlEnvelope[] {
     return records;
   } catch (error) {
     log({ level: 'error', source: 'codex-jsonl-reader', summary: `Failed to read ${filepath}: ${error instanceof Error ? error.message : String(error)}`, data: { filepath, error: String(error) } });
-    return [];
+    throw error;
   }
 }
 
@@ -364,6 +365,7 @@ export function scanCodexUserMessages(
     const buffer = Buffer.alloc(READ_BUFFER_SIZE);
     let currentOffset = startOffset;
     let remainder = '';
+    const decoder = new StringDecoder('utf8');
     let lastCompleteLineOffset = startOffset;
     let lineStartOffset = startOffset;
 
@@ -373,7 +375,7 @@ export function scanCodexUserMessages(
 
       if (bytesRead === 0) break;
 
-      const chunk = remainder + buffer.toString('utf-8', 0, bytesRead);
+      const chunk = remainder + decoder.write(buffer.subarray(0, bytesRead));
       const lines = chunk.split('\n');
 
       remainder = lines.pop() || '';
@@ -547,6 +549,7 @@ export function readCodexResponsePreview(
     const buffer = Buffer.alloc(READ_BUFFER_SIZE);
     let currentOffset = byteOffset;
     let remainder = '';
+    const decoder = new StringDecoder('utf8');
     let lastAssistantText: string | null = null;
     let skippedFirstLine = false;
 
@@ -556,7 +559,7 @@ export function readCodexResponsePreview(
 
       if (bytesRead === 0) break;
 
-      const chunk = remainder + buffer.toString('utf-8', 0, bytesRead);
+      const chunk = remainder + decoder.write(buffer.subarray(0, bytesRead));
       const lines = chunk.split('\n');
 
       remainder = lines.pop() || '';
@@ -711,6 +714,7 @@ export function readCodexTurnContent(
     const buffer = Buffer.alloc(READ_BUFFER_SIZE);
     let currentOffset = byteOffset;
     let remainder = '';
+    const decoder = new StringDecoder('utf8');
     let userPrompt: string | null = null;
     const assistantParts: string[] = [];
     let parsedFirstLine = false;
@@ -720,7 +724,7 @@ export function readCodexTurnContent(
       const bytesRead = fs.readSync(fd, buffer, 0, chunkSize, currentOffset);
       if (bytesRead === 0) break;
 
-      const chunk = remainder + buffer.toString('utf-8', 0, bytesRead);
+      const chunk = remainder + decoder.write(buffer.subarray(0, bytesRead));
       const lines = chunk.split('\n');
       remainder = lines.pop() || '';
 

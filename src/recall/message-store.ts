@@ -1,3 +1,4 @@
+import { exhaustedEmbedMessageIds } from './embed-failures.js';
 /**
  * Message Store — Message-level persistence for the recall pipeline
  *
@@ -106,9 +107,11 @@ export function insertMessages(
     replaceSessionId?: string;
     provenance?: SessionProvenanceRecord;
     aliases?: SessionAliasRecord[];
+    /** Includes omitted meta UUIDs, so old meta rows do not mimic truncation. */
+    sourceMessageIds?: string[];
   },
-): void {
-  if (messages.length === 0 && !opts?.replaceSessionId && !opts?.provenance) return;
+): number {
+  if (messages.length === 0 && !opts?.replaceSessionId && !opts?.provenance) return 0;
 
   ensureDir();
   const d = db();
@@ -119,6 +122,7 @@ export function insertMessages(
   // SQLITE_BUSY_SNAPSHOT the busy handler can't wait on — the exact "database
   // is locked" the WAL migration must eliminate for concurrent Stop hooks.
   d.exec('BEGIN IMMEDIATE');
+  let inserted = 0;
   try {
     if (opts?.replaceSessionId) {
       // Delete vectors explicitly (belt-and-suspenders with the CASCADE), then
@@ -135,18 +139,59 @@ export function insertMessages(
        (message_id, session_id, message_seq, message_text, project_id, created_at, message_role, retrieval_class, project_key)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     );
+    const invalidatedSessions = new Set<string>();
+    const sourceIds = new Map<string, Set<string>>();
     for (const m of messages) {
-      stmt.run([
-        m.message_id,
+      const ids = sourceIds.get(m.session_id) ?? new Set<string>();
+      ids.add(m.message_id); ids.add(`session:${m.session_id}:${m.message_id}`);
+      sourceIds.set(m.session_id, ids);
+    }
+    if (opts?.provenance && opts.sourceMessageIds) {
+      const sid = opts.provenance.sessionId;
+      const ids = sourceIds.get(sid);
+      for (const id of opts.sourceMessageIds) { ids?.add(id); ids?.add(`session:${sid}:${id}`); }
+    }
+    const partialSessions = new Map<string, number>();
+    for (const [sid, ids] of sourceIds) {
+      const stored = d.all('SELECT message_id, message_seq FROM messages WHERE session_id = ?', [sid]) as Array<{ message_id: string; message_seq: number }>;
+      // A rotated/truncated source cannot establish a replacement global order.
+      // Keep the indexed prefix and append new rows rather than colliding with it.
+      if (stored.some(r => !ids.has(r.message_id))) partialSessions.set(sid, stored.reduce((max, r) => Math.max(max, r.message_seq), -1));
+    }
+    for (const m of messages) {
+      // Preserve legacy UUID anchors for the owning session. Forked transcripts
+      // can repeat those UUIDs, so use a session-scoped fallback on collision.
+      const scopedId = `session:${m.session_id}:${m.message_id}`;
+      const scoped = d.get('SELECT message_id FROM messages WHERE message_id = ? AND session_id = ?', [scopedId, m.session_id]);
+      const owner = d.get('SELECT session_id FROM messages WHERE message_id = ?', [m.message_id]) as { session_id: string } | undefined;
+      const id = scoped || (owner && owner.session_id !== m.session_id) ? scopedId : m.message_id;
+      const existing = d.get('SELECT message_seq FROM messages WHERE message_id = ? AND session_id = ?', [id, m.session_id]) as { message_seq: number } | undefined;
+      let sequence = m.message_seq;
+      if (partialSessions.has(m.session_id)) {
+        sequence = existing?.message_seq ?? partialSessions.get(m.session_id)! + 1;
+        partialSessions.set(m.session_id, Math.max(partialSessions.get(m.session_id)!, sequence));
+      }
+      const insertsPredecessor = !existing && d.get('SELECT 1 FROM messages WHERE session_id = ? AND message_seq >= ? LIMIT 1', [m.session_id, sequence]);
+      if ((existing && existing.message_seq !== sequence) || insertsPredecessor) {
+        // Renumber old filtered-basis rows on every reingest. Their adjacency
+        // vectors are stale; invalidate the entire session atomically.
+        if (!invalidatedSessions.has(m.session_id)) {
+          d.run('DELETE FROM message_vectors WHERE message_id IN (SELECT message_id FROM messages WHERE session_id = ?)', [m.session_id]);
+          invalidatedSessions.add(m.session_id);
+        }
+        d.run('UPDATE messages SET message_seq = ? WHERE message_id = ? AND session_id = ?', [sequence, id, m.session_id]);
+      }
+      inserted += (stmt.run([
+        id,
         m.session_id,
-        m.message_seq,
+        sequence,
         m.message_text,
         m.project_id,
         m.created_at,
         m.message_role,
         m.retrieval_class ?? 'hot',
         m.project_key ?? null,
-      ]);
+      ]) as { changes: number }).changes;
     }
 
     if (opts?.provenance) {
@@ -196,6 +241,7 @@ export function insertMessages(
     }
 
     d.exec('COMMIT');
+    return inserted;
   } catch (e) {
     d.exec('ROLLBACK');
     throw e;
@@ -433,8 +479,8 @@ export function getMessageByUuid(sessionId: string, messageId: string): MessageR
   try {
     const row = db().get(
       `SELECT message_id, session_id, message_seq, message_text, project_id, created_at, message_role
-       FROM messages WHERE session_id = ? AND message_id = ?`,
-      [sessionId, messageId],
+       FROM messages WHERE session_id = ? AND message_id IN (?, ?)`,
+      [sessionId, messageId, `session:${sessionId}:${messageId}`],
     );
     if (!row) return null;
     return rowToMessage(row);
@@ -997,13 +1043,14 @@ export function getUnembeddedMessages(limit: number): UnembeddedMessage[] {
            ORDER BY p.message_seq DESC LIMIT 1) AS prev_text
        FROM messages m
        WHERE m.message_text != ''
+         AND m.message_id NOT IN (SELECT value FROM json_each(?))
          AND m.retrieval_class = 'hot'
          AND (LENGTH(m.message_text) >= ${MIN_EMBED_CHARS}
               OR EXISTS (SELECT 1 FROM messages p2 WHERE p2.session_id = m.session_id AND p2.message_seq < m.message_seq AND p2.retrieval_class = 'hot'))
          AND NOT EXISTS (SELECT 1 FROM message_vectors mv WHERE mv.message_id = m.message_id AND mv.embed_version = ?)
        ORDER BY m.created_at DESC
        LIMIT ?`,
-      [EMBED_VERSION, limit],
+      [JSON.stringify(exhaustedEmbedMessageIds()), EMBED_VERSION, limit],
     ) as Array<Record<string, unknown>>;
     return rows.map(r => {
       const message_text = r.message_text as string;

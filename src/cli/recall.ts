@@ -182,7 +182,7 @@ const FLAG_BOOLEAN = new Set([
   '--no-catchup', '--auto-embed', '--detach', '--purge-meta', '--dry-run',
   // installer subcommand flags
   '--yes', '--offline', '--json', '--purge', '--integrity',
-  '--fts', '--vectors', '--full', '--rekey-codex', '--rekey-projects', '--force',
+  '--fts', '--vectors', '--full', '--messages', '--rekey-codex', '--rekey-projects', '--force',
   '--no-claudemd', '--no-backfill', '--auto-backfill',
   '--statusline', '--no-statusline',
   // statusline subcommand flag
@@ -363,6 +363,7 @@ REPAIR FLAGS (with 'recall repair')
   --fts            Rebuild the FTS5 index from the filtered view
   --vectors        Drop all embeddings; the next sweep re-embeds them
   --full           Delete every indexed message and reingest from JSONL
+  --messages      Re-read indexed transcripts to repair order, fork history and missed tails.
   --rekey-codex    Run the one-time Codex message-id migration (full UUIDs).
                    Re-ingests the affected sessions, which drops their
                    vectors, then launches the re-embed drain. Asks first on a
@@ -517,11 +518,14 @@ function resolveMessageRef(sessionId: string, ref: string): string {
     return t;
   }
 
+  const scoped = `session:${sessionId}:${t}`;
+  if (d.get('SELECT 1 FROM messages WHERE session_id = ? AND message_id = ? LIMIT 1', [sessionId, scoped])) return scoped;
+
   const rows = d.all(
     `SELECT DISTINCT message_id FROM messages
-     WHERE session_id = ? AND substr(message_id, 1, ?) = ?
+     WHERE session_id = ? AND (substr(message_id, 1, ?) = ? OR substr(message_id, 1, ?) = ?)
      ORDER BY message_id ASC LIMIT ${AMBIGUITY_LIST_MAX + 1}`,
-    [sessionId, t.length, t],
+    [sessionId, t.length, t, scoped.length, scoped],
   ) as { message_id: string }[];
 
   if (rows.length === 0) {
@@ -668,7 +672,12 @@ function runReadTurn(sessionId: string, messageId: string) {
   }
 
   // Fetch a generous batch centered on the match
-  const centeredOffset = Math.max(0, record.message_seq - Math.floor(FETCH_BATCH / 2));
+  // Sequence numbers preserve transcript gaps; SQL OFFSET counts stored rows.
+  const preceding = getDb(getDbPath()).get(
+    `SELECT COUNT(*) AS n FROM messages WHERE session_id = ? AND message_seq ${reverse ? '>' : '<'} ?`,
+    [sessionId, record.message_seq],
+  ) as { n: number };
+  const centeredOffset = Math.max(0, preceding.n - Math.floor(FETCH_BATCH / 2));
   const page = readSessionMessages(sessionId, centeredOffset, FETCH_BATCH, reverse);
 
   if (!page) {
@@ -1200,6 +1209,10 @@ async function runBackfill() {
   }
 
   const autoEmbed = hasFlag('--auto-embed');
+  if (autoEmbed) {
+    const { resetEmbedRetries } = await import('../recall/embed-failures.js');
+    resetEmbedRetries();
+  }
   const vendors = parseVendors();
 
   await startRecallCatchup({ autoEmbed, ...(vendors ? { vendors } : {}) });
@@ -1289,6 +1302,12 @@ async function runInstallerSubcommand(cmd: string): Promise<void> {
   }
 
   if (cmd === 'repair') {
+    if (hasFlag('--messages')) {
+      const { repairMessages } = await import('../recall/repair-messages.js');
+      const r = await repairMessages();
+      console.log(`Messages repaired: ${r.sessions} sessions, ${r.inserted} rows inserted, ${r.failed} read failures.`);
+      exit(r.failed ? 1 : 0);
+    }
     const { repairFts, repairVectors, repairFull, repairRekeyCodex } = await import('../installer/repair.js');
     if (hasFlag('--rekey-codex')) {
       const r = await repairRekeyCodex({ yes: hasFlag('--yes') });
@@ -1319,7 +1338,7 @@ async function runInstallerSubcommand(cmd: string): Promise<void> {
       }
       exit(r.markerWritten ? 0 : 1);
     }
-    console.error('recall repair: specify --fts, --vectors, --full, --rekey-codex, or --rekey-projects');
+    console.error('recall repair: specify --fts, --vectors, --full, --messages, --rekey-codex, or --rekey-projects');
     exit(1);
   }
 }
