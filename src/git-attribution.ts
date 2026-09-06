@@ -154,7 +154,7 @@ export async function findSessionsForCommit(
   opts: AttributionOptions,
 ): Promise<SessionMatch[]> {
   const info = getCommitInfo(opts.repoRoot, commitHash);
-  return matchCommit(info, opts, new Map());
+  return matchCommit(info, opts, new Map(), { traces: new Map() });
 }
 
 /**
@@ -190,6 +190,7 @@ export async function findSessionsForBlame(
 
   // Reuse per-commit-file `git show` results across iterations.
   const commitFileTriCache = new Map<string, Set<string>>();
+  const transcriptCache: InvocationTranscripts = { traces: new Map() };
 
   const all: SessionMatch[] = [];
   for (const h of commitSet) {
@@ -205,7 +206,7 @@ export async function findSessionsForBlame(
       });
       continue;
     }
-    const ms = await matchCommit(info, opts, commitFileTriCache);
+    const ms = await matchCommit(info, opts, commitFileTriCache, transcriptCache);
     for (const m of ms) all.push(m);
   }
 
@@ -287,12 +288,20 @@ interface CandidateFile {
   jsonlPath: string;
   parentSessionId: string | null;
   agentType: string | null;
+  mtimeMs: number;
+  vendor: 'claude' | 'codex';
+}
+
+interface InvocationTranscripts {
+  candidates?: CandidateFile[];
+  traces: Map<string, Promise<SessionEditTrace>>;
 }
 
 async function matchCommit(
   info: CommitInfo,
   opts: AttributionOptions,
   commitFileTriCache: Map<string, Set<string>>,
+  transcriptCache: InvocationTranscripts,
 ): Promise<SessionMatch[]> {
   const commitFiles = new Set(info.files);
   // Windows edit paths can spell the same file with different casing from Git.
@@ -307,13 +316,16 @@ async function matchCommit(
   const lower = info.parentTime;
   const upper = info.commitTime + windowAfterMs;
 
-  const sessionsDir = opts.sessionsDir ?? defaultSessionsDir(opts.repoRoot);
-
-  const candidates = collectCandidates(sessionsDir, lower, info.commitTime);
-  // An explicit Claude-only fixture directory keeps historical callers isolated;
-  // normal CLI attribution scans both vendors, including Codex-only machines.
-  const codexDir = opts.codexSessionsDir ?? (opts.sessionsDir ? undefined : path.join(codexRoot(), 'sessions'));
-  if (codexDir) candidates.push(...collectCodexCandidates(codexDir, lower));
+  if (!transcriptCache.candidates) {
+    const sessionsDir = opts.sessionsDir ?? defaultSessionsDir(opts.repoRoot);
+    const candidates = collectCandidates(sessionsDir, -Infinity, Infinity);
+    // Explicit Claude fixture roots remain isolated unless Codex is requested.
+    const codexDir = opts.codexSessionsDir ?? (opts.sessionsDir ? undefined : path.join(codexRoot(), 'sessions'));
+    if (codexDir) candidates.push(...collectCodexCandidates(codexDir, -Infinity));
+    transcriptCache.candidates = candidates;
+  }
+  const candidates = transcriptCache.candidates.filter(c => c.mtimeMs >= lower - 60_000
+    && (c.vendor === 'codex' || c.mtimeMs <= info.commitTime + 24 * 60 * 60 * 1000));
 
   const addedTriByFile = new Map<string, Set<string>>();
   for (const [file, lines] of info.addedLines) {
@@ -324,7 +336,12 @@ async function matchCommit(
   for (const cand of candidates) {
     let trace: SessionEditTrace;
     try {
-      trace = await extractSessionEdits(cand.jsonlPath, { repoRoot: opts.repoRoot });
+      let pending = transcriptCache.traces.get(cand.jsonlPath);
+      if (!pending) {
+        pending = extractSessionEdits(cand.jsonlPath, { repoRoot: opts.repoRoot });
+        transcriptCache.traces.set(cand.jsonlPath, pending);
+      }
+      trace = await pending;
     } catch (err) {
       log({
         source: 'git-attribution',
@@ -424,6 +441,7 @@ function collectCandidates(
   const mtimeLower = lower - 60_000;
   const mtimeUpper = commitTime + 24 * 60 * 60 * 1000;
 
+  const mtimes = new Map<string, number>();
   const inWindow = (p: string): boolean => {
     let stat: fs.Stats;
     try {
@@ -431,6 +449,7 @@ function collectCandidates(
     } catch {
       return false;
     }
+    mtimes.set(p, stat.mtimeMs);
     if (stat.mtimeMs < mtimeLower) return false;
     if (stat.mtimeMs > mtimeUpper) return false;
     return true;
@@ -449,7 +468,7 @@ function collectCandidates(
     if (ent.isFile() && ent.name.endsWith('.jsonl')) {
       const full = path.join(sessionsDir, ent.name);
       if (inWindow(full)) {
-        out.push({ jsonlPath: full, parentSessionId: null, agentType: null });
+        out.push({ jsonlPath: full, parentSessionId: null, agentType: null, mtimeMs: mtimes.get(full)!, vendor: 'claude' });
       }
       continue;
     }
@@ -475,7 +494,7 @@ function collectCandidates(
       } catch {
         // meta.json is optional
       }
-      out.push({ jsonlPath: full, parentSessionId: ent.name, agentType });
+      out.push({ jsonlPath: full, parentSessionId: ent.name, agentType, mtimeMs: mtimes.get(full)!, vendor: 'claude' });
     }
   }
 
@@ -494,7 +513,8 @@ function collectCodexCandidates(root: string, lower: number): CandidateFile[] {
       else if (entry.isFile() && entry.name.endsWith('.jsonl')) {
         try {
           // No upper mtime cutoff: a rollout may continue long after a commit.
-          if (fs.statSync(full).mtimeMs >= lower - 60_000) out.push({ jsonlPath: full, parentSessionId: null, agentType: null });
+          const mtimeMs = fs.statSync(full).mtimeMs;
+          if (mtimeMs >= lower - 60_000) out.push({ jsonlPath: full, parentSessionId: null, agentType: null, mtimeMs, vendor: 'codex' });
         } catch { /* rotated between enumeration and stat */ }
       }
     }

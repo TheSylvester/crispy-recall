@@ -977,6 +977,14 @@ function parseCodexPatch(input: string): PatchFileChange[] {
       continue;
     }
 
+    // Updates may rename the file before applying their hunks. The emitted
+    // edit belongs to the destination that git records in the resulting commit.
+    const moveMatch = line.match(/^\*\*\* Move to:\s*(.+)$/);
+    if (moveMatch && currentKind === 'update') {
+      currentPath = moveMatch[1].trim();
+      continue;
+    }
+
     const addMatch = line.match(/^\*\*\* Add File:\s*(.+)$/);
     if (addMatch) {
       flushCurrent();
