@@ -12,7 +12,7 @@
  * @module recall/embed-lock
  */
 
-import { writeFileSync, readFileSync, unlinkSync, statSync } from 'node:fs';
+import { writeFileSync, readFileSync, unlinkSync, statSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { runDir } from '../paths.js';
 
@@ -39,6 +39,11 @@ export function tryAcquireEmbedLock(): boolean {
   // ~1.5 GB llama-servers. A vanishingly small window remains (a racer's
   // unlink landing just after another's fresh create); the cost is one
   // transient extra server, self-healed on the next sweep, never corruption.
+  // `run/` need not exist: `repair --full` and a non-detached `recall backfill`
+  // reach here with no prior mkdir, and on a snapshot root the ENOENT from the
+  // `wx` create was indistinguishable from "lock held" — every re-embed was
+  // silently skipped with "another embed process holds the lock".
+  try { mkdirSync(runDir(), { recursive: true }); } catch { /* create below reports it */ }
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       writeFileSync(embedLockPath(), String(process.pid), { flag: 'wx' });

@@ -10,10 +10,12 @@
  *     forget to clear it and steady-state catch-up reingests nothing).
  * Plus repairVectors clears embeddings and repairFts leaves FTS healthy.
  *
- * Tiny message bodies (< MIN_EMBED_CHARS) keep the embedding gap at 0, so no
- * llama-server / model download is triggered — CI-friendly.
+ * The embedder module is mocked wholesale: `repair --full` runs the embedding
+ * backfill for real (short bodies still embed once they have a preceding turn,
+ * so the gap is NOT 0 here), and an unmocked run would download the llama
+ * binary and the 8-bit model from the network mid-test.
  */
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { mkdirSync, rmSync, writeFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -23,6 +25,16 @@ import { repairFull, repairVectors, repairFts, integrityCheck } from '../../src/
 import { mtimeScan } from '../../src/recall/mtime-scan.js';
 import { _setTestRoot, dbPath } from '../../src/paths.js';
 import { _resetDb, getDb } from '../../src/db.js';
+
+// No network, no llama-server: `repair --full` embeds through this stub.
+vi.mock('../../src/recall/embedder.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../src/recall/embedder.js')>()),
+  ensureBinary: async () => '/fake/llama-embedding',
+  ensureModel: async () => '/fake/model.gguf',
+  disposeEmbedder: async () => {},
+  embedBatch: async (texts: string[]) =>
+    texts.map((_, i) => Float32Array.from({ length: 768 }, (_v, j) => ((i + j) % 7) / 7 + 0.01)),
+}));
 
 let recallHome: string;
 let claudeRoot: string;
@@ -103,6 +115,10 @@ describe('repair', () => {
     expect(count('SELECT COUNT(*) AS c FROM ingest_watermark')).toBe(3);
     // FTS index is consistent with the reingested rows.
     expect(integrityCheck().ftsOk).toBe(true);
+    // …and the embed pass actually RAN: before the embed-lock ENOENT fix the
+    // backfill mistook a missing run/ directory for a held lock and yielded,
+    // so a full repair left every reingested row unvectorized.
+    expect(count('SELECT COUNT(*) AS c FROM message_vectors')).toBeGreaterThan(0);
   });
 
   it('repairVectors clears embeddings without touching messages', () => {
@@ -110,10 +126,12 @@ describe('repair', () => {
     // Attach a vector to an existing message so there is something to clear.
     const mid = (getDb(dbPath()).get('SELECT message_id FROM messages LIMIT 1') as { message_id: string }).message_id;
     getDb(dbPath()).run(
-      `INSERT INTO message_vectors (message_id, embedding_q8, norm, quant_scale) VALUES (?, ?, ?, ?)`,
+      `INSERT OR REPLACE INTO message_vectors (message_id, embedding_q8, norm, quant_scale) VALUES (?, ?, ?, ?)`,
       [mid, Buffer.from([1, 2, 3]), 1.0, 0.5],
     );
-    expect(count('SELECT COUNT(*) AS c FROM message_vectors')).toBe(1);
+    // The full repair above already vectorized the reingested rows.
+    const vectors = count('SELECT COUNT(*) AS c FROM message_vectors');
+    expect(vectors).toBeGreaterThanOrEqual(1);
 
     repairVectors();
 

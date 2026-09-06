@@ -207,6 +207,16 @@ export async function runEmbeddingBackfill(): Promise<void> {
   const heartbeat = startLockHeartbeat(embedLockPath());
 
   try {
+    // Nothing to embed → never pay for the binary/model download. `repair
+    // --full` and `backfill --auto-embed` reach here on every run; before the
+    // embed-lock ENOENT was fixed they returned at the lock instead, which is
+    // what used to keep a zero-gap repair off the network.
+    if (getUnembeddedMessages(1).length === 0) {
+      const { gapCount, totalMessages } = getEmbeddingGapStats();
+      writeStatus({ phase: 'done', gapCount, totalMessages, estimatedSecondsRemaining: 0 });
+      return;
+    }
+
     // Download binary + model if needed
     writeStatus({ phase: 'downloading-model', stoppedByMemoryPressure: false, stoppedByError: undefined });
     try {

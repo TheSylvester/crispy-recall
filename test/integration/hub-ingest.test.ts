@@ -39,6 +39,18 @@ import { writeHubConfig } from '../../src/installer/config.js';
 import { clearProjectKeyCache } from '../../src/recall/project-key.js';
 import { appendPath, authHeaders, claudeEntry, codexRollout, metaHeader, req } from './helpers/hub-harness.js';
 
+// `repair --full` runs the embedding backfill in-process. Unmocked it downloads
+// the llama binary and the 8-bit model from the network mid-test (it only
+// stayed off the network while the embed-lock ENOENT made the backfill yield).
+vi.mock('../../src/recall/embedder.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../src/recall/embedder.js')>()),
+  ensureBinary: async () => '/fake/llama-embedding',
+  ensureModel: async () => '/fake/model.gguf',
+  disposeEmbedder: async () => {},
+  embedBatch: async (texts: string[]) =>
+    texts.map((_, i) => Float32Array.from({ length: 768 }, (_v, j) => ((i + j) % 7) / 7 + 0.01)),
+}));
+
 const win32 = platform() === 'win32';
 const KEY = 'git:' + 'd'.repeat(40);
 
