@@ -47,6 +47,11 @@ export function recordEmbedSuccess(messageId: string): void {
   try {
     const previous = readEmbedFailure();
     if (!previous) return;
+    // The common case is a success for a row that never failed. Rewriting the
+    // whole file for it made every healthy embed in a batch pay a read+write
+    // for as long as ANY unrelated failure remained on disk.
+    if (!previous.failedMessageIds.includes(messageId)
+      && !(previous.retryAfter && messageId in previous.retryAfter)) return;
     previous.failedMessageIds = previous.failedMessageIds.filter(id => id !== messageId);
     if (previous.retryAfter) delete previous.retryAfter[messageId];
     if (previous.failedMessageIds.length) writeFileSync(join(logsDir(), 'embed-failure.json'), JSON.stringify(previous));
