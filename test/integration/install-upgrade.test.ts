@@ -13,7 +13,7 @@
  * backfill child resolves the temp DB — a child that native-opened the live DB
  * is the exact corruption this effort prevents.
  */
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync,
 } from 'node:fs';
@@ -21,7 +21,7 @@ import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import Database from 'better-sqlite3';
 import { Database as WasmDatabase } from 'node-sqlite3-wasm';
-import { _resetDb } from '../../src/db.js';
+import { _resetDb, getDb } from '../../src/db.js';
 import { dbPath, binDir, runDir } from '../../src/paths.js';
 import { runInstall } from '../../src/installer/install.js';
 import { getBinaryPath, getModelPath } from '../../src/recall/embedder.js';
@@ -304,4 +304,40 @@ describe('install-upgrade: legacy delete-mode/v1 DB migrates in place', () => {
     expect(String(chk.pragma('integrity_check', { simple: true }))).toBe('ok');
     chk.close();
   }, 30_000);
+});
+
+describe('migration safety regressions', () => {
+  it('preserves grouped foreign hooks on a 0.3.x-shaped Codex-marker upgrade', async () => {
+    getDb(dbPath());
+    _resetDb();
+    const old = new Database(dbPath());
+    old.prepare("DELETE FROM schema_meta WHERE key = 'codex_message_id_v2'").run();
+    old.close();
+    // Existing native install: phase 5.5 need not run, but Codex quiesce does.
+    writeFileSync(join(binDir(), '.binding-info.json'), JSON.stringify({ nodeAbi: process.versions.modules }));
+    const foreign = [{ type: 'command', command: 'notify-user', timeout: 12 }, { type: 'prompt', prompt: 'Check completion' }];
+    const entry = { matcher: 'custom', hooks: [{ type: 'command', command: 'node /old/.recall/bin/stop-hook.js' }, ...foreign] };
+    writeFileSync(join(claudeDir, 'settings.json'), JSON.stringify({ hooks: { Stop: [entry], SubagentStop: [entry] } }));
+    const res = await runInstall({ ...INSTALL, distDir });
+    expect(res.aborted).toBeFalsy();
+    expect(res.migration?.state).toBe('already-migrated');
+    const hooks = JSON.parse(readFileSync(join(claudeDir, 'settings.json'), 'utf8')).hooks;
+    expect(hooks.Stop[0]).toEqual({ ...entry, hooks: foreign });
+    expect(hooks.SubagentStop[0]).toEqual({ ...entry, hooks: foreign });
+  });
+
+  it('aborts on backup ENOSPC before changing legacy journal mode and restores hooks', async () => {
+    buildLegacyDb(dbPath());
+    seedClaudeSettings();
+    const before = readFileSync(join(claudeDir, 'settings.json'), 'utf8');
+    const backup = vi.spyOn(Database.prototype, 'backup').mockRejectedValueOnce(new Error('ENOSPC'));
+    try {
+      await expect(runInstall({ ...INSTALL, distDir })).rejects.toThrow(/snapshot failed.*ENOSPC/);
+    } finally { backup.mockRestore(); }
+    const check = new Database(dbPath(), { readonly: true });
+    expect(check.pragma('journal_mode', { simple: true })).toBe('delete');
+    expect(check.prepare('SELECT COUNT(*) AS n FROM messages').get()).toEqual({ n: 2 });
+    check.close();
+    expect(readFileSync(join(claudeDir, 'settings.json'), 'utf8')).toBe(before);
+  });
 });

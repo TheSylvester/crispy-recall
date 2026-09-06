@@ -26,6 +26,7 @@ import {
 import { searchMessagesFts, readSessionMessages, getUnembeddedMessages, getEmbeddingGapStats } from '../../src/recall/message-store.js';
 import { listSessions } from '../../src/recall/memory-queries.js';
 import { repairFts, repairVectors, integrityCheck } from '../../src/installer/repair.js';
+import { snapshotDb } from '../../src/installer/upgrade-migrate.js';
 import { runCodexRekeyMigration } from '../../src/installer/codex-rekey-migration.js';
 import { mtimeScan } from '../../src/recall/mtime-scan.js';
 import { EMBED_VERSION } from '../../src/recall/embed-config.js';
@@ -365,7 +366,7 @@ describe.skipIf(platform() === 'win32')('retrieval-class migration (§8.3)', () 
     }
   }, 30_000);
 
-  it('WAL-safe snapshot captures committed-but-uncheckpointed frames and restores correctly', async () => {
+  it.each(['retrieval', 'upgrade'] as const)('%s snapshot captures committed-but-uncheckpointed frames and restores correctly', async (label) => {
     // Write rows that stay in the WAL (autocheckpoint off, connection open).
     const writer = new Database(dbPath());
     writer.pragma('journal_mode = WAL');
@@ -376,7 +377,8 @@ describe.skipIf(platform() === 'win32')('retrieval-class migration (§8.3)', () 
     const walFile = `${dbPath()}-wal`;
     expect(existsSync(walFile) && statSync(walFile).size > 0, 'fixture must have live WAL frames').toBe(true);
 
-    const snap = await snapshotDbWalSafe();
+    const snap = label === 'upgrade' ? await snapshotDb() : await snapshotDbWalSafe();
+    expect(snap).toContain(`.pre-${label}-`);
     writer.close();
 
     // The snapshot (a single consistent file) contains the WAL-only row.
@@ -607,4 +609,25 @@ describe.skipIf(platform() === 'win32')('retrieval-class migration (§8.3)', () 
     ) as { c: string }).c;
     expect(cls).toBe('agent');
   }, 60_000);
+});
+
+describe('historical/live Codex parser parity', () => {
+  it.each([
+    { type: 'subagent', thread_spawn: { parent_thread_id: CODEX_ROOT, depth: 2, agent_role: 'explorer', agent_nickname: 'Ada' } },
+    { subagent: 'review' }, { subagent: 'compact' }, { subagent: 'memory_consolidation' },
+  ])('migrates recognized child source %j to agent', async (source) => {
+    const p = codexChildTranscriptPath();
+    const lines = readFileSync(p, 'utf8').trim().split('\n');
+    const meta = JSON.parse(lines[0]!);
+    meta.payload.source = source;
+    lines[0] = JSON.stringify(meta);
+    writeFileSync(p, lines.join('\n') + '\n');
+    const result = await runRetrievalClassMigration();
+    expect(result.agentSessions).toBe(2);
+    const db = getDb(dbPath(), { allowPendingMigration: true });
+    expect(db.get('SELECT kind FROM session_provenance WHERE session_id = ?', [CODEX_CHILD])).toEqual({ kind: 'agent' });
+    const row = db.get('SELECT agent_meta FROM session_provenance WHERE session_id = ?', [CODEX_CHILD]) as { agent_meta: string };
+    expect(JSON.parse(row.agent_meta)).toEqual('thread_spawn' in source
+      ? { agent_role: 'explorer', agent_nickname: 'Ada' } : { type: source.subagent });
+  });
 });

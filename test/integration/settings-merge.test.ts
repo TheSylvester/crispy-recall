@@ -122,3 +122,42 @@ describe('settings-merge', () => {
     expect(parsed.hooks.SubagentStop).toBeUndefined();
   });
 });
+
+describe('hook ownership and grouped entries', () => {
+  it.each(['settings.json', 'hooks.json'])('preserves command and prompt siblings through quiesce/remerge in %s', (name) => {
+    const foreign = [{ type: 'command', command: 'echo keep', timeout: 17 }, { type: 'prompt', prompt: 'Review the result' }];
+    const entry = { matcher: 'custom', timeout: 91, hooks: [{ type: 'command', command: CMD }, ...foreign] };
+    const p = setup(JSON.stringify({ hooks: { Stop: [entry], SubagentStop: [entry] } }), name);
+    const result = removeStopHook(p);
+    expect(existsSync(result.backup!)).toBe(true);
+    for (const entries of Object.values(JSON.parse(readFileSync(p, 'utf8')).hooks) as any[]) {
+      expect(entries).toEqual([{ ...entry, hooks: foreign }]);
+    }
+    mergeStopHook(p, HOOK);
+    removeStopHook(p);
+    expect(JSON.parse(readFileSync(p, 'utf8')).hooks.Stop).toEqual([{ ...entry, hooks: foreign }]);
+  });
+
+  it.each([
+    `sh -c 'notify; ${CMD}'`, `${CMD} && notify`, `${CMD} --custom`,
+    'node /home/u/not-recall/stop-hook.js', 'node /home/u/backups.recall/stop-hook.js',
+    `"echo" "${HOOK}"`,
+  ])('never claims a foreign wrapper or lookalike: %s', (command) => {
+    const entry = { matcher: '', hooks: [{ type: 'command', command }] };
+    const p = setup(JSON.stringify({ hooks: { Stop: [entry] } }));
+    expect(removeStopHook(p).changed).toBe(false);
+    mergeStopHook(p, HOOK);
+    expect(JSON.parse(readFileSync(p, 'utf8')).hooks.Stop[0]).toEqual(entry);
+    removeStopHook(p);
+    expect(JSON.parse(readFileSync(p, 'utf8')).hooks.Stop).toEqual([entry]);
+  });
+
+  it('heals quoted Windows Node/script paths', () => {
+    const p = setup(JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: 'command',
+      command: String.raw`"C:\Program Files\nodejs\node.exe" "C:\Users\u\.recall\bin\stop-hook.js"` }] }] } }));
+    mergeStopHook(p, HOOK);
+    expect(JSON.parse(readFileSync(p, 'utf8')).hooks.Stop).toHaveLength(1);
+    expect(removeStopHook(p).changed).toBe(true);
+    expect(JSON.parse(readFileSync(p, 'utf8')).hooks.Stop).toBeUndefined();
+  });
+});

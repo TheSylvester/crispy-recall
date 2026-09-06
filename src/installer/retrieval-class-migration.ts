@@ -35,7 +35,6 @@
  */
 
 import { existsSync, readFileSync, unlinkSync } from 'node:fs';
-import { join, dirname } from 'node:path';
 import Database from 'better-sqlite3';
 import {
   getDb, _resetDb, isRetrievalMigrationPending, resolveNativeBindingPath,
@@ -48,6 +47,7 @@ import { backfillAlreadyRunning } from './upgrade-migrate.js';
 import { backupStamp } from './settings-merge.js';
 import { extractCodexSessionMeta, scanCodexSessionFiles } from '../adapters/codex/codex-jsonl-reader.js';
 import { log } from '../log.js';
+import { parseSubagentSource } from '../recall/session-classifier.js';
 
 // ---------------------------------------------------------------------------
 // Detection (read-only)
@@ -171,9 +171,9 @@ async function quiesceDrain(waitMs: number): Promise<void> {
  * load-bearing for the external-content FTS index on restore). THROWS on any
  * failure: the migration must not proceed without a rollback artifact.
  */
-export async function snapshotDbWalSafe(): Promise<string> {
+export async function snapshotDbWalSafe(label: 'upgrade' | 'retrieval' | 'codex-rekey' = 'retrieval'): Promise<string> {
   const dbFile = dbPath();
-  const dest = join(dirname(dbFile), `recall.db.pre-retrieval-${backupStamp()}`);
+  const dest = `${dbFile}.pre-${label}-${backupStamp()}`;
   const raw = openRaw(dbFile, { readonly: true });
   if (!raw) {
     throw new RetrievalMigrationAbort(
@@ -202,6 +202,7 @@ export async function snapshotDbWalSafe(): Promise<string> {
 // ---------------------------------------------------------------------------
 
 interface CodexChildEvidence {
+  agentMeta: Record<string, unknown> | null;
   sessionId: string;
   parentSessionId: string | null;
   depth: number | null;
@@ -234,27 +235,16 @@ function collectCodexEvidence(d: RecallDb): CodexEvidence {
     if (!existsSync(p)) continue;
     const meta = extractCodexSessionMeta(p);
     if (!meta?.id) continue;
-    const sub = meta.source && typeof meta.source === 'object'
-      ? (meta.source as { subagent?: unknown }).subagent
-      : undefined;
-    if (sub !== undefined && (typeof sub !== 'object' || sub === null)) {
-      log({
-        source: 'installer/retrieval-migration',
-        level: 'warn',
-        summary: `malformed subagent provenance in ${p} — leaving session hot (conservative)`,
-      });
-      roots.add(meta.id);
+    const sub = parseSubagentSource(meta.source, p);
+    if (sub.malformed) {
+      log({ source: 'installer/retrieval-migration', level: 'warn',
+        summary: `malformed subagent provenance in ${p} — leaving session hot (conservative)` });
+      // Unknown evidence is not a confident root.
       continue;
     }
-    if (sub) {
-      const spawn = (sub as Record<string, unknown>).thread_spawn;
-      const spawnObj = spawn && typeof spawn === 'object' ? spawn as Record<string, unknown> : {};
-      children.push({
-        sessionId: meta.id,
-        parentSessionId: typeof spawnObj.parent_thread_id === 'string' ? spawnObj.parent_thread_id : null,
-        depth: typeof spawnObj.depth === 'number' ? spawnObj.depth : null,
-        transcriptPath: p.replace(/\\/g, '/'),
-      });
+    if (sub.isSubagent) {
+      children.push({ agentMeta: sub.meta, sessionId: meta.id, parentSessionId: sub.parentThreadId,
+        depth: sub.depth, transcriptPath: p.replace(/\\/g, '/') });
     } else {
       roots.add(meta.id);
     }
@@ -371,22 +361,23 @@ export async function runRetrievalClassMigration(
 
     // Durable provenance for everything classified (and confident roots).
     const upsertProv = d.prepare(
-      `INSERT INTO session_provenance (session_id, vendor, kind, parent_session_id, agent_depth, transcript_path, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO session_provenance (session_id, vendor, kind, parent_session_id, agent_depth, agent_meta, transcript_path, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(session_id) DO UPDATE SET
          kind = excluded.kind,
          parent_session_id = COALESCE(excluded.parent_session_id, session_provenance.parent_session_id),
          agent_depth = COALESCE(excluded.agent_depth, session_provenance.agent_depth),
+         agent_meta = COALESCE(excluded.agent_meta, session_provenance.agent_meta),
          transcript_path = COALESCE(excluded.transcript_path, session_provenance.transcript_path),
          updated_at = excluded.updated_at`,
     );
     const now = Date.now();
     for (const sid of claudeLeaves) {
       const enrich = claudeParents.get(sid);
-      upsertProv.run([sid, 'claude', 'agent', enrich?.parent ?? null, null, enrich?.path ?? null, now]);
+      upsertProv.run([sid, 'claude', 'agent', enrich?.parent ?? null, null, null, enrich?.path ?? null, now]);
     }
     for (const c of codex.children) {
-      upsertProv.run([c.sessionId, 'codex', 'agent', c.parentSessionId, c.depth, c.transcriptPath, now]);
+      upsertProv.run([c.sessionId, 'codex', 'agent', c.parentSessionId, c.depth, c.agentMeta ? JSON.stringify(c.agentMeta) : null, c.transcriptPath, now]);
     }
 
     // 6c. Unresolved: codex-shaped sessions (codex-jsonl-* message ids) that

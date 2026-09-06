@@ -13,7 +13,7 @@ import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { _setTestRoot, dbPath } from '../../src/paths.js';
 import { _resetDb, getDb } from '../../src/db.js';
-import { classifySession } from '../../src/recall/session-classifier.js';
+import { classifySession, parseSubagentSource } from '../../src/recall/session-classifier.js';
 import {
   extractCodexSessionMeta, findCodexSessionFile, scanCodexSessionFiles,
 } from '../../src/adapters/codex/codex-jsonl-reader.js';
@@ -217,5 +217,17 @@ describe('codex reader honors CODEX_HOME (no hardcoded ~/.codex)', () => {
     const scanned = scanCodexSessionFiles();
     expect(scanned).toHaveLength(1);
     expect(scanned[0]!.sessionId).toBe(CHILD_UUID);
+  });
+});
+
+describe('shared Codex source parser', () => {
+  it.each(['review', 'compact', 'memory_consolidation'])('classifies %s enum children', (kind) => {
+    expect(parseSubagentSource({ subagent: kind }, '')).toMatchObject({ isSubagent: true, malformed: false, meta: { type: kind } });
+  });
+  it('keeps typed child parity and Codex role/nickname metadata', () => {
+    expect(parseSubagentSource({ type: 'subagent', thread_spawn: {
+      parent_thread_id: PARENT_UUID, depth: 2, agent_role: 'explorer', agent_nickname: 'Ada',
+    } }, '')).toMatchObject({ isSubagent: true, parentThreadId: PARENT_UUID, depth: 2,
+      meta: { agent_role: 'explorer', agent_nickname: 'Ada' } });
   });
 });

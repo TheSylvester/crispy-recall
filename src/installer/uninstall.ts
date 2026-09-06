@@ -34,8 +34,11 @@ export function runUninstall(opts: UninstallOptions = {}): UninstallResult {
   }
 
   // Hook entries (path-independent removal).
-  if (removeStopHook(claudeSettingsPath()).changed) removed.push(claudeSettingsPath());
-  if (removeStopHook(codexHooksPath()).changed) removed.push(codexHooksPath());
+  for (const path of [claudeSettingsPath(), codexHooksPath()]) {
+    const result = removeStopHook(path);
+    if (result.changed) removed.push(path);
+    if (result.backup) process.stderr.write(`Hook backup: ${result.backup}\n`);
+  }
 
   // CLAUDE.md / AGENTS.md nudge.
   if (removeNudge(claudeMdPath()).changed) removed.push(claudeMdPath());

@@ -92,7 +92,7 @@ export async function runCodexRekeyMigration(
   // so an idempotent re-run never copies a gigabyte. A failure propagates:
   // install.ts phase 6.8 restores the quiesced hooks and aborts.
   const { snapshotDbWalSafe } = await import('./retrieval-class-migration.js');
-  result.snapshotPath = await snapshotDbWalSafe();
+  result.snapshotPath = await snapshotDbWalSafe('codex-rekey');
   say(`codex-rekey: snapshot ${result.snapshotPath}`);
 
   // Enumerate from `messages`, NEVER from session_provenance: on the live hub

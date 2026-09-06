@@ -315,7 +315,7 @@ interface SubagentSource {
  *   - `source.type === 'subagent'` with the same nested fields
  * Anything subagent-like but non-object → malformed (conservative root).
  */
-function parseSubagentSource(
+export function parseSubagentSource(
   source: Record<string, unknown> | undefined,
   _transcriptPath: string,
 ): SubagentSource {
@@ -327,7 +327,10 @@ function parseSubagentSource(
   const looksSubagent = subRaw !== undefined || typeTag === 'subagent';
   if (!looksSubagent) return none;
 
-  if (subRaw !== undefined && (typeof subRaw !== 'object' || subRaw === null)) {
+  if (typeof subRaw === 'string' && ['review', 'compact', 'memory_consolidation'].includes(subRaw)) {
+    return { ...none, isSubagent: true, meta: { type: subRaw } };
+  }
+  if (subRaw !== undefined && (typeof subRaw !== 'object' || subRaw === null || Array.isArray(subRaw))) {
     return { ...none, malformed: true };
   }
 
@@ -344,7 +347,7 @@ function parseSubagentSource(
 
   // Bounded metadata bag: keep the interesting scalar fields only.
   const meta: Record<string, unknown> = {};
-  for (const k of ['agent_path', 'agent_type', 'agent_name', 'path', 'type', 'name']) {
+  for (const k of ['agent_path', 'agent_type', 'agent_name', 'agent_nickname', 'agent_role', 'path', 'type', 'name']) {
     const v = spawn[k] ?? sub[k];
     if (typeof v === 'string' || typeof v === 'number') meta[k] = v;
   }

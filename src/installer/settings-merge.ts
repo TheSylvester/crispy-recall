@@ -2,8 +2,8 @@
  * settings-merge — idempotent JSON hook merge for ~/.claude/settings.json
  * and ~/.codex/hooks.json.
  *
- * Treats any existing array entry whose `command` references the recall
- * stop-hook script — at ANY path — as a recall entry it owns. Running
+ * Owns only direct Node invocations of the recall stop-hook script; preserves
+ * foreign commands and prompt hooks even when grouped beside recall. Running
  * `install` twice produces the same file as running it once. Preserves the
  * file's dominant line ending and indentation; backs up before the first edit.
  *
@@ -11,9 +11,10 @@
  */
 
 import { existsSync, readFileSync, writeFileSync, copyFileSync, renameSync, unlinkSync } from 'node:fs';
+import { join } from 'node:path';
 import { stableNodePath } from './stable-node.js';
 import { readConfig } from './config.js';
-import { statuslineScript } from '../paths.js';
+import { statuslineScript, binDir } from '../paths.js';
 
 const HOOK_ARRAYS = ['Stop', 'SubagentStop'] as const;
 
@@ -99,11 +100,17 @@ function serialize(obj: SettingsShape, raw: string | null): string {
 // Recall-entry detection (path-independent)
 // ---------------------------------------------------------------------------
 
-/** A command is a recall stop-hook if it references stop-hook.js AND carries a
- *  `recall` marker in the path — catches stale entries at a different path. */
+/** Own only a direct two-token invocation, including the legacy unquoted form.
+ * Shell wrappers and commands that merely mention our script belong to users. */
 function isRecallCommand(cmd: string | undefined): boolean {
-  if (!cmd) return false;
-  return /stop-hook\.js/.test(cmd) && /recall/i.test(cmd);
+  if (typeof cmd !== 'string') return false;
+  const m = /^\s*(?:"([^"\r\n]+)"|([^\s"'`;|&<>$()]+))\s+(?:"([^"\r\n]+)"|([^\s"'`;|&<>$()]+))\s*$/.exec(cmd);
+  if (!m) return false;
+  const executable = (m[1] ?? m[2]!).replace(/\\/g, '/').split('/').pop();
+  const script = m[3] ?? m[4]!;
+  if (!/^node(?:\.exe)?$/i.test(executable ?? '')) return false;
+  return /(?:^|[\\/])stop-hook\.js$/.test(script) &&
+    (/(^|[\\/])\.recall[\\/]/.test(script) || script === join(binDir(), 'stop-hook.js'));
 }
 
 function findRecallEntry(arr: HookEntry[]): { entry: HookEntry; cmd: HookCommand } | null {
@@ -237,11 +244,12 @@ export function removeStopHook(filePath: string): MergeResult {
   for (const name of HOOK_ARRAYS) {
     const arr = obj.hooks[name];
     if (!Array.isArray(arr)) continue;
-    const kept = arr.filter((entry) => {
-      const hooks = entry.hooks;
-      const isRecall = Array.isArray(hooks) && hooks.some((h) => isRecallCommand(h.command));
-      if (isRecall) changed = true;
-      return !isRecall;
+    const kept = arr.flatMap((entry) => {
+      if (!Array.isArray(entry.hooks)) return [entry];
+      const hooks = entry.hooks.filter((h) => !isRecallCommand(h.command));
+      if (hooks.length === entry.hooks.length) return [entry];
+      changed = true;
+      return hooks.length ? [{ ...entry, hooks }] : [];
     });
     if (kept.length === 0) {
       delete obj.hooks[name];

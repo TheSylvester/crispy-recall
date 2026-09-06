@@ -24,7 +24,7 @@
  * the same code path Claude Code triggers in production.
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { mkdirSync, rmSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -206,4 +206,21 @@ describe('stop-hook concurrency', () => {
     }
     expect(elapsed).toBeLessThan(PERF_HANG_MS);
   }, 30_000);
+});
+
+describe('malformed Stop payload fail-open contract', () => {
+  it.each(['null', '[]', '42', 'false', '"str"', '', '{',
+    '{"agent_transcript_path":42}', '{"agent_transcript_path":{}}',
+    '{"transcript_path":42,"session_id":"s"}', '{"transcript_path":"x","session_id":42}',
+  ])('exits silently with zero for %s', (input) => {
+    const home = join(tmpdir(), `recall-malformed-${randomUUID()}`);
+    try {
+      const result = spawnSync(process.execPath, [HOOK_BUNDLE], {
+        input, encoding: 'utf8', timeout: 10_000, env: { ...process.env, RECALL_HOME: home },
+      });
+      expect(result.status).toBe(0);
+      expect(result.stderr).toBe('');
+      expect(existsSync(join(home, 'recall.db'))).toBe(false);
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  });
 });

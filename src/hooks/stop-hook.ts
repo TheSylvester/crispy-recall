@@ -74,6 +74,11 @@ export interface IngestTarget {
  * `agent_id` as an alias when it differs.
  */
 export function resolveIngestTarget(payload: StopHookPayload): IngestTarget | null {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return null;
+  if (payload.agent_transcript_path != null && typeof payload.agent_transcript_path !== 'string') return null;
+  if (payload.transcript_path != null && typeof payload.transcript_path !== 'string') return null;
+  if (payload.session_id != null && typeof payload.session_id !== 'string') return null;
+  if (payload.agent_id != null && typeof payload.agent_id !== 'string') return null;
   if (payload.agent_transcript_path) {
     const transcriptPath = payload.agent_transcript_path;
     const base = transcriptPath.replace(/\\/g, '/').split('/').pop()!.replace(/\.jsonl$/i, '');
@@ -109,6 +114,7 @@ async function runStopHook(): Promise<void> {
   for await (const chunk of process.stdin) data += chunk;
   let payload: StopHookPayload;
   try { payload = JSON.parse(data); } catch { process.exit(0); }
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) process.exit(0);
   if (payload.stop_hook_active) process.exit(0); // recursion guard
   const target = resolveIngestTarget(payload);
   if (!target) process.exit(0);
@@ -204,5 +210,8 @@ async function runStopHook(): Promise<void> {
 declare const require: NodeJS.Require | undefined;
 declare const module: NodeJS.Module | undefined;
 if (typeof require !== "undefined" && typeof module !== "undefined" && require.main === module) {
-  void runStopHook();
+  void runStopHook().catch((error: unknown) => {
+    logStopHook(`${new Date().toISOString()} hook-failed err=${String(error)}\n`);
+    process.exit(0);
+  });
 }

@@ -561,6 +561,7 @@ export async function runInstall(opts: InstallOptions = {}): Promise<InstallResu
         captureHookFile(p);
         const r = removeStopHook(p);
         if (r.changed) filesWritten.push(p);
+        if (r.backup) say(`hook backup: ${r.backup}`);
       }
       say('upgrade: quiesced Stop hooks before migration');
     }
@@ -618,8 +619,8 @@ export async function runInstall(opts: InstallOptions = {}): Promise<InstallResu
     // ---- 5.5 Pre-flip snapshot (upgrade only) — rollback artifact before the
     // native binding flips the delete-mode DB to WAL. ----
     if (migration.state === 'needs-migration') {
-      snapshotPath = snapshotDb() ?? undefined;
-      say(snapshotPath ? `pre-upgrade snapshot: ${snapshotPath}` : 'pre-upgrade snapshot skipped (no DB / copy failed)');
+      snapshotPath = await snapshotDb();
+      say(`pre-upgrade snapshot: ${snapshotPath}`);
     }
 
     // ---- 6. Init DB (implicit WAL flip on an upgrade) ----

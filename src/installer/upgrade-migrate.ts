@@ -17,13 +17,12 @@
  * @module installer/upgrade-migrate
  */
 
-import { existsSync, copyFileSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import Database from 'better-sqlite3';
 import { getDb, _resetDb, resolveNativeBindingPath } from '../db.js';
 import { dbPath, binDir, runDir } from '../paths.js';
 import { EMBED_VERSION } from '../recall/embed-config.js';
-import { backupStamp } from './settings-merge.js';
 import { log } from '../log.js';
 
 // ---------------------------------------------------------------------------
@@ -127,27 +126,11 @@ export function classifyUpgrade(): UpgradeClassification {
 // Snapshot (rollback artifact, BEFORE the flip)
 // ---------------------------------------------------------------------------
 
-/**
- * Copy the (quiesced, delete-mode) DB to `${dbPath}.pre-upgrade-<stamp>` as a
- * rollback artifact. Derived from dbPath() so under a test's RECALL_HOME it
- * stays inside the temp root and never escapes to the live tree. Best-effort —
- * returns the snapshot path, or null if there's nothing to copy / the copy failed.
- */
-export function snapshotDb(): string | null {
-  const dbFile = dbPath();
-  if (!existsSync(dbFile)) return null;
-  const dest = `${dbFile}.pre-upgrade-${backupStamp()}`;
-  try {
-    copyFileSync(dbFile, dest);
-    // A crashed delete-mode writer may have left a hot rollback journal — copy it
-    // too so the snapshot stays self-consistent.
-    const journal = `${dbFile}-journal`;
-    if (existsSync(journal)) copyFileSync(journal, `${dest}-journal`);
-    return dest;
-  } catch (e) {
-    log({ source: 'installer/upgrade', level: 'warn', summary: `pre-upgrade snapshot failed: ${(e as Error).message}` });
-    return null;
-  }
+/** Take an online, WAL-safe rollback artifact before changing journal mode.
+ * Failure must abort the installer before any database migration. */
+export async function snapshotDb(): Promise<string> {
+  const { snapshotDbWalSafe } = await import('./retrieval-class-migration.js');
+  return snapshotDbWalSafe('upgrade');
 }
 
 // ---------------------------------------------------------------------------
