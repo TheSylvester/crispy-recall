@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.4.0-sat.5 (experimental, unreleased)
+## 0.4.0-sat.6 (experimental, unreleased)
 
 - Preserve foreign commands and prompt hooks grouped beside recall during install, migration, and uninstall; retain user wrapper commands.
 - Bound failed embedding retries, sanitize NUL input, and report stalled messages in status/doctor. Unreadable transcripts now fail visibly without advancing watermarks or purging existing history.
