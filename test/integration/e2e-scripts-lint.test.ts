@@ -23,7 +23,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readdirSync, readFileSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -115,13 +115,6 @@ describe('contrib/satellite/e2e — script lint', () => {
     for (const [i, l] of code(f).entries()) {
       expect(l, `${f} line ${i + 1}`).not.toMatch(/(^|[^\w-])ssh /);
       expect(l, `${f} line ${i + 1}`).not.toMatch(/cmd\.exe/);
-    }
-  });
-
-  it.each(SCRIPTS)('%s puts no double quote on a cmd.exe /c line', (f) => {
-    for (const l of lines(f)) {
-      const at = l.indexOf('cmd.exe /c');
-      if (at >= 0) expect(l.slice(at).includes('"'), `${f}: ${l.trim()}`).toBe(false);
     }
   });
 
@@ -253,5 +246,108 @@ describe('contrib/satellite/e2e — script lint', () => {
     const readme = readFileSync(join(DIR, 'README.md'), 'utf8');
     const named = new Set([...readme.matchAll(/`([0-9]{2}-[a-z0-9-]+\.sh)`/g)].map((m) => m[1]));
     expect([...named].sort()).toEqual(RUNNABLE);
+  });
+});
+
+// Execute only isolated helpers / the install selection block, with fake tools.
+// No SSH, WSL interop, npm install, or acceptance script body can reach a host.
+describe('E2E candidate and Windows command regressions', () => {
+  it.each([false, true])('selects the installed candidate with nvm on PATH (stale=%s)', (stale) => {
+    const tmp = mkdtempSync(join(tmpdir(), 'e2e-candidate-'));
+    try {
+      const nvm = join(tmp, 'nvm bin');
+      mkdirSync(nvm);
+      writeFileSync(join(nvm, 'recall'), '#!/bin/bash\necho old-nvm-release\n', { mode: 0o755 });
+      // Fake npm installs a fake CLI into precisely the requested --prefix.
+      writeFileSync(join(nvm, 'npm'), `#!/bin/bash
+[ "$1 $2 $3" = 'install -g --prefix' ] || exit 9
+mkdir -p "$4/bin"
+printf '#!/bin/bash\\necho ${stale ? 'wrong-version' : '0.4.0-candidate'}\\n' > "$4/bin/recall"
+chmod +x "$4/bin/recall"
+`, { mode: 0o755 });
+      const script = text('40-laptop-install.sh');
+      const block = script.slice(script.indexOf('INST=$(lap '), script.indexOf('step "installing in satellite mode'));
+      const result = spawnSync('bash', ['-c', `
+source "$1/lib.sh"
+NAME=test
+EXPECTED_VERSION=0.4.0-candidate
+lap() { bash -c "$1"; }
+${block}
+` , '_', DIR], {
+        env: { PATH: '/usr/bin:/bin', HOME: tmp, RECALL_E2E_LOG_DIR: tmp,
+          RECALL_E2E_LAPTOP_HOME: tmp, RECALL_E2E_LAPTOP_PATH_PREFIX: nvm }, encoding: 'utf8',
+      });
+      expect(result.status, result.stderr).toBe(stale ? 1 : 0);
+      expect(result.stdout).toContain(join(tmp, '.local/bin/recall'));
+      if (stale) expect(result.stderr).toContain('does not match tarball');
+      else expect(result.stderr).toBe('');
+      // Subsequent acceptance commands also resolve the new candidate.
+      if (!stale) {
+        const out = execFileSync('bash', ['-c', 'source "$1/lib.sh"; eval "export PATH=\\\"$LAPTOP_PATH_PREFIX:$PATH\\\""; recall', '_', DIR], {
+          env: { PATH: '/usr/bin:/bin', HOME: tmp, RECALL_E2E_LOG_DIR: tmp,
+            RECALL_E2E_LAPTOP_HOME: tmp, RECALL_E2E_LAPTOP_PATH_PREFIX: nvm }, encoding: 'utf8',
+        });
+        expect(out.trim()).toBe('0.4.0-candidate');
+      }
+    } finally { rmSync(tmp, { recursive: true, force: true }); }
+  });
+
+  it('rejects an old nvm binary override before remote installation', () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'e2e-override-'));
+    try {
+      const script = text('40-laptop-install.sh');
+      const guard = script.slice(script.indexOf('[ "${RECALL_E2E_LAPTOP_RECALL_BIN'), script.indexOf('EXPECTED_VERSION='));
+      const result = spawnSync('bash', ['-c', `source "$1/lib.sh"; NAME=test; ${guard}`, '_', DIR], {
+        env: { PATH: '/usr/bin:/bin', HOME: tmp, RECALL_E2E_LOG_DIR: tmp,
+          RECALL_E2E_LAPTOP_HOME: tmp, RECALL_E2E_LAPTOP_RECALL_BIN: `${tmp}/nvm/recall` }, encoding: 'utf8',
+      });
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('the candidate install');
+      expect(script.indexOf('RECALL_E2E_LAPTOP_RECALL_BIN')).toBeLessThan(script.indexOf('OLD=$(lap'));
+    } finally { rmSync(tmp, { recursive: true, force: true }); }
+  });
+
+  it('reads the expected version from tarball metadata, not the filename', () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'e2e-version-'));
+    try {
+      mkdirSync(join(tmp, 'package'));
+      writeFileSync(join(tmp, 'package/package.json'), JSON.stringify({ version: '0.4.0-candidate' }));
+      const tgz = join(tmp, 'misleading-name.tgz');
+      execFileSync('tar', ['czf', tgz, '-C', tmp, 'package']);
+      const script = text('40-laptop-install.sh');
+      const block = script.slice(script.indexOf('EXPECTED_VERSION='), script.indexOf('mask()'));
+      const out = execFileSync('bash', ['-c', `TGZ=$1; ${block}\nprintf '%s' "$EXPECTED_VERSION"`, '_', tgz], { encoding: 'utf8' });
+      expect(out).toBe('0.4.0-candidate');
+    } finally { rmSync(tmp, { recursive: true, force: true }); }
+  });
+
+  it('runs relative batch names from a spaced Windows profile directory and preserves failure', () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'e2e-win-'));
+    try {
+      const dir = join(tmp, 'Alex Smith', 'Temp');
+      const out = spawnSync('bash', ['-c', `
+source "$1/lib.sh"
+WIN_DIR=$2
+# Replace the entire process-launch boundary: no cmd.exe is executed.
+timeout() { printf 'cwd=%s\\n' "$PWD"; printf 'arg=<%s>\\n' "$@"; return 7; }
+win_cmd sample <<'CMD'
+@echo off
+exit /b %ERRORLEVEL%
+CMD
+`, '_', DIR, dir], {
+        env: { PATH: '/usr/bin:/bin', HOME: tmp, RECALL_E2E_LOG_DIR: tmp, RECALL_E2E_WIN_USER: 'Alex Smith' }, encoding: 'utf8',
+      });
+      expect(out.status).toBe(7);
+      expect(out.stdout).toBe(`cwd=${dir}\narg=<300>\narg=<cmd.exe>\narg=</c>\narg=<sample.cmd>\n`);
+      expect(readFileSync(join(dir, 'sample.cmd'), 'utf8')).toBe('@echo off\r\nexit /b %ERRORLEVEL%\r\n');
+    } finally { rmSync(tmp, { recursive: true, force: true }); }
+  });
+
+  it.each(WINDOWS_SCRIPTS)('%s quotes derived Windows batch paths', (f) => {
+    const bodies = [...text(f).matchAll(/<<'?CMD'?\n([\s\S]*?)\nCMD\b/g)].map((m) => m[1]);
+    for (const body of bodies) {
+      expect(body).not.toMatch(/call \$WIN_(?:RECALL|CLAUDE)_W/);
+      expect(body).not.toMatch(/(?:-g |<)\$WIN_DIR_W/);
+    }
   });
 });

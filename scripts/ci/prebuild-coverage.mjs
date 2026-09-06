@@ -10,8 +10,10 @@
  *
  * ROLE-HONEST: recall has two roles with two different floors.
  *   - HUB majors (what `checkNode` in src/installer/preflight.ts accepts: 22,
- *     24, 25, 26) load the native binding. They MUST have darwin AND linux AND
- *     win32 prebuilds — a gap is a hard FAIL.
+ *     24, 25, 26) load the native binding. They MUST have a prebuild for EVERY
+ *     documented OS/architecture pair (README "Requirements": Linux x64/arm64,
+ *     macOS x64/arm64, Windows x64) — a missing pair is a hard FAIL even when
+ *     the other architecture of that OS is present.
  *   - SATELLITE_ONLY majors (20) never load the binding. npm still installs the
  *     dependency and compiles it from source, which is a documented, accepted
  *     cost (python3 + make + a C/C++ compiler must be present). Reported, never
@@ -19,14 +21,14 @@
  *   - Anything else `engines` admits is a FAIL: either it needs prebuilds it
  *     does not have, or nobody decided what role it plays.
  *
- * EXHAUSTIVE: `engines` is probed over Node majors 18..30, so a major that it
- * admits but the table does not know about FAILs loudly instead of being
- * silently skipped (the pre-fix bug: the table started at 22, so admitted majors
- * 20 and 21 were never even considered). The one exception is the open upper
- * end: `>=24.0.0` necessarily admits majors that do not exist yet, so admitted
- * majors ABOVE the highest entry in the ABI table are reported as future work
- * (extend the table when that Node ships) rather than failed. Every admitted
- * major at or below the table's horizon must have an entry.
+ * KNOWN-MAJOR HORIZON: this guard evaluates the Node majors in its ABI table
+ * (20..26 today) and every major below that horizon that `engines` admits (an
+ * admitted major with no table entry FAILs instead of being skipped — the
+ * pre-fix bug: the table started at 22, so admitted 20 and 21 were never
+ * considered). `engines` ends in an open `>=24.0.0`, so majors ABOVE the
+ * horizon are admitted at install time but are NOT evaluated here; the report
+ * says so. When Node 27+ ships and support is verified, extend ABI (and
+ * HUB_MAJORS) — nothing here predicts or vouches for an unreleased major.
  *
  * Input is the resolved better-sqlite3 release asset names (one per line,
  * produced by `gh api .../releases/tags/vX --jq '.assets[].name'`).
@@ -46,11 +48,11 @@ export const HUB_MAJORS = [22, 24, 25, 26];
 /** Majors supported for SATELLITES only — no prebuild needed, source build is fine. */
 export const SATELLITE_ONLY = [20];
 
-/** Platforms a hub major must have a prebuild for. */
-export const REQUIRED_PLATFORMS = ['darwin', 'linux', 'win32'];
+/** OS/architecture pairs a hub major must have a prebuild for (README "Requirements"). */
+export const REQUIRED_TARGETS = ['darwin-arm64', 'darwin-x64', 'linux-arm64', 'linux-x64', 'win32-x64'];
 
-/** Node majors probed against `engines`. Wide enough to catch anything real. */
-const PROBE_MAJORS = Array.from({ length: 13 }, (_, i) => 18 + i); // 18..30
+/** Lowest major probed below the table for admitted-but-unknown majors. */
+const PROBE_FLOOR = 14;
 
 // --- minimal semver range satisfaction (enough for our engines strings) ---
 function cmp(a, b) {
@@ -85,51 +87,49 @@ export function majorAllowed(maj, range) {
  *
  * @param {string} enginesString  package.json engines.node
  * @param {string[]} assetNames   better-sqlite3 release asset names
- * @returns {{allowed:number[], hub:number[], satelliteOnly:number[], gaps:object[], problems:string[], report:string}}
+ * @returns {{allowed:number[], hub:number[], satelliteOnly:number[], horizon:number, openAboveHorizon:boolean, gaps:object[], problems:string[], report:string}}
  */
 export function evaluateCoverage(enginesString, assetNames, opts = {}) {
   const bsqlVersion = opts.bsqlVersion ?? 'unknown';
 
-  // ABI -> Set(platforms) from `...-node-v<ABI>-<platform>-<arch>.tar.gz`.
+  // ABI -> Set("<os>-<arch>") from `...-node-v<ABI>-<os>-<arch>.tar.gz`.
   const byAbi = new Map();
   for (const a of assetNames) {
-    // The trailing `-` is load-bearing: without it `linuxmusl-x64` matches
-    // `linux` and a missing glibc linux prebuild would be masked by a musl one.
-    const m = String(a).match(/node-v(\d+)-(darwin|linux|win32)-/);
+    // Anchored on `-` and `.tar.gz` so `linuxmusl-x64` can never stand in for
+    // the glibc `linux-x64` prebuild.
+    const m = String(a).match(/node-v(\d+)-(darwin|linux|win32)-([a-z0-9]+)\.tar\.gz$/);
     if (!m) continue; // electron-*, linuxmusl-*, checksums: not our runtime
     const abi = Number(m[1]);
     if (!byAbi.has(abi)) byAbi.set(abi, new Set());
-    byAbi.get(abi).add(m[2]);
+    byAbi.get(abi).add(`${m[2]}-${m[3]}`);
   }
-  const platformsFor = (maj) => [...(byAbi.get(ABI[maj]) ?? new Set())].sort();
+  const targetsFor = (maj) => [...(byAbi.get(ABI[maj]) ?? new Set())].sort();
 
-  const allowed = PROBE_MAJORS.filter((maj) => majorAllowed(maj, enginesString));
+  const horizon = Math.max(...Object.keys(ABI).map(Number));
+  const probe = Array.from({ length: horizon - PROBE_FLOOR + 1 }, (_, i) => PROBE_FLOOR + i);
+  const allowed = probe.filter((maj) => majorAllowed(maj, enginesString));
+  // Does `engines` admit anything past the horizon? Reported, not evaluated.
+  const openAboveHorizon = majorAllowed(horizon + 1, enginesString);
   const problems = [];
   const gaps = [];
 
-  // The ABI table's horizon: the newest major whose ABI we know. `engines` ends
-  // in an open `>=24.0.0`, so anything above the horizon is an unreleased major,
-  // not a hole in the table.
-  const horizon = Math.max(...Object.keys(ABI).map(Number));
-  const future = allowed.filter((maj) => maj > horizon);
-
-  // Exhaustiveness: an admitted major at or below the horizon with no ABI entry
-  // is a FAIL, never a silent skip.
-  const unknown = allowed.filter((maj) => maj <= horizon && ABI[maj] === undefined);
+  // An admitted major at or below the horizon with no ABI entry is a FAIL,
+  // never a silent skip.
+  const unknown = allowed.filter((maj) => ABI[maj] === undefined);
   for (const maj of unknown) {
     problems.push(
       `Node ${maj} is allowed by engines but has no entry in the ABI table — add it (with its NODE_MODULE_VERSION) and decide its role`,
     );
   }
 
-  const known = allowed.filter((maj) => maj <= horizon && ABI[maj] !== undefined);
+  const known = allowed.filter((maj) => ABI[maj] !== undefined);
   const hub = known.filter((maj) => HUB_MAJORS.includes(maj));
   const satelliteOnly = known.filter((maj) => SATELLITE_ONLY.includes(maj) && !HUB_MAJORS.includes(maj));
   const unclassified = known.filter((maj) => !HUB_MAJORS.includes(maj) && !SATELLITE_ONLY.includes(maj));
 
   for (const maj of hub) {
-    const have = platformsFor(maj);
-    const missing = REQUIRED_PLATFORMS.filter((p) => !have.includes(p));
+    const have = targetsFor(maj);
+    const missing = REQUIRED_TARGETS.filter((t) => !have.includes(t));
     if (missing.length) {
       gaps.push({ major: maj, abi: ABI[maj], missing });
       problems.push(
@@ -155,23 +155,22 @@ export function evaluateCoverage(enginesString, assetNames, opts = {}) {
   const lines = [];
   lines.push(`## prebuild-coverage — better-sqlite3 v${bsqlVersion}`);
   lines.push('');
-  lines.push(`engines.node = \`${enginesString}\` → allowed majors: ${allowed.join(', ') || '(none)'}`);
+  lines.push(`engines.node = \`${enginesString}\` → evaluated majors (known table ${Math.min(...Object.keys(ABI).map(Number))}–${horizon}): ${allowed.join(', ') || '(none)'}`);
   lines.push('');
-  lines.push('| Node major | ABI | role | node prebuilds | verdict |');
+  lines.push('| Node major | ABI | role | node prebuilds (os-arch) | verdict |');
   lines.push('| --- | --- | --- | --- | --- |');
   for (const maj of allowed) {
-    if (maj > horizon) continue; // summarised as "future majors" below
     const abi = ABI[maj];
     if (abi === undefined) {
       lines.push(`| ${maj} | ? | UNKNOWN | ? | ❌ not in the ABI table |`);
       continue;
     }
-    const have = platformsFor(maj);
+    const have = targetsFor(maj);
     const role = HUB_MAJORS.includes(maj) ? 'hub' : SATELLITE_ONLY.includes(maj) ? 'satellite-only' : 'UNCLASSIFIED';
     let verdict;
     if (role === 'hub') {
-      const missing = REQUIRED_PLATFORMS.filter((p) => !have.includes(p));
-      verdict = missing.length ? `❌ MISSING ${missing.join(', ')}` : '✅ darwin + linux + win32';
+      const missing = REQUIRED_TARGETS.filter((t) => !have.includes(t));
+      verdict = missing.length ? `❌ MISSING ${missing.join(', ')}` : `✅ all ${REQUIRED_TARGETS.length} documented os-arch pairs`;
     } else if (role === 'satellite-only') {
       verdict = have.length
         ? `✅ prebuilt (${have.join(', ')})`
@@ -186,16 +185,11 @@ export function evaluateCoverage(enginesString, assetNames, opts = {}) {
       lines.push(`| ~~${maj}~~ | ${ABI[maj]} | — | (none) | excluded by engines (no prebuild) |`);
     }
   }
-  if (future.length) {
-    lines.push(
-      `| ${future[0]}+ | ? | future | — | ℹ️ beyond the ABI table horizon (Node ${horizon}) — extend ABI when it ships |`,
-    );
-  }
   lines.push('');
   lines.push(
     gaps.length
       ? `**Hub coverage gaps:** ${gaps.map((g) => `Node ${g.major} (ABI ${g.abi}) missing ${g.missing.join('/')}`).join('; ')}`
-      : '**No hub coverage gaps.**',
+      : `**No hub coverage gaps** over the documented pairs (${REQUIRED_TARGETS.join(', ')}).`,
   );
   if (satelliteOnly.length) {
     lines.push('');
@@ -203,9 +197,15 @@ export function evaluateCoverage(enginesString, assetNames, opts = {}) {
       `**Satellite-only majors:** ${satelliteOnly.join(', ')} — no prebuild, so npm compiles better-sqlite3 from source. python3, make and a C/C++ compiler must be present even though a satellite never loads the binding.`,
     );
   }
+  lines.push('');
+  lines.push(
+    openAboveHorizon
+      ? `**Horizon:** this guard evaluates Node majors up to ${horizon} (the ABI table). \`engines\` also admits later majors at install time; they are NOT evaluated or vouched for here — extend the ABI table (and HUB_MAJORS) when a newer Node is verified.`
+      : `**Horizon:** this guard evaluates Node majors up to ${horizon} (the ABI table); \`engines\` admits nothing beyond it.`,
+  );
   const report = lines.join('\n') + '\n';
 
-  return { allowed, hub, satelliteOnly, future, gaps, problems: [...new Set(problems)], report };
+  return { allowed, hub, satelliteOnly, horizon, openAboveHorizon, gaps, problems: [...new Set(problems)], report };
 }
 
 // --- CLI ---------------------------------------------------------------------
@@ -237,8 +237,9 @@ function main(argv) {
   }
 
   console.log(
-    `prebuild-coverage OK — engines-allowed majors: ${allowed.join(', ')}; hub majors have darwin+linux+win32 prebuilds` +
-      (satelliteOnly.length ? `; satellite-only (source build): ${satelliteOnly.join(', ')}` : ''),
+    `prebuild-coverage OK — evaluated majors: ${allowed.join(', ')}; hub majors have every documented os-arch prebuild` +
+      (satelliteOnly.length ? `; satellite-only (source build): ${satelliteOnly.join(', ')}` : '') +
+      ' (known-major horizon only)',
   );
   return 0;
 }

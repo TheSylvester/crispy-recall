@@ -276,11 +276,11 @@ lap_put() { # $1 local file, $2 remote absolute path — no SFTP on this tailnet
 # win_cmd <name>  — the .cmd body is read from this function's stdin.
 win_cmd() {
   local name=$1 rc
+  [[ "$name" =~ ^[A-Za-z0-9_-]+$ ]] || return 2
   mkdir -p "$WIN_DIR"
   sed 's/$/\r/' > "$WIN_DIR/$name.cmd"
   # WSL maps this DrvFs working directory to Windows. A relative batch name
   # avoids cmd.exe /c quote stripping for profiles with spaces.
-  [[ "$name" =~ ^[A-Za-z0-9_-]+$ ]] || return 2
   ( cd "$WIN_DIR" && timeout "$WIN_TIMEOUT" cmd.exe /c "$name.cmd" ) 2>&1 | tr -d '\r'
   rc=${PIPESTATUS[0]}
   return "$rc"

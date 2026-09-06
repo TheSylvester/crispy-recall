@@ -10,7 +10,10 @@
  *   - the shipped engines string is green, with Node 20 reported satellite-only
  *     (no prebuild, source build accepted) rather than failed;
  *   - re-admitting Node 21 or Node 23 goes RED and names the major;
- *   - a hub major losing any of darwin/linux/win32 goes RED.
+ *   - a hub major losing ANY documented os-arch pair goes RED, even when the
+ *     other architecture of that OS is still present;
+ *   - the report states its known-major horizon instead of claiming coverage
+ *     of unreleased majors.
  *
  * The guard is a plain .mjs so CI can run it with bare node; it is imported here
  * through a runtime-built file URL (tsconfig has no allowJs).
@@ -26,7 +29,8 @@ type Coverage = {
   allowed: number[];
   hub: number[];
   satelliteOnly: number[];
-  future: number[];
+  horizon: number;
+  openAboveHorizon: boolean;
   gaps: { major: number; abi: number; missing: string[] }[];
   problems: string[];
   report: string;
@@ -125,11 +129,46 @@ describe('prebuild-coverage guard', () => {
     expect(r.allowed).toContain(23);
   });
 
-  it('FAILs when a hub major loses its linux prebuild', () => {
+  it('FAILs when a hub major loses its whole linux prebuild set', () => {
     const crippled = ASSETS_12_11_1.filter((a) => !a.includes('node-v137-linux-'));
     const r = evaluateCoverage(SHIPPED_ENGINES, crippled);
-    expect(r.gaps).toEqual([{ major: 24, abi: 137, missing: ['linux'] }]);
-    expect(r.problems.join('\n')).toMatch(/Node 24 \(ABI 137\) is a HUB major but has NO linux prebuild/);
+    expect(r.gaps).toEqual([{ major: 24, abi: 137, missing: ['linux-arm64', 'linux-x64'] }]);
+    expect(r.problems.join('\n')).toMatch(/Node 24 \(ABI 137\) is a HUB major but has NO linux-arm64\/linux-x64 prebuild/);
+  });
+
+  // Documented pairs, one at a time, with the OTHER architecture of the same
+  // OS still present — an OS-only check would pass every one of these.
+  it.each([
+    ['darwin-x64', 22, 127, 'darwin-arm64'],
+    ['darwin-arm64', 24, 137, 'darwin-x64'],
+    ['linux-arm64', 25, 141, 'linux-x64'],
+    ['linux-x64', 26, 147, 'linux-arm64'],
+    ['win32-x64', 24, 137, 'win32-arm64'],
+  ])('FAILs when a hub major loses only %s (Node %i) while %s stays', (pair, major, abi, kept) => {
+    const crippled = ASSETS_12_11_1.filter((a) => !a.endsWith(`node-v${abi}-${pair}.tar.gz`));
+    expect(crippled).toHaveLength(ASSETS_12_11_1.length - 1);
+    expect(crippled.some((a) => a.endsWith(`node-v${abi}-${kept}.tar.gz`))).toBe(true);
+    const r = evaluateCoverage(SHIPPED_ENGINES, crippled);
+    expect(r.gaps).toEqual([{ major, abi, missing: [pair] }]);
+    expect(r.problems.join('\n')).toContain(`Node ${major} (ABI ${abi}) is a HUB major but has NO ${pair} prebuild`);
+  });
+
+  it('does not let a musl prebuild stand in for the glibc linux pair', () => {
+    const crippled = ASSETS_12_11_1.filter((a) => !a.endsWith('node-v127-linux-x64.tar.gz'));
+    const r = evaluateCoverage(SHIPPED_ENGINES, crippled);
+    expect(r.gaps).toEqual([{ major: 22, abi: 127, missing: ['linux-x64'] }]);
+  });
+
+  it('states its known-major horizon and evaluates nothing beyond the ABI table', () => {
+    const r = evaluateCoverage(SHIPPED_ENGINES, ASSETS_12_11_1);
+    expect(r.horizon).toBe(26);
+    expect(r.openAboveHorizon).toBe(true); // `>=24.0.0` admits 27+ at install time
+    expect(r.allowed.every((m) => m <= 26)).toBe(true);
+    expect(r.report).toContain('evaluates Node majors up to 26');
+    expect(r.report).toContain('NOT evaluated or vouched for');
+    const closed = evaluateCoverage('>=20.0.0 <21 || >=22.0.0 <23 || >=24.0.0 <27', ASSETS_12_11_1);
+    expect(closed.openAboveHorizon).toBe(false);
+    expect(closed.problems).toEqual([]);
   });
 
   it('FAILs when engines admits a major the ABI table does not know', () => {
