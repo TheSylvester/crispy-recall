@@ -87,20 +87,33 @@ export async function runCodexRekeyMigration(
   if (!isCodexRekeyPending(d)) return result;
   result.performed = true;
 
+  // Enumerate from `messages`, NEVER from session_provenance: on the live hub
+  // 1,102 of 2,978 affected sessions have no provenance row at all. Counted
+  // BEFORE the snapshot: install.ts treats every 0.3.x DB as codexPending, so
+  // snapshotting first made a Claude-only multi-gigabyte hub copy the whole
+  // database to re-key zero rows.
+  const sessions = (d.all(
+    `SELECT DISTINCT session_id AS id FROM messages WHERE ${LEGACY_CODEX_ID_SQL}`,
+  ) as Array<{ id: string }>).map((r) => r.id);
+  result.sessions = sessions.length;
+
+  if (sessions.length === 0) {
+    // Nothing to rewrite — open the gate with no rollback insurance to buy.
+    d.run(
+      `INSERT OR REPLACE INTO schema_meta(key, value) VALUES (?, 'complete')`,
+      [CODEX_REKEY_KEY],
+    );
+    say('codex re-key: 0 sessions carry legacy ids — marker written, no snapshot taken');
+    return result;
+  }
+
   // Rollback insurance BEFORE the first rewrite — thousands of per-session
-  // transactions are not one atomic unit. Probed only after the early return,
+  // transactions are not one atomic unit. Probed only after the early returns,
   // so an idempotent re-run never copies a gigabyte. A failure propagates:
   // install.ts phase 6.8 restores the quiesced hooks and aborts.
   const { snapshotDbWalSafe } = await import('./retrieval-class-migration.js');
   result.snapshotPath = await snapshotDbWalSafe('codex-rekey');
   say(`codex-rekey: snapshot ${result.snapshotPath}`);
-
-  // Enumerate from `messages`, NEVER from session_provenance: on the live hub
-  // 1,102 of 2,978 affected sessions have no provenance row at all.
-  const sessions = (d.all(
-    `SELECT DISTINCT session_id AS id FROM messages WHERE ${LEGACY_CODEX_ID_SQL}`,
-  ) as Array<{ id: string }>).map((r) => r.id);
-  result.sessions = sessions.length;
 
   // Hoisted resolution indexes: one watermark query and ONE walk of the Codex
   // tree for the whole run, not one of each per session.

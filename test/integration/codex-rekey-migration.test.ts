@@ -21,7 +21,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
-  appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync,
+  appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync,
 } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { platform, tmpdir } from 'node:os';
@@ -468,6 +468,32 @@ describe.skipIf(platform() === 'win32')('codex re-key migration (§5)', () => {
     expect(res!.vectorsDropped).toBeGreaterThan(0); // E's vector, on the reclassified branch
     // No embed-pending.js is staged here, so the drain surfaces as the hint.
     expect(printed.join('\n')).toMatch(/run: recall backfill --auto-embed/);
+  }, 60_000);
+
+  it('takes no snapshot when the DB carries no legacy Codex ids (M6)', async () => {
+    // install.ts treats EVERY 0.3.x DB as codexPending, so a Claude-only hub
+    // reaches this migration with zero legacy rows. Snapshotting before the
+    // count copied the whole (multi-GB) database to re-key nothing.
+    const raw = new Database(dbPath());
+    try {
+      raw.exec(`DELETE FROM message_vectors WHERE message_id IN (SELECT message_id FROM messages WHERE ${LEGACY_CODEX_ID_SQL})`);
+      raw.exec(`DELETE FROM messages WHERE ${LEGACY_CODEX_ID_SQL}`);
+    } finally { raw.close(); }
+    _resetDb();
+    expect(legacySessions()).toEqual([]);
+
+    const result = await runCodexRekeyMigration({ log: () => {} });
+    expect(result).toEqual({
+      performed: true, sessions: 0, reingested: 0, fileGone: 0, emptied: 0,
+      vectorsDropped: 0, legacyRemaining: 0, snapshotPath: null,
+    });
+    expect(readdirSync(recallHome).filter(f => f.startsWith('recall.db.pre-codex-rekey-'))).toEqual([]);
+    _resetDb();
+    expect(markerValue()).toBe('complete');
+
+    // …and the gate is genuinely closed: a second run is the no-op re-run.
+    const second = await runCodexRekeyMigration({ log: () => {} });
+    expect(second.performed).toBe(false);
   }, 60_000);
 
   it('is idempotent: a second run performs nothing', async () => {
