@@ -134,6 +134,12 @@ describe('satellite CLI', () => {
     expect(body.argv).toEqual(['plain query']);
   });
 
+  it('forwards date bounds and raw/recent search flags unchanged to the hub', async () => {
+    const args = ['zebrafoo', '--since', '2024-01-01', '--until', '2024-12-31', '--raw-messages', '--recent'];
+    expect((await runCli(args)).code).toBe(0);
+    expect(queryBody().argv).toEqual(args);
+  });
+
   it('passes --context through byte-identically (the hub strips it)', async () => {
     await runCli(['q', '--context', '5']);
     expect(queryBody().argv).toEqual(['q', '--context', '5']);

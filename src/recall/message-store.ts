@@ -287,6 +287,8 @@ export function searchMessagesFts(
   excludeSessionId?: string,
   skipIdf?: boolean,
   projectKey?: string,
+  createdFrom?: number,
+  createdTo?: number,
 ): MessageSearchResult[] {
   try {
     const sanitized = sanitizeFts5Query(query, { skipIdf });
@@ -303,6 +305,14 @@ export function searchMessagesFts(
     if (excludeSessionId) {
       extraClauses += 'AND m.session_id != ? ';
       params.push(excludeSessionId);
+    }
+    if (createdFrom !== undefined) {
+      extraClauses += 'AND m.created_at >= ? ';
+      params.push(createdFrom);
+    }
+    if (createdTo !== undefined) {
+      extraClauses += 'AND m.created_at <= ? ';
+      params.push(createdTo);
     }
     params.push(limit);
 
@@ -769,7 +779,7 @@ export function searchMessagesSemantic(
   queryQ8: Int8Array,
   queryNorm: number,
   queryScale: number,
-  opts?: { limit?: number; projectId?: string; projectKey?: string; sessionId?: string; excludeSessionId?: string; tolerant?: boolean },
+  opts?: { limit?: number; projectId?: string; projectKey?: string; sessionId?: string; excludeSessionId?: string; tolerant?: boolean; createdFrom?: number; createdTo?: number },
 ): MessageSearchResult[] {
   try {
     const limit = opts?.limit ?? 20;
@@ -788,6 +798,15 @@ export function searchMessagesSemantic(
     if (opts?.excludeSessionId) {
       filterClauses += ' AND m.session_id != ?';
       params.push(opts.excludeSessionId);
+    }
+
+    if (opts?.createdFrom !== undefined) {
+      filterClauses += ' AND m.created_at >= ?';
+      params.push(opts.createdFrom);
+    }
+    if (opts?.createdTo !== undefined) {
+      filterClauses += ' AND m.created_at <= ?';
+      params.push(opts.createdTo);
     }
 
     // Version filtering has two modes, keyed by migration coverage. dualPathSearch

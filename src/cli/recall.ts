@@ -776,8 +776,18 @@ async function runSearch(query: string) {
   initDb();
   const ceiling = limit > 0 ? limit : 200;
   const scope = projectScope();
+  const createdFrom = since ? Date.parse(since) : undefined;
+  const createdTo = until ? Date.parse(/^\d{4}-\d{2}-\d{2}$/.test(until) ? until + 'T23:59:59.999' : until) : undefined;
+  for (const [flag, value, parsed] of [['since', since, createdFrom], ['until', until, createdTo]] as const) {
+    if (parsed !== undefined && !Number.isFinite(parsed)) {
+      console.error(`Invalid --${flag} date: "${value}" (expected ISO-8601)`);
+      exit(1);
+    }
+  }
   const r = await dualPathSearch(query, {
     limit: ceiling,
+    createdFrom,
+    createdTo,
     ...(scope.projectId ? { projectId: scope.projectId } : {}),
     ...(scope.projectKey ? { projectKey: scope.projectKey } : {}),
     ...(noIdf ? { skipIdf: true } : {}),
@@ -785,32 +795,9 @@ async function runSearch(query: string) {
   });
   let { scored } = r;
 
-  // Filter by --since date if provided
-  if (since) {
-    const sinceMs = new Date(since).getTime();
-    if (!isNaN(sinceMs)) {
-      scored = scored.filter(x => {
-        const created = x.result.created_at ?? 0;
-        return created >= sinceMs;
-      });
-    } else {
-      console.error(`Invalid --since date: "${since}" (expected ISO-8601)`);
-      exit(1);
-    }
-  }
-
-  if (until) {
-    const untilMs = new Date(until + 'T23:59:59.999').getTime();
-    if (!isNaN(untilMs)) {
-      scored = scored.filter(x => {
-        const created = x.result.created_at ?? 0;
-        return created <= untilMs;
-      });
-    } else {
-      console.error(`Invalid --until date: "${until}" (expected ISO-8601)`);
-      exit(1);
-    }
-  }
+  // Defense-in-depth; retrieval already applies these before its candidate caps.
+  if (createdFrom !== undefined) scored = scored.filter(x => x.result.created_at >= createdFrom);
+  if (createdTo !== undefined) scored = scored.filter(x => x.result.created_at <= createdTo);
 
   // --- Raw per-message output (bypass all shaping) ---
   // Emit the full RRF-merged per-message ranked list (top `ceiling`), skipping

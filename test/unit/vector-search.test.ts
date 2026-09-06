@@ -160,7 +160,7 @@ describe('dualPathSearch', () => {
     mockSearchFts.mockReturnValueOnce([]);
     mockSearchSemantic.mockReturnValueOnce([]);
 
-    await dualPathSearch('test', { projectId: 'proj1', sessionId: 'sess1' });
+    await dualPathSearch('test', { projectId: 'proj1', sessionId: 'sess1', createdFrom: 1000, createdTo: 2000 });
 
     expect(mockSearchFts).toHaveBeenCalledWith(
       'test',
@@ -171,12 +171,14 @@ describe('dualPathSearch', () => {
       undefined,
       // trailing projectKey (spec §4.4) — absent here, so undefined
       undefined,
+      1000,
+      2000,
     );
     expect(mockSearchSemantic).toHaveBeenCalledWith(
       expect.any(Int8Array),
       expect.any(Number),
       expect.any(Number),
-      expect.objectContaining({ projectId: 'proj1', sessionId: 'sess1' }),
+      expect.objectContaining({ projectId: 'proj1', sessionId: 'sess1', createdFrom: 1000, createdTo: 2000 }),
     );
   });
 });
