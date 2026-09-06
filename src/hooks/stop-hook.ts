@@ -140,6 +140,11 @@ async function runStopHook(): Promise<void> {
 
   let ingestedClass: 'hot' | 'agent' | undefined;
   let canonicalId = target.sessionId;
+  // L11: latched BEFORE the satellite spawn, so a synchronous spawn throw —
+  // caught by the enclosing try — cannot fall through to the hub-only
+  // embed-pending spawn below. A satellite has no database and no staged
+  // embed-pending; that second spawn was pure churn at best.
+  let satellite = false;
   try {
     // Satellite branch (spec §3.2, S6). FIRST statement inside the try, so a
     // synchronous config/spawn throw is still caught and the hook still exits
@@ -149,6 +154,7 @@ async function runStopHook(): Promise<void> {
     // reached on a satellite.
     const sat = readSatelliteConfig();
     if (sat) {
+      satellite = true;
       spawn(process.execPath, [join(binDir(), "push-pending.js"), '--named', target.transcriptPath,
             '--hook', JSON.stringify(target.hook), '--cwd', payload.cwd ?? ''],
             { detached: true, stdio: 'ignore', windowsHide: true }).unref();
@@ -204,7 +210,7 @@ async function runStopHook(): Promise<void> {
   // A subagent-only ingest must NOT spawn one: agent leaves create no
   // embedding-eligible gap (they are excluded from every gap selector), so a
   // SubagentStop child would be pure detached churn.
-  if (!target.hook.isSubagent && ingestedClass !== 'agent') {
+  if (!satellite && !target.hook.isSubagent && ingestedClass !== 'agent') {
     // No pre-spawn close here: this process holds a LIVE connection, whose
     // shared DMS lock denies the child the exclusive lock a wal-index reset
     // needs (db.ts closeDbBeforeChildSpawn). Closing would add a WAL

@@ -36,6 +36,7 @@ let recallHome: string;
 let claudeDir: string;
 let codexDir: string;
 let argvFile: string;
+let embedFile: string;
 
 function childEnv(): NodeJS.ProcessEnv {
   return {
@@ -65,6 +66,15 @@ function stagePushRecorder(): void {
   writeFileSync(
     join(recallHome, 'bin', 'push-pending.js'),
     `require('fs').writeFileSync(${JSON.stringify(argvFile)}, JSON.stringify(process.argv.slice(2)));\n`,
+  );
+}
+
+/** A stand-in for the staged embed-pending bundle: it records that it ran. */
+function stageEmbedRecorder(): void {
+  mkdirSync(join(recallHome, 'bin'), { recursive: true });
+  writeFileSync(
+    join(recallHome, 'bin', 'embed-pending.js'),
+    `require('fs').writeFileSync(${JSON.stringify(embedFile)}, JSON.stringify(process.argv.slice(2)));\n`,
   );
 }
 
@@ -100,6 +110,7 @@ beforeEach(() => {
   claudeDir = join(sandbox, '.claude');
   codexDir = join(sandbox, '.codex');
   argvFile = join(sandbox, 'push-argv.json');
+  embedFile = join(sandbox, 'embed-argv.json');
   mkdirSync(claudeDir, { recursive: true });
   mkdirSync(codexDir, { recursive: true });
 });
@@ -135,6 +146,31 @@ describe('satellite stop hook', () => {
     expect(await waitFor(() => existsSync(argvFile))).toBe(true);
     const argv = JSON.parse(readFileSync(argvFile, 'utf-8')) as string[];
     expect(JSON.parse(argv[3]!)).toMatchObject({ agentId: 'agent-abc123', isSubagent: true });
+  });
+
+  it('L11: a satellite whose push spawn throws SYNCHRONOUSLY still exits 0 and does NOT fall through to the hub embed spawn', async () => {
+    makeSatellite();
+    stagePushRecorder();
+    stageEmbedRecorder();
+    const t = transcript('/tmp/hookproj');
+    // A NUL byte in the payload cwd makes `spawn` throw synchronously
+    // (ERR_INVALID_ARG_VALUE) — the argument reaches spawn unfiltered as
+    // `--cwd <payload.cwd>`. The throw lands in the enclosing catch, and
+    // before the fix control then walked straight into the embed-pending
+    // spawn, which a satellite has no database and no staged bundle for.
+    const res = await runHook({ session_id: randomUUID(), transcript_path: t, cwd: '/tmp/hook\u0000proj' });
+    expect(res.code).toBe(0);
+    // Give any (wrongly) spawned child time to land before asserting absence.
+    await new Promise((r) => setTimeout(r, 500));
+    // Exactly one spawn ATTEMPT was made, and it was the satellite one.
+    expect(existsSync(argvFile)).toBe(false);
+    expect(existsSync(embedFile)).toBe(false);
+    // The satellite branch never opens a database, throw or no throw.
+    expect(existsSync(join(recallHome, 'recall.db'))).toBe(false);
+    // The throw was caught and recorded rather than swallowed silently.
+    const log = join(recallHome, 'logs', 'stop-hook.log');
+    expect(existsSync(log)).toBe(true);
+    expect(readFileSync(log, 'utf-8')).toContain('ingest-failed');
   });
 
   it('a hub root (no satellite record) does NOT take the satellite branch', async () => {
