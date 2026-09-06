@@ -20,6 +20,25 @@ import { codexRoot } from "../recall/transcript-roots.js";
 import { appendFileSync, mkdirSync } from "fs";
 import { spawn } from "child_process";
 import { join } from "path";
+import { setTimeout as delay } from "node:timers/promises";
+
+/** SQLite can reject concurrent first-open WAL transitions without invoking
+ * its busy handler. Retry those transient failures, with a strict bound. */
+export async function retryBusyIngest<T extends { error?: string }>(operation: () => Promise<T>): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const result = await operation();
+      if (attempt < 2 && result.error && /database is locked|SQLITE_BUSY/i.test(result.error)) {
+        await delay(25 * (attempt + 1));
+        continue;
+      }
+      return result;
+    } catch (error) {
+      if (attempt >= 2 || !/database is locked|SQLITE_BUSY/i.test(String(error))) throw error;
+      await delay(25 * (attempt + 1));
+    }
+  }
+}
 
 /**
  * Decide the vendor from a transcript path.
@@ -143,11 +162,12 @@ async function runStopHook(): Promise<void> {
     // including a BindingLoadError or a pending-migration fail-closed throw —
     // is logged and swallowed: the hook must always exit 0 and never block the
     // user's turn (T1 re-ingests the gap after a migration completes).
-    getDb(dbPath()).exec("PRAGMA busy_timeout = 5000;");
-
     const vendor = vendorForTranscript(target.transcriptPath);
 
-    const result = await ingestSessionMessages(
+    const projectKey = payload.cwd ? (deriveProjectKey(payload.cwd).key ?? null) : undefined;
+    const result = await retryBusyIngest(async () => {
+      getDb(dbPath()).exec("PRAGMA busy_timeout = 5000;");
+      return ingestSessionMessages(
       target.sessionId,
       target.transcriptPath,
       vendor,
@@ -157,10 +177,11 @@ async function runStopHook(): Promise<void> {
         // is caught by the enclosing try, so the hook still exits 0. A
         // transient failure becomes an explicit null — ingest must not repeat
         // the derivation that just failed.
-        projectKey: payload.cwd ? (deriveProjectKey(payload.cwd).key ?? null) : undefined,
+        projectKey,
         hook: target.hook,
       },
-    );
+      );
+    });
     ingestedClass = result?.retrievalClass;
     canonicalId = result?.sessionId ?? target.sessionId;
     // ingestSessionMessages reports soft failures via { error } rather than

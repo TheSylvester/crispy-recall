@@ -209,8 +209,15 @@ export function getDb(dbPath: string, opts?: GetDbOptions): RecallDb {
   db = adapter;
   currentDbPath = dbPath;
 
-  ensureSchema(db);
-  ensureStemScratch(db);
+  try {
+    ensureSchema(db);
+    ensureStemScratch(db);
+  } catch (error) {
+    // A retry must reopen and finish initialization, never reuse a partially
+    // initialized singleton after a busy/schema failure.
+    closeDb();
+    throw error;
+  }
   log({ source: 'db', level: 'info', summary: `DB: initialized at ${dbPath}` });
 
   return db;
