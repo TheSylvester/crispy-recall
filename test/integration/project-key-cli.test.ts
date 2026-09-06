@@ -213,6 +213,25 @@ describe.skipIf(platform() === 'win32')('recall CLI project scoping', () => {
     expect(gitSpawns()).toBe(0);
   });
 
+  // A bare directory is NOT a project key: it matched no row, so the query
+  // silently fell back to cwd-only scoping. Reject the shape at parse time.
+  it.each(['/not/a/key', 'repoKey', 'git:deadbeef'])(
+    'rejects a --project-key that is not a project key: %s', (bad) => {
+      const r = runCli(['--project-key', bad, TERM, '--raw']);
+      expect(r.status).toBe(1);
+      expect(r.stderr).toContain('--project-key expects git:<hex>, origin:<url> or path:<dir>');
+      expect(r.stdout).not.toContain('S1');
+      expect(gitSpawns()).toBe(0);
+    });
+
+  it('a path: key is still accepted and scopes as before', () => {
+    const r = runCli(['--project-key', 'path:/x/two', '--project', '/x/two', TERM, '--raw']);
+    expect(r.status, r.stderr).toBe(0);
+    expect(r.stdout).toContain('S2');
+    expect(r.stdout).not.toContain('S3');
+    expect(gitSpawns()).toBe(0);
+  });
+
   it('the Stop hook stamps git:<root> derived once from payload.cwd', async () => {
     const sid = randomUUID();
     const transcript = join(repoDir, `${sid}.jsonl`);

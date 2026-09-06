@@ -111,6 +111,25 @@ const since = flagValue('--since');
 const until = flagValue('--until');
 const projectFlag = flagValue('--project');
 const allProjects = hasFlag('--all');
+
+/**
+ * Project-key shape. Byte-identical copy of `KEY_RE` in src/hub/protocol.ts:25
+ * (the CLI must not pull the hub wire protocol into its bundle) — keep the two
+ * in sync.
+ */
+const PROJECT_KEY_RE = /^(git:[0-9a-f]{40}|origin:\S+|path:.+)$/;
+/**
+ * `--project-key` is authoritative scoping: whatever is passed is used verbatim
+ * and derivation is skipped. A value that is not a key (e.g. a bare directory
+ * `--project-key /home/u/dev/repo`) therefore matched no project row and the
+ * query silently fell back to cwd-only scoping. Reject it here, at argv-parse
+ * time, before any database is opened.
+ */
+const projectKeyFlag = flagValue('--project-key');
+if (projectKeyFlag !== undefined && !PROJECT_KEY_RE.test(projectKeyFlag)) {
+  console.error('--project-key expects git:<hex>, origin:<url> or path:<dir>');
+  process.exit(1);
+}
 const reverse = hasFlag('--reverse');
 const recent = hasFlag('--recent');
 const commitFlag = flagValue('--commit');
@@ -152,7 +171,7 @@ function projectScope(): ProjectScope {
 function resolveProjectScope(): ProjectScope {
   // 1. --all: no scope at all.
   if (allProjects) return {};
-  const keyFlag = flagValue('--project-key');
+  const keyFlag = projectKeyFlag;  // shape-validated at parse time
   // 2. An explicit key (the hub appends one to every proxied query) is
   //    authoritative — never re-derive, the hub's cwd does not exist here.
   if (keyFlag) {
