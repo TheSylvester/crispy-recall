@@ -4,10 +4,9 @@
 #
 # (a) proves the folded path key for a non-git directory, (b) proves the
 # cross-host git key and a hub-only phrase answered without --all.
-# The "no double quotes" rule of spec §9.4 applies to the WSL→cmd.exe INTEROP
-# command line only (lib.sh win_cmd); a .cmd file BODY may quote freely, so the
-# prompt and the search phrase are each ONE quoted argument. Nonces stay
-# space-free.
+# win_cmd runs a relative batch name from its Windows directory. Batch
+# executable paths, prompts and search phrases are quoted to preserve spaces.
+# Nonces stay space-free.
 #
 # DEVIATION §9.4.2 — when Windows Claude Code cannot authenticate (the owner is
 # AFK and the OAuth session cannot be refreshed), the turn falls back to a

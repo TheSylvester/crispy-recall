@@ -2,9 +2,9 @@
  * Static lint of the spec §9 acceptance scripts under `contrib/satellite/e2e/`.
  *
  * The scripts drive the owner's REAL machines, so this suite never executes a
- * script body: it spawns `bash -n` (a syntax check) and otherwise reads text.
- * ONE exception: the CLAUDECODE test below SOURCES lib.sh, which runs its
- * `mkdir -p`. That call passes both RECALL_E2E_LOG_DIR and HOME on a temp dir,
+ * live script body: it checks syntax/text and runs selected command-building
+ * blocks with mocked tools. Helper tests SOURCE lib.sh, which runs `mkdir -p`.
+ * Those calls pass both RECALL_E2E_LOG_DIR and HOME on a temp dir,
  * so it cannot reach the owner's live ~/.recall even if one of the two is ever
  * dropped — lib.sh reads no other filesystem root.
  * It encodes the rules that keep an acceptance run safe — read-only access to
@@ -340,6 +340,23 @@ CMD
       expect(out.status).toBe(7);
       expect(out.stdout).toBe(`cwd=${dir}\narg=<300>\narg=<cmd.exe>\narg=</c>\narg=<sample.cmd>\n`);
       expect(readFileSync(join(dir, 'sample.cmd'), 'utf8')).toBe('@echo off\r\nexit /b %ERRORLEVEL%\r\n');
+    } finally { rmSync(tmp, { recursive: true, force: true }); }
+  });
+
+  it('constructs the Windows install batch with quoted spaced operands', () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'e2e-win-batch-'));
+    try {
+      const script = text('50-win-install.sh');
+      const start = script.indexOf('win_cmd 50-install <<CMD');
+      const block = script.slice(start, script.indexOf('\nCMD', start) + 4);
+      const out = execFileSync('bash', ['-c', `source "$1/lib.sh"; win_cmd() { cat; }; ${block}`, '_', DIR], {
+        env: { PATH: '/usr/bin:/bin', HOME: tmp, RECALL_E2E_LOG_DIR: tmp,
+          RECALL_E2E_WIN_USER: 'Alex Smith', RECALL_E2E_HUB_ADDR: 'example.invalid' }, encoding: 'utf8',
+      });
+      const profile = 'C:\\Users\\Alex Smith';
+      expect(out).toContain(`install -g "${profile}\\AppData\\Local\\Temp\\recall-e2e\\crispy-recall.tgz"`);
+      expect(out).toContain(`RECALL_HUB_TOKEN=<"${profile}\\AppData\\Local\\Temp\\recall-e2e\\token.txt"`);
+      expect(out).toContain(`call "${profile}\\AppData\\Roaming\\npm\\recall.cmd" install`);
     } finally { rmSync(tmp, { recursive: true, force: true }); }
   });
 

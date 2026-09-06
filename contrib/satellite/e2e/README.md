@@ -38,7 +38,7 @@ stays silent.
 | `RECALL_E2E_LAPTOP_HOME` | 40, 60 | The satellite's home directory (e.g. `/home/alex`); 40 checks where `recall` resolves and 60 recognises its `path:` project keys. |
 | `RECALL_E2E_LAPTOP_REPO` | 41, 42, 44, 46 | Absolute path on the satellite of the git repo the §9.3.2 turn and the scoped queries run in. |
 | `RECALL_E2E_WIN_HOST` | 30, 31, 34, 51, 90 | The Windows satellite's registered host name. |
-| `RECALL_E2E_WIN_USER` | 50, 51, 52, 90 | Windows user name. `WIN_HOME` (`/mnt/c/Users/<user>`), `WIN_HOME_W`, `WIN_DIR`, `WIN_RECALL_W`, `WIN_CLAUDE_W` and `WIN_HOOK_W` are all derived from it. |
+| `RECALL_E2E_WIN_USER` | 50, 51, 52, 90 | Windows user name (spaces supported). `WIN_HOME` (`/mnt/c/Users/<user>`), `WIN_HOME_W`, `WIN_DIR`, `WIN_RECALL_W`, `WIN_CLAUDE_W` and `WIN_HOOK_W` are all derived from it. |
 | `RECALL_E2E_NODE` | 21, 50, 91 (and 10 via `RECALL_NODE`) | Absolute path to the hub's `node` binary. Its directory becomes the `PATH` prefix and the expected `recall` location. |
 | `RECALL_MAIN_CHECKOUT` | 10 (scope, scope-pre), 91 | The hub's main checkout of this repo. |
 | `RECALL_INT_WORKTREE` | 10 (all but pre-raw), 21 | The integration worktree whose `dist/recall.js` is under test. |
