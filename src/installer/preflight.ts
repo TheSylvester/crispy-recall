@@ -406,9 +406,12 @@ function checkDisk(): { disk: string; issue?: PreflightIssue } {
  * binding targets — both fail fast here with an actionable message instead of
  * a cryptic native-load error mid-install.
  *
- * package.json `engines` is DELIBERATELY wider (">=20.0.0 <23 || >=24.0.0",
- * S7): a satellite loads no native addon, so its floor is Node 20 and npm must
- * not refuse the install there. The hub floor lives here, not in `engines`.
+ * package.json `engines` is DELIBERATELY wider
+ * (">=20.0.0 <21 || >=22.0.0 <23 || >=24.0.0", S7): a satellite loads no native
+ * addon, so its floor is Node 20 and npm must not refuse the install there.
+ * Node 21 and Node 23 are excluded from BOTH roles — better-sqlite3 publishes no
+ * prebuild for their ABIs (120 and 131), so npm would fall into a node-gyp
+ * compile there with no upside. The hub floor lives here, not in `engines`.
  */
 function checkNode(nodeVersion: string = process.version): { node: string; issue?: PreflightIssue } {
   const node = nodeVersion;
@@ -420,7 +423,7 @@ function checkNode(nodeVersion: string = process.version): { node: string; issue
       issue: {
         check: 'runtime.node',
         severity: 'FAIL',
-        message: `Node ${node} is unsupported — a recall hub requires Node 22 LTS (>=22.16) or Node >=24 (package.json engines is the wider satellite floor, ">=20.0.0 <23 || >=24.0.0").${major === 23 ? ' Node 23 has no prebuilt SQLite binding.' : ''}`,
+        message: `Node ${node} is unsupported — a recall hub requires Node 22 LTS (>=22.16) or Node >=24 (package.json engines is the wider satellite floor, ">=20.0.0 <21 || >=22.0.0 <23 || >=24.0.0").${major === 23 ? ' Node 23 has no prebuilt SQLite binding.' : ''}`,
         remediation: 'Install Node 22 LTS (>=22.16) or Node >=24, then re-run `recall install`.',
       },
     };
@@ -429,21 +432,28 @@ function checkNode(nodeVersion: string = process.version): { node: string; issue
 }
 
 /**
- * Node gate for a SATELLITE (S7): floor 20, Node 23 still excluded so one
- * documented exclusion covers both roles. No native addon is staged here, so
- * the ABI reasoning that pins the hub to 22.16+ does not apply.
+ * Node gate for a SATELLITE (S7): floor 20, with Node 21 and Node 23 excluded so
+ * one documented exclusion covers both roles and matches package.json `engines`
+ * (">=20.0.0 <21 || >=22.0.0 <23 || >=24.0.0"). No native addon is staged here,
+ * so the ABI reasoning that pins the hub to 22.16+ does not apply — but npm
+ * still installs the `better-sqlite3` dependency, and better-sqlite3 publishes
+ * no prebuild for ABI 120 (Node 21) or 131 (Node 23), so those majors would
+ * always fall into a node-gyp compile for a binding a satellite never loads.
+ * On Node 20 (ABI 115, also without a prebuild) that compile is accepted as the
+ * documented cost of satellite support: python3, make and a C/C++ compiler must
+ * be present.
  */
 function checkSatelliteNode(nodeVersion: string = process.version): { node: string; issue?: PreflightIssue } {
   const node = nodeVersion;
   const [major = 0] = node.replace(/^v/, '').split('.').map((n) => parseInt(n, 10) || 0);
-  if (major >= 20 && major !== 23) return { node };
+  if (major === 20 || major === 22 || major >= 24) return { node };
   return {
     node,
     issue: {
       check: 'runtime.node',
       severity: 'FAIL',
-      message: `Node ${node} is unsupported — a recall satellite requires Node 20+ (Node 23 excluded).`,
-      remediation: 'Install Node 20 or newer (not Node 23), then re-run `recall install --hub …`.',
+      message: `Node ${node} is unsupported — a recall satellite requires Node 20, 22 or 24+ (Node 21 and Node 23 have no prebuilt SQLite binding and are excluded).`,
+      remediation: 'Install Node 20, Node 22 or Node 24+ (not Node 21 or Node 23), then re-run `recall install --hub …`.',
     },
   };
 }

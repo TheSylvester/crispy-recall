@@ -1,7 +1,7 @@
 /**
  * runPreflight({ satellite }) — the satellite pre-flight contract (spec §3.1).
  *
- * Asserts the Node 20 floor (Node 23 still excluded), that the local-runtime
+ * Asserts the Node 20 floor (Node 21 and Node 23 excluded), that the local-runtime
  * checks are skipped, and that the HuggingFace/GitHub probes are replaced by
  * `GET /v1/health` plus an authenticated empty manifest against a stub hub —
  * with `hub.unreachable` and `hub.auth` telling apart "no hub" from "bad
@@ -70,16 +70,22 @@ function opts(nodeVersion: string, over: Partial<{ hubUrl: string; token: string
 const nodeFail = (r: Awaited<ReturnType<typeof runPreflight>>) => r.failures.find((f) => f.check === 'runtime.node');
 
 describe('preflight (satellite)', () => {
-  it.each(['v20.0.0', 'v20.20.1', 'v22.18.0', 'v24.4.0'])('accepts Node %s', async (v) => {
+  it.each(['v20.0.0', 'v20.20.1', 'v22.0.0', 'v22.18.0', 'v24.4.0', 'v26.0.0'])('accepts Node %s', async (v) => {
     const r = await runPreflight(opts(v));
     expect(nodeFail(r)).toBeUndefined();
   });
 
-  it.each(['v18.0.0', 'v19.9.0', 'v23.1.0'])('FAILs Node %s', async (v) => {
+  // Node 21 (ABI 120) and Node 23 (ABI 131) have no better-sqlite3 prebuild, so
+  // npm would compile the binding from source for a role that never loads it —
+  // excluded from `engines` and refused here. Node 20 (ABI 115) has no prebuild
+  // either but IS supported: that source build is the documented cost of
+  // satellite support (python3, make and a C/C++ compiler must be present).
+  it.each(['v18.0.0', 'v19.9.0', 'v21.7.3', 'v23.1.0'])('FAILs Node %s', async (v) => {
     const r = await runPreflight(opts(v));
     const f = nodeFail(r);
     expect(f?.severity).toBe('FAIL');
-    expect(f?.message).toMatch(/Node 20\+/);
+    expect(f?.message).toMatch(/Node 20, 22 or 24\+/);
+    expect(f?.remediation).toMatch(/not Node 21 or Node 23/);
   });
 
   it('skips the disk, macOS-floor and GPU checks', async () => {

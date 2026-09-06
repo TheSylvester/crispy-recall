@@ -1,38 +1,56 @@
 #!/usr/bin/env node
 /**
- * Static coverage check for better-sqlite3 darwin prebuilds vs recall's `engines`.
+ * Static coverage check for better-sqlite3 Node prebuilds vs recall's `engines`.
  *
- * Defect 3 (Node-23 prebuild hole): better-sqlite3 ships darwin prebuilds only
- * for ABIs 127/137/141/147 (Node 22/24/25/26) — there is NO 131 (Node 23), so
- * `npm install -g` under Node 23 on a Mac without Xcode CLT falls into a node-gyp
- * compile that fails. The fix narrows `engines.node` to exclude 23
- * (`>=22.16.0 <23 || >=24.0.0`).
+ * WHY: better-sqlite3 publishes Node prebuilds only for a handful of ABIs (for
+ * v12.11.1: 127/137/141/147 = Node 22/24/25/26). There is NO prebuild for ABI
+ * 115 (Node 20), 120 (Node 21) or 131 (Node 23). A Node major that `engines`
+ * admits but that has no prebuild sends `npm install -g` into a node-gyp
+ * compile, which fails on any machine without python3/make/a C++ compiler.
  *
- * This script reads the resolved better-sqlite3 release asset names (passed as a
- * file, one per line — produced by `gh api .../releases/tags/vX --jq
- * '.assets[].name'`), evaluates recall's `engines` range to find the Node majors
- * it actually allows, and asserts EVERY allowed major has a darwin prebuild.
+ * ROLE-HONEST: recall has two roles with two different floors.
+ *   - HUB majors (what `checkNode` in src/installer/preflight.ts accepts: 22,
+ *     24, 25, 26) load the native binding. They MUST have darwin AND linux AND
+ *     win32 prebuilds — a gap is a hard FAIL.
+ *   - SATELLITE_ONLY majors (20) never load the binding. npm still installs the
+ *     dependency and compiles it from source, which is a documented, accepted
+ *     cost (python3 + make + a C/C++ compiler must be present). Reported, never
+ *     a failure.
+ *   - Anything else `engines` admits is a FAIL: either it needs prebuilds it
+ *     does not have, or nobody decided what role it plays.
  *
- * GREEN = no engines-allowed major is missing a darwin prebuild (and the majors
- * smoke-local runs on, 22 and 24, ARE covered). It goes RED if `engines` widens
- * to re-admit a major with no prebuild (e.g. Node 23 creeps back in), which is
- * exactly the regression this guards.
+ * EXHAUSTIVE: `engines` is probed over Node majors 18..30, so a major that it
+ * admits but the table does not know about FAILs loudly instead of being
+ * silently skipped (the pre-fix bug: the table started at 22, so admitted majors
+ * 20 and 21 were never even considered). The one exception is the open upper
+ * end: `>=24.0.0` necessarily admits majors that do not exist yet, so admitted
+ * majors ABOVE the highest entry in the ABI table are reported as future work
+ * (extend the table when that Node ships) rather than failed. Every admitted
+ * major at or below the table's horizon must have an entry.
+ *
+ * Input is the resolved better-sqlite3 release asset names (one per line,
+ * produced by `gh api .../releases/tags/vX --jq '.assets[].name'`).
  *
  * Usage: node prebuild-coverage.mjs <assets.txt> >> $GITHUB_STEP_SUMMARY
  */
 import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 
-// Node major -> NODE_MODULE_VERSION (ABI). Extend when a new LTS lands.
-const ABI = { 22: 127, 23: 131, 24: 137, 25: 141, 26: 147 };
+// Node major -> NODE_MODULE_VERSION (ABI). Extend when a new major lands; an
+// engines-admitted major missing from here is a FAIL, never a skip.
+export const ABI = { 20: 115, 21: 120, 22: 127, 23: 131, 24: 137, 25: 141, 26: 147 };
 
-const assetsFile = process.argv[2];
-if (!assetsFile) {
-  console.error('prebuild-coverage: pass the assets list file');
-  process.exit(2);
-}
+/** Majors the HUB accepts (src/installer/preflight.ts checkNode: 22.16+ or 24+). */
+export const HUB_MAJORS = [22, 24, 25, 26];
 
-const pkg = JSON.parse(readFileSync('./package.json', 'utf-8'));
-const engines = String(pkg.engines?.node ?? '>=22');
+/** Majors supported for SATELLITES only — no prebuild needed, source build is fine. */
+export const SATELLITE_ONLY = [20];
+
+/** Platforms a hub major must have a prebuild for. */
+export const REQUIRED_PLATFORMS = ['darwin', 'linux', 'win32'];
+
+/** Node majors probed against `engines`. Wide enough to catch anything real. */
+const PROBE_MAJORS = Array.from({ length: 13 }, (_, i) => 18 + i); // 18..30
 
 // --- minimal semver range satisfaction (enough for our engines strings) ---
 function cmp(a, b) {
@@ -52,74 +70,179 @@ function satisfiesComparator(version, comp) {
   return op === '>=' ? c >= 0 : op === '<=' ? c <= 0 : op === '>' ? c > 0 : op === '<' ? c < 0 : c === 0;
 }
 /** A range is `clause || clause`, each clause a space-separated AND of comparators. */
-function satisfies(version, range) {
+export function satisfies(version, range) {
   return range.split('||').some((clause) =>
     clause.trim().split(/\s+/).filter(Boolean).every((comp) => satisfiesComparator(version, comp)),
   );
 }
 /** A major is allowed if some representative version of it satisfies the range. */
-function majorAllowed(maj) {
-  return [`${maj}.0.0`, `${maj}.16.0`, `${maj}.99.0`].some((v) => satisfies(v, engines));
+export function majorAllowed(maj, range) {
+  return [`${maj}.0.0`, `${maj}.16.0`, `${maj}.99.0`].some((v) => satisfies(v, range));
 }
 
-let bsqlVersion = 'unknown';
-try {
-  const lock = JSON.parse(readFileSync('./package-lock.json', 'utf-8'));
-  bsqlVersion = lock.packages?.['node_modules/better-sqlite3']?.version ?? bsqlVersion;
-} catch { /* informational only */ }
+/**
+ * Evaluate prebuild coverage.
+ *
+ * @param {string} enginesString  package.json engines.node
+ * @param {string[]} assetNames   better-sqlite3 release asset names
+ * @returns {{allowed:number[], hub:number[], satelliteOnly:number[], gaps:object[], problems:string[], report:string}}
+ */
+export function evaluateCoverage(enginesString, assetNames, opts = {}) {
+  const bsqlVersion = opts.bsqlVersion ?? 'unknown';
 
-const assets = readFileSync(assetsFile, 'utf-8').split('\n').filter(Boolean);
-const darwinAbis = new Set();
-for (const a of assets) {
-  const m = a.match(/node-v(\d+)-darwin/);
-  if (m) darwinAbis.add(Number(m[1]));
-}
-
-const allowed = Object.keys(ABI).map(Number).filter(majorAllowed);
-const gaps = allowed.filter((maj) => !darwinAbis.has(ABI[maj]));
-
-// --- report (also to the step summary) ---
-const lines = [];
-lines.push(`## prebuild-coverage-static — better-sqlite3 v${bsqlVersion}`);
-lines.push('');
-lines.push(`engines.node = \`${engines}\` → allowed majors: ${allowed.join(', ')}`);
-lines.push('');
-lines.push('| Node major | ABI | darwin prebuild |');
-lines.push('| --- | --- | --- |');
-for (const maj of allowed) {
-  lines.push(`| ${maj} | ${ABI[maj]} | ${darwinAbis.has(ABI[maj]) ? '✅ present' : '❌ MISSING'} |`);
-}
-// Show Node 23 explicitly as excluded-by-design (the defect-3 hole is closed).
-if (!allowed.includes(23)) {
-  lines.push(`| ~~23~~ | ${ABI[23]} | excluded by engines (no darwin prebuild) |`);
-}
-lines.push('');
-lines.push(gaps.length ? `**Coverage gaps:** ${gaps.map((m) => `Node ${m} (ABI ${ABI[m]})`).join(', ')}` : '**No coverage gaps.**');
-const report = lines.join('\n') + '\n';
-process.stdout.write(report);
-
-// --- assertions (post-fix: every allowed major must have a darwin prebuild) ---
-const problems = [];
-
-// Hard: smoke-local runs on Node 22 and 24 — those MUST be allowed AND covered.
-for (const maj of [22, 24]) {
-  if (!allowed.includes(maj)) {
-    problems.push(`Node ${maj} is a smoke-local target but engines no longer allows it`);
-  } else if (gaps.includes(maj)) {
-    problems.push(`Node ${maj} (ABI ${ABI[maj]}) is a smoke-local target but has NO darwin prebuild`);
+  // ABI -> Set(platforms) from `...-node-v<ABI>-<platform>-<arch>.tar.gz`.
+  const byAbi = new Map();
+  for (const a of assetNames) {
+    // The trailing `-` is load-bearing: without it `linuxmusl-x64` matches
+    // `linux` and a missing glibc linux prebuild would be masked by a musl one.
+    const m = String(a).match(/node-v(\d+)-(darwin|linux|win32)-/);
+    if (!m) continue; // electron-*, linuxmusl-*, checksums: not our runtime
+    const abi = Number(m[1]);
+    if (!byAbi.has(abi)) byAbi.set(abi, new Set());
+    byAbi.get(abi).add(m[2]);
   }
+  const platformsFor = (maj) => [...(byAbi.get(ABI[maj]) ?? new Set())].sort();
+
+  const allowed = PROBE_MAJORS.filter((maj) => majorAllowed(maj, enginesString));
+  const problems = [];
+  const gaps = [];
+
+  // The ABI table's horizon: the newest major whose ABI we know. `engines` ends
+  // in an open `>=24.0.0`, so anything above the horizon is an unreleased major,
+  // not a hole in the table.
+  const horizon = Math.max(...Object.keys(ABI).map(Number));
+  const future = allowed.filter((maj) => maj > horizon);
+
+  // Exhaustiveness: an admitted major at or below the horizon with no ABI entry
+  // is a FAIL, never a silent skip.
+  const unknown = allowed.filter((maj) => maj <= horizon && ABI[maj] === undefined);
+  for (const maj of unknown) {
+    problems.push(
+      `Node ${maj} is allowed by engines but has no entry in the ABI table — add it (with its NODE_MODULE_VERSION) and decide its role`,
+    );
+  }
+
+  const known = allowed.filter((maj) => maj <= horizon && ABI[maj] !== undefined);
+  const hub = known.filter((maj) => HUB_MAJORS.includes(maj));
+  const satelliteOnly = known.filter((maj) => SATELLITE_ONLY.includes(maj) && !HUB_MAJORS.includes(maj));
+  const unclassified = known.filter((maj) => !HUB_MAJORS.includes(maj) && !SATELLITE_ONLY.includes(maj));
+
+  for (const maj of hub) {
+    const have = platformsFor(maj);
+    const missing = REQUIRED_PLATFORMS.filter((p) => !have.includes(p));
+    if (missing.length) {
+      gaps.push({ major: maj, abi: ABI[maj], missing });
+      problems.push(
+        `Node ${maj} (ABI ${ABI[maj]}) is a HUB major but has NO ${missing.join('/')} prebuild — narrow engines or wait for a prebuild`,
+      );
+    }
+  }
+
+  for (const maj of unclassified) {
+    problems.push(
+      `Node ${maj} (ABI ${ABI[maj]}) is allowed by engines but is neither a hub major nor satellite-only — no prebuild guarantee, so exclude it from engines or classify it`,
+    );
+  }
+
+  // Hard: smoke-local/ci-linux run on Node 22 and 24 — those MUST be allowed and covered.
+  for (const maj of [22, 24]) {
+    if (!allowed.includes(maj)) {
+      problems.push(`Node ${maj} is a CI matrix target but engines no longer allows it`);
+    }
+  }
+
+  // --- report ---
+  const lines = [];
+  lines.push(`## prebuild-coverage — better-sqlite3 v${bsqlVersion}`);
+  lines.push('');
+  lines.push(`engines.node = \`${enginesString}\` → allowed majors: ${allowed.join(', ') || '(none)'}`);
+  lines.push('');
+  lines.push('| Node major | ABI | role | node prebuilds | verdict |');
+  lines.push('| --- | --- | --- | --- | --- |');
+  for (const maj of allowed) {
+    if (maj > horizon) continue; // summarised as "future majors" below
+    const abi = ABI[maj];
+    if (abi === undefined) {
+      lines.push(`| ${maj} | ? | UNKNOWN | ? | ❌ not in the ABI table |`);
+      continue;
+    }
+    const have = platformsFor(maj);
+    const role = HUB_MAJORS.includes(maj) ? 'hub' : SATELLITE_ONLY.includes(maj) ? 'satellite-only' : 'UNCLASSIFIED';
+    let verdict;
+    if (role === 'hub') {
+      const missing = REQUIRED_PLATFORMS.filter((p) => !have.includes(p));
+      verdict = missing.length ? `❌ MISSING ${missing.join(', ')}` : '✅ darwin + linux + win32';
+    } else if (role === 'satellite-only') {
+      verdict = have.length
+        ? `✅ prebuilt (${have.join(', ')})`
+        : 'ℹ️ no prebuild — source build (python3, make, C++ compiler) required on a satellite';
+    } else {
+      verdict = '❌ unclassified role';
+    }
+    lines.push(`| ${maj} | ${abi} | ${role} | ${have.join(', ') || '(none)'} | ${verdict} |`);
+  }
+  for (const maj of [21, 23]) {
+    if (!allowed.includes(maj)) {
+      lines.push(`| ~~${maj}~~ | ${ABI[maj]} | — | (none) | excluded by engines (no prebuild) |`);
+    }
+  }
+  if (future.length) {
+    lines.push(
+      `| ${future[0]}+ | ? | future | — | ℹ️ beyond the ABI table horizon (Node ${horizon}) — extend ABI when it ships |`,
+    );
+  }
+  lines.push('');
+  lines.push(
+    gaps.length
+      ? `**Hub coverage gaps:** ${gaps.map((g) => `Node ${g.major} (ABI ${g.abi}) missing ${g.missing.join('/')}`).join('; ')}`
+      : '**No hub coverage gaps.**',
+  );
+  if (satelliteOnly.length) {
+    lines.push('');
+    lines.push(
+      `**Satellite-only majors:** ${satelliteOnly.join(', ')} — no prebuild, so npm compiles better-sqlite3 from source. python3, make and a C/C++ compiler must be present even though a satellite never loads the binding.`,
+    );
+  }
+  const report = lines.join('\n') + '\n';
+
+  return { allowed, hub, satelliteOnly, future, gaps, problems: [...new Set(problems)], report };
 }
 
-// Core invariant: no engines-allowed major may lack a darwin prebuild. If Node 23
-// (or any other prebuild-less major) is re-admitted to engines, this trips.
-for (const maj of gaps) {
-  problems.push(`Node ${maj} (ABI ${ABI[maj]}) is allowed by engines but has NO darwin prebuild — narrow engines or wait for a prebuild`);
+// --- CLI ---------------------------------------------------------------------
+function main(argv) {
+  const assetsFile = argv[2];
+  if (!assetsFile) {
+    console.error('prebuild-coverage: pass the assets list file');
+    return 2;
+  }
+
+  const pkg = JSON.parse(readFileSync('./package.json', 'utf-8'));
+  const engines = String(pkg.engines?.node ?? '>=22');
+
+  let bsqlVersion = 'unknown';
+  try {
+    const lock = JSON.parse(readFileSync('./package-lock.json', 'utf-8'));
+    bsqlVersion = lock.packages?.['node_modules/better-sqlite3']?.version ?? bsqlVersion;
+  } catch { /* informational only */ }
+
+  const assets = readFileSync(assetsFile, 'utf-8').split('\n').map((l) => l.trim()).filter(Boolean);
+  const { allowed, satelliteOnly, problems, report } = evaluateCoverage(engines, assets, { bsqlVersion });
+
+  process.stdout.write(report);
+
+  if (problems.length) {
+    console.error('PREBUILD COVERAGE FAIL:');
+    for (const p of problems) console.error(`  ✖ ${p}`);
+    return 1;
+  }
+
+  console.log(
+    `prebuild-coverage OK — engines-allowed majors: ${allowed.join(', ')}; hub majors have darwin+linux+win32 prebuilds` +
+      (satelliteOnly.length ? `; satellite-only (source build): ${satelliteOnly.join(', ')}` : ''),
+  );
+  return 0;
 }
 
-if (problems.length) {
-  console.error('PREBUILD COVERAGE FAIL:');
-  for (const p of [...new Set(problems)]) console.error(`  ✖ ${p}`);
-  process.exit(1);
+if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+  process.exit(main(process.argv));
 }
-
-console.log(`prebuild-coverage OK — all engines-allowed majors (${allowed.join(', ')}) have darwin prebuilds; Node 23 excluded by engines.`);

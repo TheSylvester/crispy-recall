@@ -2,9 +2,13 @@
  * preflight Node-version gate.
  *
  * recall ships prebuilt better-sqlite3 bindings only for Node 22 LTS (>=22.16)
- * and Node >=24, matching package.json `engines` (">=22.16.0 <23 || >=24.0.0")
- * and the README ("Node 23 is unsupported"). runPreflight must FAIL fast on any
- * other Node instead of letting the install reach a cryptic native-load error.
+ * and Node >=24. This is the HUB floor and it is deliberately NARROWER than
+ * package.json `engines` (">=20.0.0 <21 || >=22.0.0 <23 || >=24.0.0"), which is
+ * the wider SATELLITE floor — a satellite loads no native addon, so npm must not
+ * refuse the install on Node 20 (see preflight-satellite.test.ts). Node 21 and
+ * Node 23 have no prebuilt binding for their ABIs (120, 131) and are excluded
+ * from both roles. runPreflight must FAIL fast on any other Node instead of
+ * letting the install reach a cryptic native-load error.
  *
  * The running Node version is injected via opts.nodeVersion so the boundaries run
  * on any host. Sandboxed via _setTestRoot + CLAUDE_CONFIG_DIR and offline so no
