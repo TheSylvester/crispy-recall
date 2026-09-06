@@ -39,6 +39,7 @@
     "pretest": "npm run build",
     "test": "vitest run",
     "prepack": "npm run build && rm -f dist/better_sqlite3.node",
+    "postpack": "node scripts/build.mjs",
     "prepublishOnly": "npm run build && rm -f dist/better_sqlite3.node"
   },
   "dependencies": {
