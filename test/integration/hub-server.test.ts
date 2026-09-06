@@ -13,7 +13,9 @@
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { existsSync, readFileSync, readdirSync, statSync, writeFileSync, chmodSync } from 'node:fs';
-import { spawnSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { connect } from 'node:net';
+import { mkdirSync } from 'node:fs';
 import { homedir, platform, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -408,6 +410,84 @@ describe.skipIf(win32)('hub daemon — scope proof with a recording CLI stub', (
     expect(all.argv).toEqual(['walrus', '--all', '--no-catchup']);
     const noKey = await spawned({ argv: ['walrus'], cwd: '/home/x/proj' });
     expect(noKey.argv).toEqual(['walrus', '--project', '/home/x/proj', '--no-catchup']);
+  });
+
+  it('M3: a satellite `path:` key for a repository the HUB owns is upgraded to the repo key before scoping', async () => {
+    // A Windows satellite reaches a WSL repository through `\\wsl$\…` and can
+    // only derive `path:/home/u/dev/R`. Ingest already upgrades that key
+    // (ingest-queue.ts), so the rows are stored under `git:<root>`; forwarding
+    // the raw key scoped the query to a key NO row carries — a silent zero.
+    const repo = join(sb.tmp, 'm3repo');
+    mkdirSync(repo, { recursive: true });
+    const g = (args: string[]) => execFileSync('git', [
+      '-c', 'user.name=Test', '-c', 'user.email=test@example.com', '-c', 'commit.gpgsign=false', ...args,
+    ], { cwd: repo, encoding: 'utf8' });
+    g(['init', '-q', '-b', 'main']);
+    writeFileSync(join(repo, 'f.txt'), 'content\n');
+    g(['add', '-A']);
+    g(['commit', '-q', '-m', 'c0']);
+
+    const { deriveProjectKey } = await import('../../src/recall/project-key.js');
+    const expected = deriveProjectKey(repo).key!;
+    expect(expected.startsWith('git:')).toBe(true);
+
+    const r = await spawned({ argv: ['walrus'], cwd: repo, key: `path:${repo}` });
+    expect(r.argv[r.argv.indexOf('--project-key') + 1]).toBe(expected);
+    expect(r.argv).not.toContain(`path:${repo}`);
+    // `--project` keeps the cwd verbatim: only the KEY half is upgraded.
+    expect(r.argv[r.argv.indexOf('--project') + 1]).toBe(repo);
+  }, 30_000);
+});
+
+describe.skipIf(win32)('hub daemon — L6: a request body has a deadline', () => {
+  /** Announce a Content-Length and send NO body; resolve on socket close. */
+  function rawHeadersOnly(port: number, path: string, headers: Record<string, string>, declaredLength: number): Promise<{ raw: string; ms: number }> {
+    return new Promise((resolve, reject) => {
+      const started = Date.now();
+      const socket = connect({ host: '127.0.0.1', port });
+      let raw = '';
+      socket.setEncoding('utf8');
+      socket.on('data', (c: string) => { raw += c; });
+      socket.on('error', reject);
+      socket.on('close', () => resolve({ raw, ms: Date.now() - started }));
+      socket.on('connect', () => {
+        socket.write([
+          `PUT ${path} HTTP/1.1`, 'host: 127.0.0.1',
+          ...Object.entries(headers).map(([k, v]) => `${k}: ${v}`),
+          `content-length: ${declaredLength}`, '', '',
+        ].join('\r\n'));
+        // Deliberately no body and NO half-close: this is the stall the fix
+        // bounds. `requestTimeout = 0` left this socket pinned forever.
+      });
+      // Fails the test rather than hanging the run if the deadline never fires.
+      setTimeout(() => { socket.destroy(); resolve({ raw, ms: Date.now() - started }); }, 6_000).unref();
+    });
+  }
+
+  it('an authenticated append that announces a body and never sends it is closed by the deadline', async () => {
+    const { startHubServer } = await import('../../src/hub/server.js');
+    const { issueHubToken } = await import('../../src/hub/tokens.js');
+    await withInProcessHub('recall-hub-l6-', async () => {
+      const handle = await startHubServer({
+        bind: '127.0.0.1', port: 0, sweepMs: null, startupSweep: false,
+        // Injected purely so the test is fast; production uses the 5 min default.
+        requestTimeoutMs: 700,
+      });
+      return { handle, token: issueHubToken('stall') };
+    }, async ({ url, token }) => {
+      const port = Number(new URL(url).port);
+      const path = appendPath('claude', `projects/-stall/${randomUUID()}.jsonl`, 0);
+      const headers = authHeaders(token, { 'x-recall-meta': metaHeader({ cwd: '/home/x/proj' }) });
+      const r = await rawHeadersOnly(port, path, headers, 4096);
+      // Closed well inside the 6 s guard, and answered rather than dropped.
+      expect(r.ms).toBeLessThan(3_000);
+      expect(r.raw.startsWith('HTTP/1.1 408')).toBe(true);
+    });
+  }, 30_000);
+
+  it('the default deadline is 5 minutes — longer than any legitimate 8 MiB append', async () => {
+    const { HUB_REQUEST_TIMEOUT_MS } = await import('../../src/hub/server.js');
+    expect(HUB_REQUEST_TIMEOUT_MS).toBe(300_000);
   });
 });
 

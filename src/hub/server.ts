@@ -19,6 +19,7 @@ import { join } from 'node:path';
 import { closeDb } from '../db.js';
 import { binDir } from '../paths.js';
 import { getBinaryPath, getModelPath } from '../recall/embedder.js';
+import { mergeMirrorMeta, readMirrorMeta } from '../recall/mirror-meta.js';
 import type { ScanResult } from '../recall/mtime-scan.js';
 import {
   IngestQueue, runPushIngest, type PushIngestDeps, type PushIngestJob, type PushIngestOutcome,
@@ -117,7 +118,19 @@ export interface HubServerOptions {
   installSignalHandlers?: boolean;
   /** `process.exit(0)` after a signal-driven shutdown (the CLI does). */
   exitOnShutdown?: boolean;
+  /** Whole-request deadline; tests shorten it. Default `HUB_REQUEST_TIMEOUT_MS`. */
+  requestTimeoutMs?: number;
 }
+
+/**
+ * L6: a body deadline. `requestTimeout = 0` plus a `readExact` that waits
+ * forever meant one authenticated satellite could announce a Content-Length,
+ * send nothing, and pin a socket (and its `withFileLock` turn) for the life of
+ * the daemon. 5 minutes is far longer than any legitimate 8 MiB append and
+ * bounds the leak. It measures request RECEIPT only, so a slow query response
+ * is unaffected.
+ */
+export const HUB_REQUEST_TIMEOUT_MS = 300_000;
 
 export interface HubHandle {
   server: Server;
@@ -357,7 +370,13 @@ export async function startHubServer(opts: HubServerOptions): Promise<HubHandle>
         }
       }
       const r = appendMirrorBytes(abs, body.buf, { offset, reset: !!meta.reset, now: nowDate });
-      if (r.ok) writeSidecar(abs, metaToSidecar(host, meta, nowDate.toISOString()));
+      // M2: MERGE, never clobber. Chunk 2 of a session usually carries no
+      // `cwd`/`key` at all (push.ts only re-peeks the head of the file), and
+      // writing this append's meta verbatim would drop the key chunk 1
+      // established — leaving the rows reachable only through `--all`.
+      if (r.ok) {
+        writeSidecar(abs, mergeMirrorMeta(readMirrorMeta(abs), metaToSidecar(host, meta, nowDate.toISOString())));
+      }
       return r;
     });
     if (!result.ok) {
@@ -441,14 +460,31 @@ export async function startHubServer(opts: HubServerOptions): Promise<HubHandle>
   // and be answered 400 by `decodeMeta`, not cut off by node's 16 KiB default
   // as a 431 (base64url inflates the 16 KiB decoded cap to ~21.8 KiB on the
   // wire).
-  const server = createServer({ maxHeaderSize: 64 * 1024 }, (req, res) => {
+  const requestTimeoutMs = opts.requestTimeoutMs ?? HUB_REQUEST_TIMEOUT_MS;
+  const server = createServer({
+    maxHeaderSize: 64 * 1024,
+    // L6: both deadlines MUST be createServer OPTIONS, never post-construction
+    // property assignments. Measured on node 22.18: assigning EITHER
+    // `server.requestTimeout` or `server.headersTimeout` after the server
+    // exists silently disarms the timeout sweep for the whole server — which
+    // is why the previous `requestTimeout = 0; headersTimeout = 60_000;` pair
+    // left a headers-only append able to pin a socket for the life of the
+    // daemon, with no header deadline either.
+    requestTimeout: requestTimeoutMs,
+    // node validates `headersTimeout <= requestTimeout`; header receipt is a
+    // subset of request receipt, so clamping is the honest reading of both.
+    headersTimeout: Math.min(60_000, requestTimeoutMs),
+    // node checks the deadlines on a SWEEP, not a per-socket timer, so a
+    // deadline shorter than the sweep interval never fires. Production keeps
+    // node's 30 s sweep (300 s / 4 caps back to it); a test that injects a
+    // sub-second deadline gets a proportionally short sweep.
+    connectionsCheckingInterval: Math.min(30_000, Math.max(50, Math.floor(requestTimeoutMs / 4))),
+  }, (req, res) => {
     handle(req, res).catch((e) => {
       hubLog(`request-error ${(e as Error).message}`);
       try { sendJson(res, 500, { error: 'internal error' }); } catch { /* socket gone */ }
     });
   });
-  server.requestTimeout = 0;
-  server.headersTimeout = 60_000;
 
   // ---- lifecycle ---------------------------------------------------------------
 

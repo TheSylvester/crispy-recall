@@ -18,6 +18,7 @@ import { classifySession } from '../recall/session-classifier.js';
 import { ingestSessionMessages } from '../recall/message-ingest.js';
 import { sessionIdFromPath } from '../recall/mtime-scan.js';
 import { upgradeLocalPathKey } from '../recall/project-key.js';
+import { normalizePath } from '../url-path-resolver.js';
 import { mirrorHostPrefix } from './mirror.js';
 import type { AppendMeta, HubVendor } from './protocol.js';
 
@@ -122,6 +123,37 @@ export async function runPushIngest(job: PushIngestJob, deps: PushIngestDeps): P
   if (result.error) {
     deps.log(`push-ingest-failed host=${job.host} path=${job.rel} err=${result.error}`);
     return 'failed';
+  }
+
+  // M2: adopt the identity a LATER chunk taught us.
+  //
+  // Rows go in with `INSERT OR IGNORE` (message-store.ts), so a row written
+  // while the satellite still had no cwd keeps its NULL `project_key`
+  // forever — the session is then reachable only through `--all`. The first
+  // append that does carry a key/cwd must therefore back-fill the rows that
+  // were stored blind. Strictly NULL/empty-only: a row that already carries
+  // an identity was keyed by something that knew more than this chunk does.
+  if (key !== undefined) {
+    try {
+      db.run(
+        'UPDATE messages SET project_key = ? WHERE session_id = ? AND project_key IS NULL',
+        [key, result.sessionId],
+      );
+    } catch (e) {
+      deps.log(`push-key-adopt-failed host=${job.host} sid=${result.sessionId} err=${(e as Error).message}`);
+    }
+  }
+  if (job.meta.cwd !== undefined) {
+    // Same normalization message-ingest.ts:267 applies, so the adopted value
+    // is byte-identical to what a first-chunk-with-cwd would have written.
+    try {
+      db.run(
+        "UPDATE messages SET project_id = ? WHERE session_id = ? AND (project_id IS NULL OR project_id = '')",
+        [normalizePath(job.meta.cwd), result.sessionId],
+      );
+    } catch (e) {
+      deps.log(`push-project-adopt-failed host=${job.host} sid=${result.sessionId} err=${(e as Error).message}`);
+    }
   }
 
   // 2d. Watermark only after a clean ingest (advance-then-ingest drops turns).

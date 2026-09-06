@@ -84,6 +84,13 @@ export const HEAD_FIELD_BYTES = Buffer.byteLength(',"head":"' + 'a'.repeat(64) +
 
 /** Bytes of a transcript read when peeking for the session cwd. */
 export const CWD_PEEK_BYTES = 64 * 1024;
+/**
+ * Hard ceiling for the peek after doubling (M2). A single JSONL entry CAN
+ * exceed 64 KiB — a pasted file, a large image block — and the old fixed
+ * window then produced zero complete lines, so the push shipped no `cwd` and
+ * no `key` and the hub stored the session with a NULL project_key.
+ */
+export const CWD_PEEK_MAX_BYTES = 1024 * 1024;
 /** Lines of that peek inspected. */
 export const CWD_PEEK_LINES = 20;
 
@@ -211,27 +218,40 @@ function underRoot(root: string, file: string): boolean {
  * Read the session cwd from the head of a transcript: `cwd` on a Claude
  * entry, `payload.cwd` in the Codex `session_meta`. Bounded to the first
  * 64 KB / 20 lines so a 100 MB rollout costs one read.
+ *
+ * The window DOUBLES, up to `CWD_PEEK_MAX_BYTES`, while it has yielded fewer
+ * than `CWD_PEEK_LINES` COMPLETE lines and has not reached EOF. Only a
+ * complete line is parsed: a fragment cut by the window is never valid JSON,
+ * and treating it as a line is what made an oversized first entry hide the
+ * cwd of every entry behind it. The common case still costs exactly one
+ * 64 KiB read, because a normal head yields 20 complete lines at once.
  */
 export function peekCwd(file: string): string | undefined {
   let fd: number | undefined;
   try {
     fd = openSync(file, 'r');
-    const buf = Buffer.alloc(CWD_PEEK_BYTES);
-    const n = readSync(fd, buf, 0, CWD_PEEK_BYTES, 0);
-    const text = buf.subarray(0, n).toString('utf-8');
-    const lines = text.split('\n').slice(0, CWD_PEEK_LINES);
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      let entry: Record<string, unknown>;
-      try { entry = JSON.parse(line) as Record<string, unknown>; } catch { continue; }
-      if (typeof entry['cwd'] === 'string' && entry['cwd']) return entry['cwd'] as string;
-      const payload = entry['payload'];
-      if (payload && typeof payload === 'object') {
-        const c = (payload as Record<string, unknown>)['cwd'];
-        if (typeof c === 'string' && c) return c;
+    let window = CWD_PEEK_BYTES;
+    for (;;) {
+      const buf = Buffer.alloc(window);
+      const n = readSync(fd, buf, 0, window, 0);
+      const parts = buf.subarray(0, n).toString('utf-8').split('\n');
+      // A trailing fragment is a whole line only when the read hit EOF.
+      const eof = n < window;
+      const complete = eof ? parts : parts.slice(0, -1);
+      for (const line of complete.slice(0, CWD_PEEK_LINES)) {
+        if (!line.trim()) continue;
+        let entry: Record<string, unknown>;
+        try { entry = JSON.parse(line) as Record<string, unknown>; } catch { continue; }
+        if (typeof entry['cwd'] === 'string' && entry['cwd']) return entry['cwd'] as string;
+        const payload = entry['payload'];
+        if (payload && typeof payload === 'object') {
+          const c = (payload as Record<string, unknown>)['cwd'];
+          if (typeof c === 'string' && c) return c;
+        }
       }
+      if (eof || complete.length >= CWD_PEEK_LINES || window >= CWD_PEEK_MAX_BYTES) return undefined;
+      window = Math.min(window * 2, CWD_PEEK_MAX_BYTES);
     }
-    return undefined;
   } catch {
     return undefined;
   } finally {

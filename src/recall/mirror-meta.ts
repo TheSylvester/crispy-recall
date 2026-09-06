@@ -62,3 +62,23 @@ export function readMirrorMeta(transcriptPath: string): MirrorMeta | null {
   if (m['cwd'] !== undefined && typeof m['cwd'] !== 'string') return null;
   return parsed as MirrorMeta;
 }
+
+/**
+ * Merge a freshly-decoded sidecar over the one already on disk (M2).
+ *
+ * An append carries only what the satellite could see for THAT chunk: a push
+ * whose `peekCwd` fell outside its window sends no `cwd` and no `key`, and a
+ * subsequent chunk of a session whose key was already learned sends none
+ * either. Writing `next` verbatim — as the hub did — erased the key from the
+ * sidecar, and with it the only channel by which `repair --full`, `backfill`
+ * and the mirror sweep can key a mirrored transcript at all.
+ *
+ * `next` never carries explicit `undefined` (metaToSidecar omits absent
+ * fields), so a plain spread is exactly the rule "the incoming value wins
+ * when present, the stored one survives when it is not". `host`, `updatedAt`
+ * and `v` are always present on `next` and always win.
+ */
+export function mergeMirrorMeta(prior: MirrorMeta | null, next: MirrorMeta): MirrorMeta {
+  if (prior === null) return next;
+  return { ...prior, ...next };
+}

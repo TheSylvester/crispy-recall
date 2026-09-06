@@ -439,6 +439,90 @@ describe.skipIf(win32)('in-process daemon: collision through the wire increments
   }, 20_000);
 });
 
+describe.skipIf(win32)('M2: sidecar merge + later-key adoption through the wire', () => {
+  it('chunk 1 (cwd only) leaves NULL keys; chunk 2 (cwd+key) adopts them for EVERY row; chunk 3 (empty meta) does not erase the sidecar', async () => {
+    const sid = randomUUID();
+    const rel = `projects/-m2/${sid}.jsonl`;
+    const cwd = '/home/u/m2proj';
+    const token = issueHubToken('m2host');
+    const h = await startHubServer({ bind: '127.0.0.1', port: 0, sweepMs: null, startupSweep: false, spawnEmbed: () => { /* never */ } });
+    const abs = mirrorFilePath('m2host', 'claude', rel);
+    const sidecar = () => JSON.parse(readFileSync(`${abs}.meta.json`, 'utf-8'));
+    const rows = () => getDb(dbPath()).all(
+      'SELECT message_id, project_id, project_key FROM messages WHERE session_id = ? ORDER BY message_seq', [sid],
+    ) as Array<{ message_id: string; project_id: string | null; project_key: string | null }>;
+    try {
+      const url = `http://127.0.0.1:${h.port}`;
+      const put = async (offset: number, body: string, meta: Parameters<typeof metaHeader>[0]) => {
+        const r = await req(url, {
+          method: 'PUT',
+          path: appendPath('claude', rel, offset),
+          headers: authHeaders(token, { 'x-recall-meta': metaHeader(meta) }),
+          body,
+        });
+        expect(r.status).toBe(200);
+        await h.queue.idle(5_000);
+      };
+
+      // Chunk 1: `peekCwd` found a cwd but the satellite shipped no key — the
+      // live 37-row NULL-key shape on the hub.
+      const c1 = claudeEntry(sid, 0, 'first chunk turn, long enough to clear the fifty character embedding floor', { cwd });
+      await put(0, c1, { cwd, final: true });
+      expect(rows()).toHaveLength(1);
+      expect(rows()[0]!.project_key).toBe(null);
+      expect(rows()[0]!.project_id).toBe(cwd);
+
+      // Chunk 2: the satellite has since derived the key. The rows written by
+      // chunk 1 are INSERT OR IGNORE'd on re-ingest, so without adoption they
+      // stay NULL forever and the session is reachable only through `--all`.
+      const c2 = claudeEntry(sid, 1, 'second chunk turn, long enough to clear the fifty character embedding floor', { cwd });
+      await put(c1.length, c2, { cwd, key: KEY, final: true });
+      const after = rows();
+      expect(after).toHaveLength(2);
+      expect(after.map((r) => r.project_key)).toEqual([KEY, KEY]);
+      expect(after.map((r) => r.project_id)).toEqual([cwd, cwd]);
+      expect(sidecar()).toMatchObject({ host: 'm2host', cwd, key: KEY, v: 1 });
+
+      // Chunk 3: a push whose peek window found nothing sends bare meta. The
+      // sidecar is the ONLY channel by which `repair --full`, `backfill` and
+      // the mirror sweep can key a mirrored transcript, so it must survive.
+      const c3 = claudeEntry(sid, 2, 'third chunk turn, long enough to clear the fifty character embedding floor', { cwd });
+      await put(c1.length + c2.length, c3, { final: true });
+      expect(sidecar()).toMatchObject({ host: 'm2host', cwd, key: KEY, v: 1 });
+      const final = rows();
+      expect(final).toHaveLength(3);
+      expect(final.map((r) => r.project_key)).toEqual([KEY, KEY, KEY]);
+    } finally {
+      await h.stop();
+    }
+  }, 30_000);
+
+  it('a later job that carries the key adopts the rows an earlier keyless job wrote', async () => {
+    const sid = randomUUID();
+    const rel = `projects/-m2b/${sid}.jsonl`;
+    const job = stageMirror('sat1', rel, claudeEntry(sid, 0, 'sweep-path turn, long enough to clear the fifty character embedding floor', { cwd: '/home/u/m2b' }), { cwd: '/home/u/m2b' });
+    expect(await runPushIngest(job, deps())).toBe('ingested');
+    expect(getDb(dbPath()).all('SELECT project_key FROM messages WHERE session_id = ?', [sid])).toEqual([{ project_key: null }]);
+    // Re-ingest alone cannot fix it (INSERT OR IGNORE skips the existing row);
+    // the UPDATE is what closes the gap.
+    const withKey: PushIngestJob = { ...job, meta: { cwd: '/home/u/m2b', key: KEY } };
+    expect(await runPushIngest(withKey, deps())).toBe('ingested');
+    expect(getDb(dbPath()).all('SELECT project_id, project_key FROM messages WHERE session_id = ?', [sid]))
+      .toEqual([{ project_id: '/home/u/m2b', project_key: KEY }]);
+  });
+
+  it('adoption never overwrites a key a row already carries', async () => {
+    const sid = randomUUID();
+    const rel = `projects/-m2c/${sid}.jsonl`;
+    const other = 'git:' + 'e'.repeat(40);
+    const job = stageMirror('sat1', rel, claudeEntry(sid, 0, 'already-keyed turn, long enough to clear the fifty character floor', { cwd: '/home/u/m2c' }), { cwd: '/home/u/m2c', key: other });
+    expect(await runPushIngest(job, deps())).toBe('ingested');
+    const relabelled: PushIngestJob = { ...job, meta: { cwd: '/home/u/m2c', key: KEY } };
+    expect(await runPushIngest(relabelled, deps())).toBe('ingested');
+    expect(getDb(dbPath()).all('SELECT project_key FROM messages WHERE session_id = ?', [sid])).toEqual([{ project_key: other }]);
+  });
+});
+
 describe.skipIf(win32)('doctor hub section', () => {
   it('warns on a mirror with no live daemon and on an ANY bind', () => {
     mkdirSync(transcriptGlob(remoteRoot(), 'sat9', 'claude', 'projects', 'p'), { recursive: true });
