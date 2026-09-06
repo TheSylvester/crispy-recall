@@ -287,6 +287,8 @@ USAGE
   recall --blame <path>[:<line>[-<line>]]...  Sessions responsible for a file
                                      or a specific line/range (via git blame)
   recall backfill [flags]            Catch up FTS5 + embeddings against transcript files
+  recall repair --messages          Recover missed turns and repair message order
+                                     without clearing indexed history
   recall repair --rekey-projects [--force]
                                      Fill messages.project_key for existing rows
                                      (attended; --force also re-keys keyed rows)
@@ -318,7 +320,7 @@ FLAGS
   --limit N        Max results for search/list modes (search: 200, list: 50)
   --offset N       Continue reading from this message sequence number
   --since DATE     Only sessions after this date (list and search modes, ISO-8601)
-  --until DATE     Only sessions before this date (inclusive of the day, ISO-8601)
+  --until DATE     Through this UTC day, or exact ISO-8601 timestamp
   --project PATH   Scope to a specific project path (default: CWD)
   --project-key K  Scope by an already-derived repo key (git:/origin:/path:);
                    skips derivation. Used by the hub for proxied queries.
