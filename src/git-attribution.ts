@@ -295,6 +295,14 @@ async function matchCommit(
   commitFileTriCache: Map<string, Set<string>>,
 ): Promise<SessionMatch[]> {
   const commitFiles = new Set(info.files);
+  // Windows edit paths can spell the same file with different casing from Git.
+  // Match against folded keys there, but retain Git's spelling for git-show and
+  // output. POSIX remains case-sensitive; prefer exact matches on every host.
+  const windowsFiles = process.platform === 'win32'
+    ? new Map(info.files.map((file) => [file.toLowerCase(), file]))
+    : undefined;
+  const canonicalFile = (file: string): string | undefined =>
+    commitFiles.has(file) ? file : windowsFiles?.get(file.toLowerCase());
   const windowAfterMs = opts.windowAfterMs ?? 60 * 60 * 1000;
   const lower = info.parentTime;
   const upper = info.commitTime + windowAfterMs;
@@ -339,7 +347,7 @@ async function matchCommit(
     const inWindow = trace.edits.filter((e) => e.ts >= lower && e.ts <= upper);
     if (inWindow.length === 0) continue;
 
-    const touchedFiles = new Set(inWindow.map((e) => e.file).filter((f) => commitFiles.has(f)));
+    const touchedFiles = new Set(inWindow.map((e) => canonicalFile(e.file)).filter((file): file is string => file !== undefined));
     if (touchedFiles.size === 0) continue;
 
     // Per-file tri-gram sets for session edits to commit-touched files.
@@ -347,11 +355,12 @@ async function matchCommit(
     // multiple files (the bug noted in the spike's caveats).
     const sessionTriByFile = new Map<string, Set<string>>();
     for (const e of inWindow) {
-      if (!commitFiles.has(e.file)) continue;
-      let bucket = sessionTriByFile.get(e.file);
+      const file = canonicalFile(e.file);
+      if (file === undefined) continue;
+      let bucket = sessionTriByFile.get(file);
       if (!bucket) {
         bucket = new Set<string>();
-        sessionTriByFile.set(e.file, bucket);
+        sessionTriByFile.set(file, bucket);
       }
       for (const t of triGrams(e.content.split('\n'))) bucket.add(t);
     }

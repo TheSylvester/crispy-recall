@@ -549,3 +549,32 @@ describe('Windows path normalization and Codex attribution', () => {
     } finally { fs.rmSync(dir, { recursive: true, force: true }); }
   });
 });
+
+describe('platform-aware attribution file matching', () => {
+  it('folds Windows relative-tail casing while preserving Git spelling and POSIX distinctions', async () => {
+    const dir = tmpDir('recall-attribution-case-');
+    const descriptor = Object.getOwnPropertyDescriptor(process, 'platform')!;
+    try {
+      const repo = path.join(dir, 'repo');
+      const sessions = path.join(dir, 'sessions');
+      fs.mkdirSync(repo);
+      initRepo(repo);
+      commit(repo, 'base', [{ file: 'base.txt', content: 'base' }], isoMinutesAgo(10));
+      const text = 'const first = 1;\nconst second = 2;\nexport const sum = first + second;\n';
+      const hash = commit(repo, 'mixed case path', [{ file: 'src/a.ts', content: text }], isoMinutesAgo(2));
+      writeSessionJsonl(sessions, 'mixed-tail', [editEvent({
+        tool: 'Write', filePath: repo.replace(/\\/g, '/') + '/SRC/A.TS', newString: text, ts: isoMinutesAgo(3),
+      })]);
+      const opts = { repoRoot: repo, sessionsDir: sessions };
+      Object.defineProperty(process, 'platform', { ...descriptor, value: 'win32' });
+      const windows = await findSessionsForCommit(hash, opts);
+      expect(windows).toHaveLength(1);
+      expect(windows[0]).toMatchObject({ session: 'mixed-tail', matched_files: ['src/a.ts'], surviving_ratio: 1 });
+      Object.defineProperty(process, 'platform', { ...descriptor, value: 'linux' });
+      expect(await findSessionsForCommit(hash, opts)).toEqual([]);
+    } finally {
+      Object.defineProperty(process, 'platform', descriptor);
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
