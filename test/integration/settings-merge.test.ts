@@ -152,22 +152,54 @@ describe('hook ownership and grouped entries', () => {
     expect(JSON.parse(readFileSync(p, 'utf8')).hooks.Stop).toEqual([entry]);
   });
 
-  // A wrapper we do not own is still an invocation that RUNS. Appending our own
-  // entry beside it would fire the Stop hook twice per turn (two ingests, two
-  // embed-pending spawns), so merge must treat it as already present.
+  // A wrapper we do not own is still an invocation that RUNS, so adding our
+  // own entry beside it fires the hook twice per turn. That duplicate is an
+  // ACCEPTED limitation: shell text cannot be judged by substring, and the
+  // alternative (suppressing the install on a path mention) silently leaves a
+  // machine without ingestion — see the mention cases below.
   it.each([
     `sh -c 'my-notify; ${CMD}'`,
     `${CMD} && my-notify`,
-  ])('does not add a second entry beside a wrapper running the same invocation: %s', (command) => {
+  ])('adds the recall entry beside a wrapper running the same invocation (accepted duplicate): %s', (command) => {
     const entry = { matcher: '', hooks: [{ type: 'command', command }] };
     const p = setup(JSON.stringify({ hooks: { Stop: [entry], SubagentStop: [entry] } }));
-    expect(mergeStopHook(p, HOOK).changed).toBe(false);
+    expect(mergeStopHook(p, HOOK).changed).toBe(true);
     const hooks = JSON.parse(readFileSync(p, 'utf8')).hooks;
-    expect(hooks.Stop).toHaveLength(1);
-    expect(hooks.SubagentStop).toHaveLength(1);
-    expect(hooks.Stop[0]).toEqual(entry);
-    // Still not ours: removal leaves the user's wrapper alone.
-    expect(removeStopHook(p).changed).toBe(false);
+    for (const name of ['Stop', 'SubagentStop']) {
+      expect(hooks[name]).toHaveLength(2);
+      expect(hooks[name][0]).toEqual(entry);
+      expect(hooks[name][1].hooks[0].command).toBe(CMD);
+    }
+    // Still not ours: removal takes only our direct entry and leaves the wrapper.
+    expect(removeStopHook(p).changed).toBe(true);
+    const after = JSON.parse(readFileSync(p, 'utf8')).hooks;
+    expect(after.Stop).toEqual([entry]);
+    expect(after.SubagentStop).toEqual([entry]);
+  });
+
+  // Commands that merely MENTION both paths run nothing of ours. A substring
+  // match once treated them as "already installed" and skipped the install.
+  it.each([
+    [`echo '${CMD}'`, 'an echo of the command'],
+    [`echo ok # ${CMD}`, 'a comment naming the command'],
+    [`"${process.execPath}" "${HOOK}.bak"`, 'a different script whose name has the hook path as a prefix'],
+    [`node -e "console.log(process.argv)" -- "${process.execPath}" "${HOOK}"`, 'the paths as arguments to another program'],
+  ])('installs the recall entry beside %s (%s)', (command) => {
+    const entry = { matcher: '', hooks: [{ type: 'command', command }] };
+    const p = setup(JSON.stringify({ hooks: { Stop: [entry], SubagentStop: [entry] } }));
+    expect(mergeStopHook(p, HOOK).changed).toBe(true);
+    const hooks = JSON.parse(readFileSync(p, 'utf8')).hooks;
+    for (const name of ['Stop', 'SubagentStop']) {
+      expect(hooks[name]).toHaveLength(2);
+      expect(hooks[name][0]).toEqual(entry);
+      expect(hooks[name][1].hooks[0].command).toBe(CMD);
+    }
+    // Idempotent on a second merge: exactly one recall entry, the mention untouched.
+    expect(mergeStopHook(p, HOOK).changed).toBe(false);
+    expect(JSON.parse(readFileSync(p, 'utf8')).hooks.Stop).toHaveLength(2);
+    // Never claimed: removal deletes only our direct entry.
+    removeStopHook(p);
+    expect(JSON.parse(readFileSync(p, 'utf8')).hooks.Stop).toEqual([entry]);
   });
 
   it('still adds the recall entry beside a wrapper running a DIFFERENT hook path', () => {

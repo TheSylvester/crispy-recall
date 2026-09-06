@@ -113,26 +113,6 @@ function isRecallCommand(cmd: string | undefined): boolean {
     (/(^|[\\/])\.recall[\\/]/.test(script) || script === join(binDir(), 'stop-hook.js'));
 }
 
-/**
- * Does `cmd` already RUN the invocation we are about to add, wrapped in
- * something we do not own — e.g. `sh -c 'my-notify; "<node>" "<hook>"'`?
- *
- * `isRecallCommand` deliberately refuses to claim such a wrapper (we must never
- * rewrite or delete a user's shell line). But "not ours" is not "not there": if
- * we appended our own entry beside it, the Stop hook would fire TWICE per turn
- * — two ingests and two embed-pending spawns. So merging treats a wrapper that
- * mentions BOTH the exact node path and the exact staged hook path as already
- * present, and adds nothing. Removal/rewrite semantics are unchanged: a wrapper
- * is still not ours to touch.
- *
- * A wrapper pointing at a DIFFERENT (stale) hook path is not this invocation,
- * so the recall entry is still added beside it.
- */
-function mentionsInvocation(cmd: string | undefined, nodePath: string, hookScriptPath: string): boolean {
-  if (typeof cmd !== 'string') return false;
-  return cmd.includes(nodePath) && cmd.includes(hookScriptPath);
-}
-
 function findRecallEntry(arr: HookEntry[]): { entry: HookEntry; cmd: HookCommand } | null {
   for (const entry of arr) {
     const hooks = entry.hooks;
@@ -181,14 +161,15 @@ export function mergeStopHook(filePath: string, hookScriptPath: string): MergeRe
     const arr = Array.isArray(obj.hooks[name]) ? obj.hooks[name]! : [];
     const found = findRecallEntry(arr);
     if (!found) {
-      // Not ours to own — but if a user wrapper already runs this exact
-      // invocation, adding our entry would double-fire the hook. Leave it be.
-      const wrapped = arr.some((entry) =>
-        Array.isArray(entry.hooks) && entry.hooks.some((h) => mentionsInvocation(h.command, nodePath, hookScriptPath)));
-      if (!wrapped) {
-        arr.push(makeEntry(desiredCommand));
-        changed = true;
-      }
+      // Not ours to own → add our own direct entry. A user wrapper that happens
+      // to run the same invocation (`sh -c 'notify; "<node>" "<hook>"'`) will
+      // then fire the hook twice per turn; that duplicate is an accepted
+      // limitation. Shell text cannot be judged by substring: `echo '<cmd>'`,
+      // a trailing `# <cmd>` comment or `"<node>" "<hook>.bak"` all CONTAIN the
+      // paths and run nothing of ours, and suppressing the install on such a
+      // match would silently leave the machine without ingestion.
+      arr.push(makeEntry(desiredCommand));
+      changed = true;
     } else if (found.cmd.command !== desiredCommand) {
       // Stale recall path → rewrite in place (do not duplicate, do not touch siblings).
       found.cmd.command = desiredCommand;
