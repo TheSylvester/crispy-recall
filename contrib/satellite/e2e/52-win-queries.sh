@@ -20,15 +20,15 @@ set -u
 NAME=52-win-queries
 exec > >(tee -a "$(log_file "$NAME")") 2>&1
 
+require_e2e_env RECALL_E2E_HUB_ADDR RECALL_E2E_WIN_USER
 require_hub_up
-[ -e /mnt/c/Users/silve/.recall/config.json ] || fail "$NAME" "Windows satellite not installed — run 50-win-install.sh first"
+[ -e "$WIN_HOME/.recall/config.json" ] || fail "$NAME" "Windows satellite not installed — run 50-win-install.sh first"
 VARS=$E2E_LOG_DIR/51.vars
 [ -f "$VARS" ] || fail "$NAME" "no $VARS — run 51-win-sessions.sh first"
 WIN_SID_PATH=
 # shellcheck disable=SC1090
 . "$VARS"
 [ -n "$WIN_SID_PATH" ] || fail "$NAME" "$VARS names no WIN_SID_PATH — re-run 51-win-sessions.sh"
-WIN_HOOK_W='C:\Users\silve\.recall\bin\stop-hook.js'
 SYNTH=${RECALL_E2E_WIN_SYNTHETIC:-auto}
 AUTH_RE='Failed to authenticate|OAuth|not logged in|/login'
 SYNTHETIC_USED=0
@@ -78,7 +78,7 @@ synthetic_flash() {
   local wcwd=$1 slug=$2 prompt=$3 u pdir hout
   u=$(uuidgen) || fail "$NAME" "uuidgen failed"
   [ -n "$u" ] || fail "$NAME" "uuidgen produced an empty id"
-  pdir=/mnt/c/Users/silve/.claude/projects/$slug
+  pdir=$WIN_HOME/.claude/projects/$slug
   mkdir -p "$pdir" || fail "$NAME" "could not create $pdir"
   python3 - "$pdir/$u.jsonl" "$u" "$wcwd" "$prompt" <<'PY' || fail "$NAME" "could not write the synthetic Windows transcript"
 import json,sys,uuid
@@ -93,11 +93,11 @@ u2,l2=entry(1,'assistant',u1)
 open(f,'w',newline='\n').write(l1+'\n'+l2+'\n')
 print('    wrote %s (session %s)' % (f,sid))
 PY
-  python3 - "$WIN_DIR/payload-52d.json" "$u" "$slug" "$wcwd" <<'PY' || fail "$NAME" "could not write the hook payload"
+  python3 - "$WIN_DIR/payload-52d.json" "$u" "$slug" "$wcwd" "$WIN_HOME_W" <<'PY' || fail "$NAME" "could not write the hook payload"
 import json,sys
-f,sid,slug,cwd=sys.argv[1:5]
+f,sid,slug,cwd,winhome=sys.argv[1:6]
 json.dump({'session_id':sid,
-           'transcript_path':'C:\\Users\\silve\\.claude\\projects\\'+slug+'\\'+sid+'.jsonl',
+           'transcript_path':winhome+'\\.claude\\projects\\'+slug+'\\'+sid+'.jsonl',
            'cwd':cwd,'hook_event_name':'Stop','stop_hook_active':False}, open(f,'w'))
 print('    payload %s' % f)
 PY
@@ -111,7 +111,7 @@ CMD
   printf '%s\n' "$hout" | sed 's/^/    /'
   rm -f "$WIN_DIR/payload-52d.json"
   step "synthetic Stop-hook invoked for session $u in $wcwd"
-  step "LEFT-CHANGED: synthetic Windows session $u at C:\\Users\\silve\\.claude\\projects\\$slug\\$u.jsonl"
+  step "LEFT-CHANGED: synthetic Windows session $u at $WIN_HOME_W\\.claude\\projects\\$slug\\$u.jsonl"
   printf '%s\n' "$pdir/$u.jsonl" >> "$E2E_LOG_DIR/win-synthetic.paths"
 }
 

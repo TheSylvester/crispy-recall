@@ -15,6 +15,8 @@ set -u
 NAME=31-hub-service
 exec > >(tee -a "$(log_file "$NAME")") 2>&1
 
+require_e2e_env RECALL_E2E_HUB_ADDR RECALL_E2E_LAPTOP RECALL_E2E_LAPTOP_HOST RECALL_E2E_WIN_HOST
+
 UNIT_PID=$(systemctl --user show -p MainPID --value recall-hub 2>/dev/null || echo 0)
 DETACHED=$(python3 - "$HOME/.recall/run/hub.json" <<'PY'
 import json,os,sys

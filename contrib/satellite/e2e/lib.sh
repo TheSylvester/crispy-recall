@@ -5,10 +5,11 @@
 #     NAME=<script basename without .sh>
 #     exec > >(tee -a "$(log_file "$NAME")") 2>&1
 #
-# The scripts drive the owner's REAL machines (hub era2-wsl, Linux satellite
-# sylvester-laptop, Windows satellite silverera2). Every remote call goes
-# through lap/lap_stdin/lap_put (Tailscale SSH, exec + pty only, NO SFTP) or
-# win_cmd (WSL → cmd.exe interop). Nothing here echoes a bearer token.
+# The scripts drive REAL machines (a hub, a Linux satellite and a Windows
+# satellite), all named through RECALL_E2E_* variables — see README.md,
+# "Environment". Every remote call goes through lap/lap_stdin/lap_put (Tailscale
+# SSH, exec + pty only, NO SFTP) or win_cmd (WSL -> cmd.exe interop). Nothing
+# here echoes a bearer token.
 set -u
 
 # The acceptance seat is itself a Claude Code session, and the native binary
@@ -19,18 +20,33 @@ unset CLAUDECODE
 E2E_LOG_DIR=${RECALL_E2E_LOG_DIR:-$HOME/.recall/logs/e2e}
 mkdir -p "$E2E_LOG_DIR"
 
-HUB_ADDR=${RECALL_E2E_HUB_ADDR:-100.79.117.97}
+# No machine-specific value below carries a default: each is either impersonal
+# or EMPTY, and every script gates the ones it uses through require_e2e_env at
+# run time. Derived values use `${VAR:-}` so an unset variable never aborts this
+# file under `set -u` — sourcing lib.sh with an almost-empty environment must
+# stay silent and succeed.
+HUB_ADDR=${RECALL_E2E_HUB_ADDR:-}
 HUB_PORT=${RECALL_E2E_HUB_PORT:-7877}
 HUB_URL=http://$HUB_ADDR:$HUB_PORT
-LAPTOP=${RECALL_E2E_LAPTOP:-sylvester@100.64.125.99}
-LAPTOP_HOST=sylvester-laptop
-WIN_HOST=silverera2
-WIN_DIR=/mnt/c/Users/silve/AppData/Local/Temp/recall-e2e
-WIN_DIR_W='C:\Users\silve\AppData\Local\Temp\recall-e2e'
-WIN_RECALL_W='C:\Users\silve\AppData\Roaming\npm\recall.cmd'
-WIN_CLAUDE_W='C:\Users\silve\AppData\Roaming\npm\claude.cmd'
-WIN_NPM_W='C:\Program Files\nodejs\npm.cmd'
-NODE=/home/silver/.nvm/versions/node/v22.18.0/bin/node
+LAPTOP=${RECALL_E2E_LAPTOP:-}
+LAPTOP_HOST=${RECALL_E2E_LAPTOP_HOST:-}
+LAPTOP_HOME=${RECALL_E2E_LAPTOP_HOME:-}
+LAPTOP_REPO=${RECALL_E2E_LAPTOP_REPO:-}
+# Sent to the REMOTE shell verbatim, so `$HOME` must survive this expansion:
+# it is the laptop's home, not the seat's. Point it at the laptop's node bin
+# directory when recall lives under nvm (a non-interactive ssh never loads nvm).
+LAPTOP_PATH_PREFIX=${RECALL_E2E_LAPTOP_PATH_PREFIX:-\$HOME/.local/bin}
+WIN_HOST=${RECALL_E2E_WIN_HOST:-}
+WIN_USER=${RECALL_E2E_WIN_USER:-}
+WIN_HOME=/mnt/c/Users/${WIN_USER:-}
+WIN_HOME_W="C:\\Users\\${WIN_USER:-}"
+WIN_DIR=$WIN_HOME/AppData/Local/Temp/recall-e2e
+WIN_DIR_W="$WIN_HOME_W\\AppData\\Local\\Temp\\recall-e2e"
+WIN_RECALL_W="$WIN_HOME_W\\AppData\\Roaming\\npm\\recall.cmd"
+WIN_CLAUDE_W="$WIN_HOME_W\\AppData\\Roaming\\npm\\claude.cmd"
+WIN_HOOK_W="$WIN_HOME_W\\.recall\\bin\\stop-hook.js"
+WIN_NPM_W=${RECALL_E2E_WIN_NPM_W:-'C:\Program Files\nodejs\npm.cmd'}
+NODE=${RECALL_E2E_NODE:-}
 RECALL_BIN=${RECALL_E2E_RECALL:-recall}
 TGZ=${RECALL_E2E_TGZ:-}
 TOKEN_FILE=${RECALL_TOKEN_FILE:-$HOME/.recall/e2e-tokens.env}
@@ -69,6 +85,18 @@ fail() { # $1 script name, $2.. reason
     kill -TERM $$ 2>/dev/null
   fi
   exit 1
+}
+
+# require_e2e_env <VAR>… — the LAZY gate on the machine-specific variables.
+# Call it from a script AFTER `NAME=` is set, never at source time: this file is
+# also sourced by the lint suite with an almost-empty environment.
+require_e2e_env() { # $1.. variable names
+  local v
+  for v in "$@"; do
+    if [ -z "${!v:-}" ]; then
+      fail "${NAME:-lib}" "set $v (see contrib/satellite/e2e/README.md, \"Environment\")"
+    fi
+  done
 }
 
 # --- secrets ----------------------------------------------------------------

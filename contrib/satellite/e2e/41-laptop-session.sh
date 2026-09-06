@@ -9,12 +9,15 @@ set -u
 NAME=41-laptop-session
 exec > >(tee -a "$(log_file "$NAME")") 2>&1
 
+require_e2e_env RECALL_E2E_HUB_ADDR RECALL_E2E_LAPTOP RECALL_E2E_LAPTOP_HOST RECALL_E2E_LAPTOP_REPO
 require_hub_up
 lap 'test -f ~/.recall/satellite-token' || fail "$NAME" "the laptop is not installed in satellite mode — run 40-laptop-install.sh first"
-CRISPY_KEY=git:d30433f1268b413193c532421b123d58a63ba4b9
+# The git project_key of RECALL_E2E_LAPTOP_REPO / the Windows checkout of the
+# same repo. Override it when the fixture repo is not crispy.
+CRISPY_KEY=${RECALL_E2E_REPO_GIT_KEY:-git:d30433f1268b413193c532421b123d58a63ba4b9}
 N=$(nonce)
 step "nonce SAT-LAPTOP-$N"
-lap 'cd ~/dev/crispy && claude -p "Reply with exactly this test phrase and nothing else: SAT-LAPTOP-'"$N"'" --model haiku' \
+lap "cd '$LAPTOP_REPO' && claude -p \"Reply with exactly this test phrase and nothing else: SAT-LAPTOP-$N\" --model haiku" \
   || fail "$NAME" "claude -p exited nonzero on the laptop"
 
 MDIR=$(mirror_dir "$LAPTOP_HOST" claude)
@@ -33,7 +36,7 @@ KEY=$(hub_sql "SELECT DISTINCT project_key FROM messages WHERE session_id='$SID'
 PID=$(hub_sql "SELECT DISTINCT project_id FROM messages WHERE session_id='$SID'")
 step "sid=$SID project_key=$KEY project_id=$PID"
 [ "$KEY" = "$CRISPY_KEY" ] || fail "$NAME" "project_key is '$KEY', expected $CRISPY_KEY"
-[ "$PID" = /home/sylvester/dev/crispy ] || fail "$NAME" "project_id is '$PID', expected /home/sylvester/dev/crispy"
+[ "$PID" = "$LAPTOP_REPO" ] || fail "$NAME" "project_id is '$PID', expected $LAPTOP_REPO"
 
 WM=$(hub_sql "SELECT COUNT(*) FROM ingest_watermark WHERE transcript_path='$MFILE'")
 step "ingest_watermark rows for the mirror path: $WM"
@@ -49,7 +52,7 @@ wait_until 90 "[ \"\$(sqlite3 -readonly '$HOME/.recall/recall.db' \"$GAP\")\" = 
   || fail "$NAME" "vector gap $(hub_sql "$GAP") / vectors $(hub_sql "$VEC") after 90 s"
 step "vector gap 0, vectors for the session: $(hub_sql "$VEC")"
 
-RAW=$(lap 'cd ~/dev/crispy && export PATH="$HOME/.local/bin:$PATH"; recall "SAT-LAPTOP-'"$N"'" --raw') \
+RAW=$(lap "cd '$LAPTOP_REPO' && export PATH=\"$LAPTOP_PATH_PREFIX:\$PATH\"; recall \"SAT-LAPTOP-$N\" --raw") \
   || fail "$NAME" "the forwarded --raw query failed"
 TAG=$(printf '%s' "$RAW" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["sessions"][0]["tag"] if d.get("sessions") else "<none>")')
 step "top hit tag: $TAG"

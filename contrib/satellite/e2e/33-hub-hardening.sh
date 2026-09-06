@@ -11,6 +11,8 @@ set -u
 NAME=33-hub-hardening
 exec > >(tee -a "$(log_file "$NAME")") 2>&1
 
+require_e2e_env RECALL_E2E_HUB_ADDR
+
 TOK=$HOME/.recall/hub-tokens.json
 STASH=/tmp/ht-33-$$
 [ -f "$TOK" ] || fail "$NAME" "no $TOK — run 30-hub-tokens-serve.sh first"

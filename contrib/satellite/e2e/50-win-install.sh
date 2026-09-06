@@ -5,7 +5,8 @@
 # The token reaches Windows in a 0600 token.txt under the recall-e2e Temp
 # directory, is read by `set /p` inside the .cmd, and is deleted by the trap.
 # Right after the Windows global install this script re-checks `which -a recall`
-# in THIS WSL shell: /mnt/c/Users/silve/AppData/Roaming/npm is on the PATH, and
+# in THIS WSL shell: the Windows npm prefix ($WIN_HOME/AppData/Roaming/npm) is on
+# the PATH, and
 # the 2026-08-12 "invalid ELF header" incident was a Windows shim shadowing the
 # WSL binary.
 source "$(dirname "$0")/lib.sh"
@@ -13,6 +14,12 @@ set -u
 NAME=50-win-install
 exec > >(tee -a "$(log_file "$NAME")") 2>&1
 
+require_e2e_env RECALL_E2E_HUB_ADDR RECALL_E2E_WIN_USER
+HUB_RECALL_BIN=${RECALL_E2E_HUB_RECALL_BIN:-}
+if [ -z "$HUB_RECALL_BIN" ]; then
+  require_e2e_env RECALL_E2E_NODE
+  HUB_RECALL_BIN=$(dirname "$NODE")/recall
+fi
 load_tokens win
 require_hub_up
 [ -n "$TGZ" ] && [ -f "$TGZ" ] || fail "$NAME" "set RECALL_E2E_TGZ to the packed tarball"
@@ -42,16 +49,16 @@ CMD
 printf '%s\n' "$OUT" | sed "s/$RECALL_E2E_TOKEN_WIN/<token>/g" | tail -40 | sed 's/^/    /'
 [ "$RC" = 0 ] || fail "$NAME" "the Windows install step exited $RC"
 printf '%s\n' "$OUT" | grep -qF 'AppData\Roaming\npm\recall.cmd' \
-  || fail "$NAME" "where recall did not print C:\\Users\\silve\\AppData\\Roaming\\npm\\recall.cmd"
+  || fail "$NAME" "where recall did not print $WIN_RECALL_W"
 rm -f "$WIN_DIR/token.txt"; trap - EXIT
 
 step "which -a recall in THIS WSL shell:"
 which -a recall | sed 's/^/    /'
 FIRST=$(which -a recall | head -1)
-[ "$FIRST" = /home/silver/.nvm/versions/node/v22.18.0/bin/recall ] \
-  || fail "$NAME" "the WSL shell now resolves recall to $FIRST — the Windows shim shadows the hub binary"
+[ "$FIRST" = "$HUB_RECALL_BIN" ] \
+  || fail "$NAME" "the WSL shell now resolves recall to $FIRST, not $HUB_RECALL_BIN — the Windows shim shadows the hub binary"
 
-python3 - /mnt/c/Users/silve/.claude/settings.json <<'PY' || fail "$NAME" "the Windows settings.json assertions failed"
+python3 - "$WIN_HOME/.claude/settings.json" <<'PY' || fail "$NAME" "the Windows settings.json assertions failed"
 import json,sys
 d=json.load(open(sys.argv[1])); h=d.get('hooks',{}); ok=True
 for ev in ('Stop','SubagentStop'):
@@ -63,6 +70,6 @@ print('    cleanupPeriodDays:', d.get('cleanupPeriodDays'))
 sys.exit(0 if ok and d.get('cleanupPeriodDays')==999 else 1)
 PY
 
-[ ! -e /mnt/c/Users/silve/.recall/recall.db ] || fail "$NAME" "the Windows satellite grew a recall.db"
-step "no C:\\Users\\silve\\.recall\\recall.db — satellite mode confirmed"
+[ ! -e "$WIN_HOME/.recall/recall.db" ] || fail "$NAME" "the Windows satellite grew a recall.db"
+step "no $WIN_HOME_W\\.recall\\recall.db — satellite mode confirmed"
 pass "$NAME"

@@ -6,6 +6,8 @@ set -u
 NAME=46-laptop-codex
 exec > >(tee -a "$(log_file "$NAME")") 2>&1
 
+require_e2e_env RECALL_E2E_HUB_ADDR RECALL_E2E_LAPTOP RECALL_E2E_LAPTOP_HOST RECALL_E2E_LAPTOP_REPO
+
 require_hub_up
 lap 'test -f ~/.recall/satellite-token' || fail "$NAME" "the laptop is not installed in satellite mode — run 40-laptop-install.sh first"
 HELP=$(lap 'codex exec --help 2>&1 | head -30')
@@ -16,7 +18,7 @@ step "relying on this usage line: ${USAGE:-<none found>}"
 
 N=$(nonce)
 step "nonce SAT-CODEX-$N"
-lap 'cd ~/dev/crispy && codex exec "Reply with exactly this test phrase and nothing else: SAT-CODEX-'"$N"'"' \
+lap "cd '$LAPTOP_REPO' && codex exec \"Reply with exactly this test phrase and nothing else: SAT-CODEX-$N\"" \
   || fail "$NAME" "codex exec exited nonzero on the laptop"
 
 CDIR=$(mirror_dir "$LAPTOP_HOST" codex)

@@ -12,6 +12,8 @@ set -u
 NAME=30-hub-tokens-serve
 exec > >(tee -a "$(log_file "$NAME")") 2>&1
 
+require_e2e_env RECALL_E2E_HUB_ADDR RECALL_E2E_LAPTOP_HOST RECALL_E2E_WIN_HOST
+
 assert_hub_config() {
   python3 - "$HOME/.recall/config.json" "$HUB_ADDR" "$HUB_PORT" <<'PY'
 import json,sys

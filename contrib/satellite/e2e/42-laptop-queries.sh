@@ -16,25 +16,27 @@ set -u
 NAME=42-laptop-queries
 exec > >(tee -a "$(log_file "$NAME")") 2>&1
 
+require_e2e_env RECALL_E2E_HUB_ADDR RECALL_E2E_LAPTOP RECALL_E2E_LAPTOP_REPO
+
 require_hub_up
 VARS=$E2E_LOG_DIR/41.vars
 [ -f "$VARS" ] || fail "$NAME" "no $VARS — run 41-laptop-session.sh first"
 # shellcheck disable=SC1090
 . "$VARS"
 PHRASE=${RECALL_E2E_HUB_ONLY_PHRASE:-VACUUM INTO snapshot of the recall database}
-P='export PATH="$HOME/.local/bin:$PATH"; '
+P="export PATH=\"$LAPTOP_PATH_PREFIX:\$PATH\"; "
 
-R=$(lap "cd ~/dev/crispy && $P"'recall "SAT-LAPTOP-'"$NONCE"'"') || fail "$NAME" "the scoped query failed"
+R=$(lap "cd '$LAPTOP_REPO' && $P"'recall "SAT-LAPTOP-'"$NONCE"'"') || fail "$NAME" "the scoped query failed"
 printf '%s\n' "$R" | head -10 | sed 's/^/    /'
-printf '%s\n' "$R" | grep -q "$SID" || fail "$NAME" "the laptop session is not found from ~/dev/crispy without --all"
+printf '%s\n' "$R" | grep -q "$SID" || fail "$NAME" "the laptop session is not found from $LAPTOP_REPO without --all"
 
-H=$(lap "cd ~/dev/crispy && $P"'recall "'"$PHRASE"'"') || fail "$NAME" "the hub-only phrase query failed"
+H=$(lap "cd '$LAPTOP_REPO' && $P"'recall "'"$PHRASE"'"') || fail "$NAME" "the hub-only phrase query failed"
 HITS=$(printf '%s\n' "$H" | rows)
 step "hub-authored crispy sessions visible from the laptop without --all: $HITS"
 [ "$HITS" -ge 1 ] || fail "$NAME" "the cross-host git key returned no hub sessions for '$PHRASE'"
 
-R2=$(lap "cd ~ && $P"'recall "SAT-LAPTOP-'"$NONCE"'" --project ~/dev/crispy') || fail "$NAME" "--project query failed"
-printf '%s\n' "$R2" | grep -q "$SID" || fail "$NAME" "--project ~/dev/crispy does not find the session from ~"
+R2=$(lap "cd ~ && $P"'recall "SAT-LAPTOP-'"$NONCE"'" --project '"'$LAPTOP_REPO'") || fail "$NAME" "--project query failed"
+printf '%s\n' "$R2" | grep -q "$SID" || fail "$NAME" "--project $LAPTOP_REPO does not find the session from ~"
 R3=$(lap "cd ~ && $P"'recall "SAT-LAPTOP-'"$NONCE"'" --project /tmp'); RC3=$?
 step "--project /tmp exit code: $RC3"
 # A row count only means something when the query actually ran: an empty output

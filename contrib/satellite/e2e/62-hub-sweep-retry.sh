@@ -9,6 +9,8 @@ set -u
 NAME=62-hub-sweep-retry
 exec > >(tee -a "$(log_file "$NAME")") 2>&1
 
+require_e2e_env RECALL_E2E_HUB_ADDR RECALL_E2E_LAPTOP_HOST
+
 require_hub_up
 PID=$(systemctl --user show -p MainPID --value recall-hub)
 [ -n "$PID" ] && [ "$PID" != 0 ] || fail "$NAME" "recall-hub has no MainPID — run 31-hub-service.sh first"

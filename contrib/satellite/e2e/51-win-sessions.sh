@@ -13,7 +13,7 @@
 # AFK and the OAuth session cannot be refreshed), the turn falls back to a
 # SYNTHETIC Stop-hook invocation: this script writes a two-entry transcript into
 # the real Claude Code project directory and pipes the payload Claude Code would
-# send into the STAGED C:\Users\silve\.recall\bin\stop-hook.js. Every hub-side
+# send into the STAGED stop-hook.js under the Windows user's .recall. Every hub-side
 # assertion below is unchanged. What that proves and does not prove is written
 # up in README.md. RECALL_E2E_WIN_SYNTHETIC=0 turns the fallback off.
 source "$(dirname "$0")/lib.sh"
@@ -21,13 +21,15 @@ set -u
 NAME=51-win-sessions
 exec > >(tee -a "$(log_file "$NAME")") 2>&1
 
+require_e2e_env RECALL_E2E_HUB_ADDR RECALL_E2E_WIN_HOST RECALL_E2E_WIN_USER
 require_hub_up
-[ -e /mnt/c/Users/silve/.recall/config.json ] || fail "$NAME" "Windows satellite not installed — run 50-win-install.sh first"
-CRISPY_KEY=git:d30433f1268b413193c532421b123d58a63ba4b9
+[ -e "$WIN_HOME/.recall/config.json" ] || fail "$NAME" "Windows satellite not installed — run 50-win-install.sh first"
+# The git project_key of RECALL_E2E_LAPTOP_REPO / the Windows checkout of the
+# same repo. Override it when the fixture repo is not crispy.
+CRISPY_KEY=${RECALL_E2E_REPO_GIT_KEY:-git:d30433f1268b413193c532421b123d58a63ba4b9}
 PHRASE=${RECALL_E2E_HUB_ONLY_PHRASE:-VACUUM INTO snapshot of the recall database}
 N=$(nonce)
 MDIR=$(mirror_dir "$WIN_HOST" claude)
-WIN_HOOK_W='C:\Users\silve\.recall\bin\stop-hook.js'
 SYNTH=${RECALL_E2E_WIN_SYNTHETIC:-auto}
 AUTH_RE='Failed to authenticate|OAuth|not logged in|/login'
 SYNTHETIC_USED=0
@@ -51,7 +53,7 @@ synthetic_turn() {
   local tag=$1 wcwd=$2 slug=$3 prompt=$4 u pdir
   u=$(uuidgen) || fail "$NAME" "uuidgen failed"
   [ -n "$u" ] || fail "$NAME" "uuidgen produced an empty id"
-  pdir=/mnt/c/Users/silve/.claude/projects/$slug
+  pdir=$WIN_HOME/.claude/projects/$slug
   mkdir -p "$pdir" || fail "$NAME" "could not create $pdir"
   python3 - "$pdir/$u.jsonl" "$u" "$wcwd" "$prompt" <<'PY' || fail "$NAME" "could not write the synthetic Windows transcript"
 import json,sys,uuid
@@ -66,11 +68,11 @@ u2,l2=entry(1,'assistant',u1)
 open(f,'w',newline='\n').write(l1+'\n'+l2+'\n')
 print('    wrote %s (session %s)' % (f,sid))
 PY
-  python3 - "$WIN_DIR/payload-$tag.json" "$u" "$slug" "$wcwd" <<'PY' || fail "$NAME" "could not write the hook payload"
+  python3 - "$WIN_DIR/payload-$tag.json" "$u" "$slug" "$wcwd" "$WIN_HOME_W" <<'PY' || fail "$NAME" "could not write the hook payload"
 import json,sys
-f,sid,slug,cwd=sys.argv[1:5]
+f,sid,slug,cwd,winhome=sys.argv[1:6]
 json.dump({'session_id':sid,
-           'transcript_path':'C:\\Users\\silve\\.claude\\projects\\'+slug+'\\'+sid+'.jsonl',
+           'transcript_path':winhome+'\\.claude\\projects\\'+slug+'\\'+sid+'.jsonl',
            'cwd':cwd,'hook_event_name':'Stop','stop_hook_active':False}, open(f,'w'))
 print('    payload %s' % f)
 PY
@@ -85,7 +87,7 @@ CMD
   printf '%s\n' "$hout" | sed 's/^/    /'
   rm -f "$WIN_DIR/payload-$tag.json"
   step "synthetic Stop-hook invoked for session $u in $wcwd"
-  step "LEFT-CHANGED: synthetic Windows session $u at C:\\Users\\silve\\.claude\\projects\\$slug\\$u.jsonl"
+  step "LEFT-CHANGED: synthetic Windows session $u at $WIN_HOME_W\\.claude\\projects\\$slug\\$u.jsonl"
   printf '%s\n' "$pdir/$u.jsonl" >> "$E2E_LOG_DIR/win-synthetic.paths"
 }
 

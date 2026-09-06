@@ -9,12 +9,13 @@
 # (protocol.ts:152-162). Probe bodies are two `{"type":"probe"}` lines, not
 # transcript entries, so the ingester finds zero records and no row lands.
 #
-# Run this BEFORE 50-win-install.sh: it re-issues the silverera2 token.
+# Run this BEFORE 50-win-install.sh: it re-issues the Windows satellite token.
 source "$(dirname "$0")/lib.sh"
 set -u
 NAME=34-hub-protocol-probes
 exec > >(tee -a "$(log_file "$NAME")") 2>&1
 
+require_e2e_env RECALL_E2E_HUB_ADDR RECALL_E2E_LAPTOP RECALL_E2E_LAPTOP_HOST RECALL_E2E_WIN_HOST
 load_tokens both
 require_hub_up
 LAP_MIRROR=$(mirror_dir "$LAPTOP_HOST" claude)
@@ -83,7 +84,7 @@ WINPATH=$(printf '%s\n' "$OUT" | grep '^winpath=' | cut -d= -f2)
 PID_BEFORE=$(systemctl --user show -p MainPID --value recall-hub)
 step "daemon MainPID before the revoke: $PID_BEFORE"
 REV=$("$RECALL_BIN" hub token --revoke "$WIN_HOST") || fail "$NAME" "hub token --revoke $WIN_HOST failed"
-printf '%s\n' "$REV" | sed 's/^/    /' 
+printf '%s\n' "$REV" | sed 's/^/    /'
 
 remote_after=$(cat <<REMOTE2
 read -r TW

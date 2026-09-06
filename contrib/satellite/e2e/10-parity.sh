@@ -36,27 +36,49 @@
 #            migration has changed Codex content; `post` (table view) stays
 #            valid only while content is unchanged (U1 alone).
 #   scope  — (iii) scope-change proof: the same queries WITHOUT --all from
-#            /home/silver/dev/recall, on the UNPAGINATED per-message list
+#            $RECALL_MAIN_CHECKOUT, on the UNPAGINATED per-message list
 #            (--raw-messages --limit 100000; the table view pages 75 sessions
 #            and a larger candidate pool displaces pre-set sessions by rank);
 #            pre session set ⊆ post session set (a lost session tolerated by
 #            the same rule as post-raw) and post contains ≥1 session whose
-#            project_id is under /home/silver/dev/recall/ or
-#            /home/silver/dev/recall-agent-fix-*.
+#            project_id is under $RECALL_E2E_HUB_REPO/ or
+#            $RECALL_E2E_HUB_REPO-agent-fix-*.
 #
 # Env: RECALL_PARITY_HOME, RECALL_INT_WORKTREE (dist/recall.js to run),
-#      RECALL_MAIN_CHECKOUT (cwd for scope mode), RECALL_PARITY_BASE +
-#      RECALL_BASE_WORKTREE (base root and base build for pre-raw).
+#      RECALL_MAIN_CHECKOUT (cwd for scope mode), RECALL_E2E_HUB_REPO (the
+#      hub-side repo path the scope gate looks for), RECALL_PARITY_BASE +
+#      RECALL_BASE_WORKTREE (base root and base build for pre-raw), and
+#      RECALL_NODE (or RECALL_E2E_NODE) for the node binary. No default is
+#      personal; see README.md, "Environment".
 set -u
 S=${RECALL_PARITY_HOME:-$HOME/.recall-parity}
-INT=${RECALL_INT_WORKTREE:-/home/silver/dev/recall-sat-int}
-MAIN=${RECALL_MAIN_CHECKOUT:-/home/silver/dev/recall}
+INT=${RECALL_INT_WORKTREE:-}
+MAIN=${RECALL_MAIN_CHECKOUT:-}
 RUNS=$S/runs
 CLI=$INT/dist/recall.js
 B=${RECALL_PARITY_BASE:-$HOME/.recall-parity-base}
-BASEWT=${RECALL_BASE_WORKTREE:-/home/silver/dev/recall-sat-base}
-NODE=${RECALL_NODE:-/home/silver/.nvm/versions/node/v22.18.0/bin/node}
+BASEWT=${RECALL_BASE_WORKTREE:-}
+HUB_REPO=${RECALL_E2E_HUB_REPO:-}
+NODE=${RECALL_NODE:-${RECALL_E2E_NODE:-}}
 mkdir -p "$RUNS"
+
+# This script does NOT source lib.sh (it runs against a snapshot root, not the
+# live hub), so it carries its own gate. Both print the FAIL vocabulary.
+need_env() { # $1.. variable names — none of them has a personal default
+  local v
+  for v in "$@"; do
+    if [ -z "${!v:-}" ]; then
+      echo "FAIL 10-parity ${mode:-<no mode>} — set $v (see contrib/satellite/e2e/README.md, \"Environment\")" >&2
+      exit 1
+    fi
+  done
+}
+need_node() {
+  [ -n "$NODE" ] || {
+    echo "FAIL 10-parity ${mode:-<no mode>} — set RECALL_NODE or RECALL_E2E_NODE to the node binary" >&2
+    exit 1
+  }
+}
 
 QUERIES=(
   "VACUUM INTO snapshot of the recall database"
@@ -134,6 +156,7 @@ mode=${1:-}
 fail=0
 case "$mode" in
   pre)
+    need_node; need_env RECALL_INT_WORKTREE
     for i in "${!QUERIES[@]}"; do
       n=$((i+1)); q=${QUERIES[$i]}
       run_query "$q" "$RUNS/pre-$n.txt" "--all" "$S"
@@ -152,6 +175,7 @@ case "$mode" in
     done
     ;;
   post)
+    need_node; need_env RECALL_INT_WORKTREE
     for i in "${!QUERIES[@]}"; do
       n=$((i+1)); q=${QUERIES[$i]}
       [ -f "$RUNS/pre-$n.txt" ] || { echo "  q$n: no pre run"; fail=1; continue; }
@@ -177,6 +201,7 @@ case "$mode" in
     done
     ;;
   scope)
+    need_node; need_env RECALL_INT_WORKTREE RECALL_MAIN_CHECKOUT RECALL_E2E_HUB_REPO
     for i in "${!QUERIES[@]}"; do
       n=$((i+1)); q=${QUERIES[$i]}
       run_query "$q" "$RUNS/scope-post-$n.json" "--raw-messages --limit 100000" "$MAIN"
@@ -190,7 +215,7 @@ case "$mode" in
       fi
       hit=0
       for sid in $post_s; do
-        c=$(sqlite3 -readonly "$S/recall.db" "SELECT COUNT(*) FROM messages WHERE session_id='$sid' AND (project_id LIKE '/home/silver/dev/recall/%' OR project_id LIKE '/home/silver/dev/recall-agent-fix-%')")
+        c=$(sqlite3 -readonly "$S/recall.db" "SELECT COUNT(*) FROM messages WHERE session_id='$sid' AND (project_id LIKE '$HUB_REPO/%' OR project_id LIKE '$HUB_REPO-agent-fix-%')")
         [ "$c" -gt 0 ] && { hit=1; break; }
       done
       echo "  q$n pre=$(echo "$pre_s" | grep -c .) post=$(echo "$post_s" | grep -c .) lost=$lost lost_explained=$lost_ok worktree_or_subdir_hit=$hit"
@@ -198,6 +223,7 @@ case "$mode" in
     done
     ;;
   scope-pre)
+    need_node; need_env RECALL_INT_WORKTREE RECALL_MAIN_CHECKOUT
     for i in "${!QUERIES[@]}"; do
       n=$((i+1)); q=${QUERIES[$i]}
       run_query "$q" "$RUNS/scope-pre-$n.json" "--raw-messages --limit 100000" "$MAIN"
@@ -205,6 +231,7 @@ case "$mode" in
     done
     ;;
   pre-raw)
+    need_node; need_env RECALL_BASE_WORKTREE
     [ -d "$B" ] && [ -f "$B/recall.db" ] || { echo "  base root $B missing (VACUUM INTO a fresh live snapshot there first)"; exit 2; }
     mkdir -p "$B/runs"
     for i in "${!QUERIES[@]}"; do
@@ -214,6 +241,7 @@ case "$mode" in
     done
     ;;
   post-raw)
+    need_node; need_env RECALL_INT_WORKTREE
     for i in "${!QUERIES[@]}"; do
       n=$((i+1)); q=${QUERIES[$i]}
       [ -f "$B/runs/pre-raw-$n.json" ] || { echo "  q$n: no pre-raw run (run 'pre-raw' first)"; fail=1; continue; }

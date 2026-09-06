@@ -2,7 +2,7 @@
 # 91-hub-rollback.sh — rule 11: the ledger's ROLLBACK REHEARSAL, executed.
 # Runs only with RECALL_E2E_CONFIRM=rollback; otherwise it prints the plan.
 #
-# This is the ONE script allowed to enter /home/silver/dev/recall, and it runs
+# This is the ONE script allowed to enter $RECALL_MAIN_CHECKOUT, and it runs
 # only `npm link` there (package.json has prepack, not prepare, so npm link does
 # NOT rebuild the owner's main checkout).
 source "$(dirname "$0")/lib.sh"
@@ -10,13 +10,15 @@ set -u
 NAME=91-hub-rollback
 exec > >(tee -a "$(log_file "$NAME")") 2>&1
 
-MAIN=/home/silver/dev/recall
+require_e2e_env RECALL_MAIN_CHECKOUT RECALL_E2E_NODE
+MAIN=$RECALL_MAIN_CHECKOUT
+NODE_BIN=$(dirname "$NODE")
 SNAP=${RECALL_E2E_SNAPSHOT_DIR:-<snapshot dir>}
 # The Phase-0 literal recorded in the ledger. Both hook commands must EQUAL it
 # after the rollback; the before/after listing below is a printed record only.
-HOOK_CMD=${RECALL_E2E_HOOK_CMD:-'"/home/silver/.nvm/versions/node/v22.18.0/bin/node" "/home/silver/.recall/bin/stop-hook.js"'}
+HOOK_CMD=${RECALL_E2E_HOOK_CMD:-"\"$NODE\" \"$HOME/.recall/bin/stop-hook.js\""}
 PLAN="  1. systemctl --user disable --now recall-hub; rm -f ~/.config/systemd/user/recall-hub.service; systemctl --user daemon-reload
-  2. export PATH=/home/silver/.nvm/versions/node/v22.18.0/bin:\$PATH; npm uninstall -g crispy-recall
+  2. export PATH=$NODE_BIN:\$PATH; npm uninstall -g crispy-recall
   3. cd $MAIN && npm link   (fallback: npm install -g crispy-recall@0.3.1)
   4. recall install --yes
   5. verify: recall \"VACUUM INTO snapshot\" returns rows within 30 s; both hook commands EQUAL the Phase-0 literal; recall doctor exit 0
@@ -26,7 +28,7 @@ if [ "${RECALL_E2E_CONFIRM:-}" != rollback ]; then
   exit 2
 fi
 printf '%s\n' "$PLAN"
-export PATH=/home/silver/.nvm/versions/node/v22.18.0/bin:$PATH
+export PATH="$NODE_BIN:$PATH"
 
 HOOKS_BEFORE=$(python3 - "$HOME/.claude/settings.json" <<'PY'
 import json,sys

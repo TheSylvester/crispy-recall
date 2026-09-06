@@ -3,7 +3,7 @@
 # mirror.
 #
 # The smallest edit inserts `.recall/remote` into the per-path list of the
-# "Claude config" step of ~/.local/bin/wsl-backup, right after
+# "Claude config" step of $RECALL_E2E_BACKUP_SCRIPT, right after
 # `.recall/config.json`, so the mirror travels in claude-config.tar.zst.
 # Without --run the script only makes and checks the edit (~3.5 GB otherwise).
 source "$(dirname "$0")/lib.sh"
@@ -11,8 +11,10 @@ set -u
 NAME=61-hub-backup
 exec > >(tee -a "$(log_file "$NAME")") 2>&1
 
+require_e2e_env RECALL_E2E_LAPTOP_HOST
+
 SNAP=${RECALL_E2E_SNAPSHOT_DIR:?set RECALL_E2E_SNAPSHOT_DIR to the Phase-4 snapshot directory}
-BK=$HOME/.local/bin/wsl-backup
+BK=${RECALL_E2E_BACKUP_SCRIPT:-$HOME/.local/bin/wsl-backup}
 [ -f "$BK" ] || fail "$NAME" "no $BK"
 mkdir -p "$SNAP"
 [ -f "$SNAP/wsl-backup.orig" ] || cp "$BK" "$SNAP/wsl-backup.orig"

@@ -11,10 +11,11 @@ set -u
 NAME=21-repo-gates
 exec > >(tee -a "$(log_file "$NAME")") 2>&1
 
-INT=${RECALL_INT_WORKTREE:-/home/silver/dev/recall-sat-int}
+require_e2e_env RECALL_INT_WORKTREE RECALL_E2E_NODE
+INT=$RECALL_INT_WORKTREE
 BASELINE=${RECALL_E2E_BASELINE:?set RECALL_E2E_BASELINE to the recorded baseline test count}
 [ -d "$INT" ] || fail "$NAME" "integration worktree $INT does not exist"
-export PATH=/home/silver/.nvm/versions/node/v22.18.0/bin:$PATH
+export PATH="$(dirname "$NODE"):$PATH"
 
 T_BEFORE=$(hub_sql "SELECT COUNT(*) FROM messages WHERE project_id LIKE '/tmp/%'")
 MD5_BEFORE=$(md5sum "$HOME/.recall/config.json" | cut -d' ' -f1)

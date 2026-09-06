@@ -13,9 +13,11 @@ set -u
 NAME=45-laptop-torn-tail
 exec > >(tee -a "$(log_file "$NAME")") 2>&1
 
+require_e2e_env RECALL_E2E_HUB_ADDR RECALL_E2E_LAPTOP RECALL_E2E_LAPTOP_HOST
+
 require_hub_up
 lap 'test -f ~/.recall/satellite-token' || fail "$NAME" "the laptop is not installed in satellite mode — run 40-laptop-install.sh first"
-P='export PATH="$HOME/.local/bin:$PATH"; '
+P="export PATH=\"$LAPTOP_PATH_PREFIX:\$PATH\"; "
 N=$(nonce)
 U=$(lap 'uuidgen') || fail "$NAME" "uuidgen failed on the laptop"
 U=$(printf '%s' "$U" | tr -d '[:space:]')

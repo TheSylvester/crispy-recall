@@ -6,6 +6,8 @@ set -u
 NAME=90-teardown
 exec > >(tee -a "$(log_file "$NAME")") 2>&1
 
+require_e2e_env RECALL_E2E_LAPTOP RECALL_E2E_LAPTOP_HOST RECALL_E2E_WIN_HOST RECALL_E2E_WIN_USER
+
 PLAN="  hub:     systemctl --user disable --now recall-hub; rm the unit file; daemon-reload
   hub:     recall hub token --revoke $LAPTOP_HOST and --revoke $WIN_HOST
   laptop:  recall uninstall --yes; npm uninstall -g --prefix ~/.local crispy-recall;
@@ -29,10 +31,10 @@ step "hub: unit active state now: $(systemctl --user is-active recall-hub 2>/dev
 step "hub: revoking both tokens"
 REV1=$("$RECALL_BIN" hub token --revoke "$LAPTOP_HOST" 2>&1) || true
 REV2=$("$RECALL_BIN" hub token --revoke "$WIN_HOST" 2>&1) || true
-printf '%s\n%s\n' "$REV1" "$REV2" | sed 's/^/    /' 
+printf '%s\n%s\n' "$REV1" "$REV2" | sed 's/^/    /'
 
 step "laptop: uninstalling"
-LAPOUT=$(lap 'export PATH="$HOME/.local/bin:$PATH"; recall uninstall --yes 2>&1 | tail -5; npm uninstall -g --prefix "$HOME/.local" crispy-recall 2>&1 | tail -3; [ -f ~/.claude/settings.json.pre-e2e ] && cp ~/.claude/settings.json.pre-e2e ~/.claude/settings.json && echo settings.json restored; rm -rf ~/.claude/projects/-tmp-recall-torn; rm -f /tmp/crispy-recall.tgz; echo laptop done') \
+LAPOUT=$(lap "export PATH=\"$LAPTOP_PATH_PREFIX:\$PATH\"; recall uninstall --yes 2>&1 | tail -5; npm uninstall -g --prefix \"\$HOME/.local\" crispy-recall 2>&1 | tail -3; [ -f ~/.claude/settings.json.pre-e2e ] && cp ~/.claude/settings.json.pre-e2e ~/.claude/settings.json && echo settings.json restored; rm -rf ~/.claude/projects/-tmp-recall-torn; rm -f /tmp/crispy-recall.tgz; echo laptop done") \
   || step "WARNING: the laptop teardown reported an error"
 printf '%s\n' "$LAPOUT" | sed 's/^/    /'
 
@@ -55,7 +57,7 @@ if [ -f "$SYNTH_PATHS" ]; then
   while IFS= read -r f; do
     [ -n "$f" ] || continue
     case "$f" in
-      /mnt/c/Users/silve/.claude/projects/*/*.jsonl) rm -f "$f"; step "removed synthetic transcript $f"; N=$((N+1));;
+      "$WIN_HOME"/.claude/projects/*/*.jsonl) rm -f "$f"; step "removed synthetic transcript $f"; N=$((N+1));;
       *) step "SKIPPING an unexpected synthetic path: $f";;
     esac
   done < "$SYNTH_PATHS"

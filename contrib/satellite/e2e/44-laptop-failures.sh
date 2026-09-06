@@ -10,13 +10,15 @@ set -u
 NAME=44-laptop-failures
 exec > >(tee -a "$(log_file "$NAME")") 2>&1
 
+require_e2e_env RECALL_E2E_HUB_ADDR RECALL_E2E_LAPTOP RECALL_E2E_LAPTOP_HOST RECALL_E2E_LAPTOP_REPO
+
 VARS=$E2E_LOG_DIR/41.vars
 [ -f "$VARS" ] || fail "$NAME" "no $VARS — run 41-laptop-session.sh first"
 # shellcheck disable=SC1090
 . "$VARS"
 require_hub_up
 lap 'test -f ~/.recall/satellite-token' || fail "$NAME" "the laptop is not installed in satellite mode — run 40-laptop-install.sh first"
-P='export PATH="$HOME/.local/bin:$PATH"; '
+P="export PATH=\"$LAPTOP_PATH_PREFIX:\$PATH\"; "
 MDIR=$(mirror_dir "$LAPTOP_HOST" claude)
 HOSTS_JSON=$HOME/.recall/run/hub-hosts.json
 
@@ -44,7 +46,7 @@ wait_until 15 "! hub_health | grep -q '\"ok\":true'" || fail "$NAME" "the hub st
 N=$(nonce)
 step "nonce HUB-DOWN-$N (hub down)"
 TSTART=$(date +%s)
-lap 'cd ~/dev/crispy && claude -p "Reply with exactly this test phrase and nothing else: HUB-DOWN-'"$N"'" --model haiku' \
+lap "cd '$LAPTOP_REPO' && claude -p \"Reply with exactly this test phrase and nothing else: HUB-DOWN-$N\" --model haiku" \
   || fail "$NAME" "claude -p failed on the laptop while the hub was down"
 step "the turn took $(( $(date +%s) - TSTART )) s with the hub down"
 # A bounded poll rather than `wait_until`: the helper redirects its command to
@@ -73,14 +75,14 @@ wait_until 15 "hub_health | grep -q '\"ok\":true'" || fail "$NAME" "the hub did 
 # CLI flushes INSIDE the query (recall.ts:1417-1418 flushBeforeQuery). So the
 # FIRST query after the restart is the reconnect that drains the queue, and the
 # SECOND is the retrieval. No sleep between the restart and the first query.
-R=$(lap "cd ~/dev/crispy && $P"'recall "HUB-DOWN-'"$N"'"') || fail "$NAME" "the drain-proving query failed"
+R=$(lap "cd '$LAPTOP_REPO' && $P"'recall "HUB-DOWN-'"$N"'"') || fail "$NAME" "the drain-proving query failed"
 printf '%s\n' "$R" | head -8 | sed 's/^/    /'
 wait_until 20 '[ -n "$(hub_sql "SELECT session_id FROM messages WHERE message_text LIKE '"'"'%HUB-DOWN-'"$N"'%'"'"' LIMIT 1")" ]' \
   || fail "$NAME" "the queued turn never reached the hub database"
 DSID=$(hub_sql "SELECT session_id FROM messages WHERE message_text LIKE '%HUB-DOWN-$N%' LIMIT 1")
 step "session carrying HUB-DOWN-$N on the hub: ${DSID:-<none>}"
 [ -n "$DSID" ] || fail "$NAME" "the queued turn never reached the hub database"
-R2=$(lap "cd ~/dev/crispy && $P"'recall "HUB-DOWN-'"$N"'"') || fail "$NAME" "the retrieval query failed"
+R2=$(lap "cd '$LAPTOP_REPO' && $P"'recall "HUB-DOWN-'"$N"'"') || fail "$NAME" "the retrieval query failed"
 printf '%s\n' "$R2" | head -8 | sed 's/^/    /'
 # `recall` echoes the query, so a nonce grep would pass unconditionally: match
 # the session id and the Results: line instead.
@@ -118,7 +120,7 @@ wait_until 15 "hub_health | grep -q '\"ok\":true'" || fail "$NAME" "the hub did 
 
 N2=$(nonce)
 step "one ordinary turn on the laptop (nonce SWEEP-$N2); nobody runs 'recall push --full'"
-lap 'cd ~/dev/crispy && claude -p "Reply with exactly this test phrase and nothing else: SWEEP-'"$N2"'" --model haiku' \
+lap "cd '$LAPTOP_REPO' && claude -p \"Reply with exactly this test phrase and nothing else: SWEEP-$N2\" --model haiku" \
   || fail "$NAME" "claude -p failed on the laptop"
 wait_until 60 "[ -f '$MFILE' ] && [ \"\$(sqlite3 -readonly '$HOME/.recall/recall.db' \"SELECT COUNT(*) FROM ingest_watermark WHERE transcript_path='$MFILE'\")\" = 1 ]" \
   || fail "$NAME" "the deleted mirror file did not come back with a watermark row within 60 s"

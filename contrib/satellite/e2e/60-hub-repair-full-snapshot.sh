@@ -23,8 +23,8 @@
 # prefix. That last refusal is about RE-KEYING: a git-keyed session rewritten
 # from its mirror path or sidecar cwd shows up as a git: key that DISAPPEARED and
 # a path: key that APPEARED. A path: key already present before the repair is
-# correct — the laptop derives it itself for a non-git cwd such as
-# /home/sylvester/dev, and its sidecar carries it — so it is carried and reported,
+# correct — the laptop derives it itself for a non-git cwd under its own home,
+# and its sidecar carries it — so it is carried and reported,
 # never failed on. The NULL pseudo-key is exempt from the non-decreasing rule and
 # may vanish entirely: a sidecar can GAIN a key between the first ingest and the
 # repair (the satellite's derivation was transient at first push and a later push
@@ -36,6 +36,8 @@ source "$(dirname "$0")/lib.sh"
 set -u
 NAME=60-hub-repair-full-snapshot
 exec > >(tee -a "$(log_file "$NAME")") 2>&1
+
+require_e2e_env RECALL_E2E_LAPTOP_HOST RECALL_E2E_LAPTOP_HOME
 
 AVAIL=$(df --output=avail -m "$HOME" | tail -1 | tr -dc '0-9')
 step "free space under \$HOME: ${AVAIL} MiB"
@@ -103,7 +105,7 @@ tail -15 "$E2E_LOG_DIR/60-repair.log" | sed 's/^/    /'
 snap_sql "$WORK/hist.sql" > "$WORK/hist2" || fail "$NAME" "the histogram query failed after the repair"
 sed 's/^/    after:  /' "$WORK/hist2"
 printf '%s\n' "$B" > "$WORK/hist1"
-python3 - "$WORK/hist1" "$WORK/hist2" <<'PY' || fail "$NAME" "the laptop-mirror project_key histogram did not hold across repair --full"
+python3 - "$WORK/hist1" "$WORK/hist2" "$LAPTOP_HOME" <<'PY' || fail "$NAME" "the laptop-mirror project_key histogram did not hold across repair --full"
 import re,sys
 def load(f):
     d={}
@@ -113,7 +115,7 @@ def load(f):
         k,_,c=l.rpartition("|")
         d[k or '<NULL project_key>']=int(c)  # a NULL key prints as an empty field
     return d
-MIRRORKEY=re.compile(r'^(path:/home/sylvester|path:c:/)')
+MIRRORKEY=re.compile(r'^(path:%s|path:c:/)' % re.escape(sys.argv[3].lower()))
 NULLKEY='<NULL project_key>'
 a=load(sys.argv[1]); b=load(sys.argv[2])
 bad=[]; left_null=0; real_growth=0

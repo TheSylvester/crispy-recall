@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# 40-laptop-install.sh — spec §9.3.1: install the satellite on sylvester-laptop.
+# 40-laptop-install.sh — spec §9.3.1: install the satellite on the Linux satellite
+# named by RECALL_E2E_LAPTOP.
 #
 # npm's prefix on that box is the root-owned /usr and sudo needs a password, so
 # the install uses `--prefix "$HOME/.local"`. The token reaches the remote shell
@@ -9,6 +10,7 @@ set -u
 NAME=40-laptop-install
 exec > >(tee -a "$(log_file "$NAME")") 2>&1
 
+require_e2e_env RECALL_E2E_HUB_ADDR RECALL_E2E_LAPTOP RECALL_E2E_LAPTOP_HOME
 load_tokens laptop
 require_hub_up
 [ -n "$TGZ" ] && [ -f "$TGZ" ] || fail "$NAME" "set RECALL_E2E_TGZ to the packed tarball"
@@ -33,12 +35,13 @@ INST=$(lap 'npm install -g --prefix "$HOME/.local" /tmp/crispy-recall.tgz 2>&1')
   || { printf '%s\n' "$INST" | sed 's/^/    /'; fail "$NAME" "npm install -g failed on the laptop"; }
 printf '%s\n' "$INST" | tail -20 | sed 's/^/    /'
 printf '%s\n' "$INST" | grep -q 'EBADENGINE' && fail "$NAME" "npm reported EBADENGINE on Node 20"
-WHICH=$(lap 'export PATH="$HOME/.local/bin:$PATH"; command -v recall')
+WHICH=$(lap "export PATH=\"$LAPTOP_PATH_PREFIX:\$PATH\"; command -v recall")
 step "laptop command -v recall → $WHICH"
-[ "$WHICH" = /home/sylvester/.local/bin/recall ] || fail "$NAME" "recall resolved to ${WHICH:-<nothing>}"
+EXPECT_RECALL=${RECALL_E2E_LAPTOP_RECALL_BIN:-$LAPTOP_HOME/.local/bin/recall}
+[ "$WHICH" = "$EXPECT_RECALL" ] || fail "$NAME" "recall resolved to ${WHICH:-<nothing>}, expected $EXPECT_RECALL"
 
 step "installing in satellite mode against $HUB_URL"
-SAT=$(lap_stdin 'read -r T; export PATH="$HOME/.local/bin:$PATH"; RECALL_HUB_TOKEN="$T" recall install --hub '"$HUB_URL"' --yes 2>&1' <<<"$RECALL_E2E_TOKEN") \
+SAT=$(lap_stdin "read -r T; export PATH=\"$LAPTOP_PATH_PREFIX:\$PATH\"; RECALL_HUB_TOKEN=\"\$T\" recall install --hub $HUB_URL --yes 2>&1" <<<"$RECALL_E2E_TOKEN") \
   || { printf '%s\n' "$SAT" | mask | sed 's/^/    /'; fail "$NAME" "recall install --hub failed on the laptop"; }
 printf '%s\n' "$SAT" | mask | tail -25 | sed 's/^/    /'
 
@@ -68,7 +71,7 @@ BAK=$(lap "ls -1 ~/.claude/settings.json.bak.* 2>/dev/null | wc -l")
 step "settings.json.bak.* files: $BAK"
 [ "$BAK" -ge 1 ] || fail "$NAME" "the retention change left no .bak backup"
 
-DOC=$(lap 'export PATH="$HOME/.local/bin:$PATH"; recall doctor 2>&1'); DRC=$?
+DOC=$(lap "export PATH=\"$LAPTOP_PATH_PREFIX:\$PATH\"; recall doctor 2>&1"); DRC=$?
 printf '%s\n' "$DOC" | sed 's/^/    /'
 [ "$DRC" = 0 ] || fail "$NAME" "recall doctor exited $DRC on the satellite"
 for line in 'hub reachable' 'auth ok' 'hub version' 'last push' 'pending bytes' 'git' 'cleanupPeriodDays'; do
