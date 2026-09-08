@@ -167,14 +167,18 @@ jobs:
           recall "xylophone quantum cheese" --all || true
           # Hard gate: at least one hit (FTS guarantees this for our token).
           node scripts/ci/assert-search.mjs search.json
-          # Semantic must be available (live query embed succeeded). If not, treat
-          # it as a possible Metal flake: log loudly, force CPU, re-embed, retry.
-          if ! node scripts/ci/assert-search.mjs search.json --require-semantic; then
-            echo "::warning::Semantic UNAVAILABLE first pass (Node ${{ matrix.node }}) — suspected Metal flake on the paravirtual device. Forcing CPU embedder and re-embedding."
+          # Require stored semantic hits as well as a live query embedding.
+          # A working query model with zero backfilled vectors is not acceptance.
+          assert_semantic_hits() {
+            node scripts/ci/assert-search.mjs "$1" --require-semantic &&
+              node -e 'const d=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")); if (!(d.semantic_count > 0)) { console.error("No stored semantic matches: semantic_count="+d.semantic_count+", embed_coverage="+d.embed_coverage); process.exit(1); } console.log("Stored semantic matches: "+d.semantic_count);' "$1"
+          }
+          if ! assert_semantic_hits search.json; then
+            echo "::warning::Semantic acceptance failed first pass (Node ${{ matrix.node }}). Forcing CPU embedder and re-embedding before the final gate."
             node scripts/ci/force-cpu.mjs
             recall backfill --auto-embed
             recall "xylophone quantum cheese" --raw --all > search2.json || true
-            node scripts/ci/assert-search.mjs search2.json --require-semantic
+            assert_semantic_hits search2.json
           fi
 
       - name: Stop-hook simulation (row-count-grew is the real check)

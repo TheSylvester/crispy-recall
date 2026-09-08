@@ -24,7 +24,7 @@ import { resetEmbedRetries } from './embed-failures.js';
  */
 
 import { existsSync, utimesSync } from 'node:fs';
-import { freemem } from 'node:os';
+import { availableMemory } from './available-memory.js';
 import { confirm, isCancel } from '@clack/prompts';
 import { listAllSessions } from '../session-manager-shim.js';
 import { isUnderRemoteRoot } from './mirror-meta.js';
@@ -51,8 +51,8 @@ import type { CatchupStatus } from './catchup-types.js';
 /** Gap threshold: embed silently below this, prompt above. */
 const SILENT_EMBED_THRESHOLD = 200;
 
-/** System free memory threshold (MB) — stop embedding if free RAM drops below this. */
-const FREE_MEM_FLOOR_MB = 1024;
+/** Available memory threshold (MB) — pause embedding below this floor. */
+const AVAILABLE_MEM_FLOOR_MB = 1024;
 
 /** Rough estimate: seconds per message for embedding with llama.cpp.
  * Server mode processes ~300-350 msg/min (~0.2s each). */
@@ -175,13 +175,13 @@ export async function runFts5Catchup(opts?: { vendors?: ('claude' | 'codex')[] }
 // ============================================================================
 
 function memoryPressure(): boolean {
-  const freeMB = Math.round(freemem() / 1024 / 1024);
-  const under = freeMB < FREE_MEM_FLOOR_MB;
+  const availableMB = Math.round(availableMemory() / 1024 / 1024);
+  const under = availableMB < AVAILABLE_MEM_FLOOR_MB;
   if (under) {
     log({
       source: 'recall-catchup',
       level: 'warn',
-      summary: `Memory pressure: ${freeMB} MB free < ${FREE_MEM_FLOOR_MB} MB floor`,
+      summary: `Memory pressure: ${availableMB} MB available < ${AVAILABLE_MEM_FLOOR_MB} MB floor; pausing backfill`,
     });
   }
   return under;
