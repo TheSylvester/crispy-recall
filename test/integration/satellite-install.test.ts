@@ -32,7 +32,7 @@ import {
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { _setTestRoot } from '../../src/paths.js';
-import { runInstall } from '../../src/installer/install.js';
+import { runInstall as installRecall, type InstallOptions } from '../../src/installer/install.js';
 import { readConfig } from '../../src/installer/config.js';
 import { startStubHub, type StubHub } from '../helpers/stub-hub.js';
 
@@ -99,6 +99,22 @@ function install(over: Record<string, unknown> = {}) {
     hub: hub.url, token: hub.token, yes: true, noClaudemd: true, distDir,
     templatePath: join(distDir, 'SKILL.md.template'), ...over,
   });
+}
+
+async function waitForPushExit(pid: number): Promise<void> {
+  expect(await waitFor(() => {
+    try { process.kill(pid, 0); return false; }
+    catch (err) { return (err as NodeJS.ErrnoException).code === 'ESRCH'; }
+  }), `initial push ${pid} must finish before its sandbox is removed`).toBe(true);
+}
+
+// The installer deliberately returns before its initial push finishes. Await
+// that owned child in the fixture so it cannot write during teardown, including
+// after repeated installs that each spawn a separate recorder.
+async function runInstall(opts: InstallOptions) {
+  const result = await installRecall(opts);
+  if (result.backfillPid) await waitForPushExit(result.backfillPid);
+  return result;
 }
 
 function walk(dir: string): string[] {
@@ -295,9 +311,13 @@ describe('satellite install', () => {
       child.stdout.on('data', (c) => { out += String(c); });
       child.stderr.on('data', (c) => { out += String(c); });
       child.on('error', reject);
-      child.on('close', (c) => {
-        expect(out).not.toContain(hub.token);
-        resolve(c ?? 1);
+      child.on('close', async (c) => {
+        try {
+          expect(out).not.toContain(hub.token);
+          const pushPid = out.match(/initial push running in background \(PID (\d+)\)/);
+          if (pushPid) await waitForPushExit(Number(pushPid[1]));
+          resolve(c ?? 1);
+        } catch (err) { reject(err); }
       });
       child.stdin.write(`${hub.token}\n`);
       child.stdin.end();
