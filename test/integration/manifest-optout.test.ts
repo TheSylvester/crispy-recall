@@ -10,7 +10,7 @@ import {
   mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync,
 } from 'node:fs';
 import { join } from 'node:path';
-import { tmpdir } from 'node:os';
+import { tmpdir, platform, arch } from 'node:os';
 import { _setTestRoot, binDir, modelsDir } from '../../src/paths.js';
 import { _resetDb } from '../../src/db.js';
 import { runPreflight } from '../../src/installer/preflight.js';
@@ -109,6 +109,8 @@ describe('manifest-optout', () => {
     expect(settings.hooks.Stop.length).toBeGreaterThan(0);
     expect(settings.hooks.SubagentStop.length).toBeGreaterThan(0);
     expect(existsSync(skillFile())).toBe(true);
-    expect(readConfig()?.embedder?.mode).toBe('cpu');
+    // The mandatory GPU phase still adopts built-in Metal on Apple Silicon.
+    const expectedMode = platform() === 'darwin' && arch() === 'arm64' ? 'gpu' : 'cpu';
+    expect(readConfig()?.embedder?.mode).toBe(expectedMode);
   });
 });

@@ -9,7 +9,7 @@
  * (failure aborts), idempotent, crash-safe, fail-closed for normal commands,
  * exit-0-silent for the Stop hook, and repair-proof afterwards.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, copyFileSync, statSync, chmodSync,
 } from 'node:fs';
@@ -30,6 +30,7 @@ import { snapshotDb } from '../../src/installer/upgrade-migrate.js';
 import { runCodexRekeyMigration } from '../../src/installer/codex-rekey-migration.js';
 import { mtimeScan } from '../../src/recall/mtime-scan.js';
 import { EMBED_VERSION } from '../../src/recall/embed-config.js';
+import * as gpuPhase from '../../src/installer/gpu.js';
 
 const ROOT = join(__dirname, '..', '..');
 const CLI_BUNDLE = join(ROOT, 'dist', 'recall.js');
@@ -538,12 +539,24 @@ describe.skipIf(platform() === 'win32')('retrieval-class migration (§8.3)', () 
     writeFileSync(getBinaryPath(), 'stub');
     writeFileSync(getModelPath(), 'stub');
 
-    const failure = new Error('injected GPU detection failure');
-    await expect(runInstall({
-      yes: true, offline: true, distDir,
-      gpuDetect: async () => { throw failure; },
-    })).rejects.toBe(failure);
-    expect(readFileSync(settingsPath, 'utf-8')).toBe(priorSettings);
+    const failure = new Error('injected GPU phase failure');
+    // Fail AFTER hook quiescing, on every platform. NVIDIA detection happens
+    // during preflight and is intentionally bypassed by Apple Silicon Metal.
+    const phase = vi.spyOn(gpuPhase, 'runGpuPhase').mockImplementationOnce(async () => {
+      const quiesced = readFileSync(settingsPath, 'utf-8');
+      expect(quiesced).not.toContain('stop-hook.js');
+      expect(quiesced).toContain('/usr/bin/users-own-hook.sh');
+      throw failure;
+    });
+    try {
+      await expect(runInstall({
+        yes: true, offline: true, distDir, gpuDetect: async () => false,
+      })).rejects.toBe(failure);
+      expect(phase).toHaveBeenCalledOnce();
+      expect(readFileSync(settingsPath, 'utf-8')).toBe(priorSettings);
+    } finally {
+      phase.mockRestore();
+    }
   }, 60_000);
 
   it('completes end to end under the codex gate, which then fails closed until the codex migration runs', async () => {

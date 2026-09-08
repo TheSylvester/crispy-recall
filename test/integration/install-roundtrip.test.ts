@@ -4,19 +4,23 @@
  * Runs `runInstall({ yes, offline })` in-process against a sandboxed $HOME
  * (RECALL_HOME via _setTestRoot, CLAUDE_CONFIG_DIR for ~/.claude), with the
  * binary/model/bundles pre-staged so no real downloads happen and the GPU is
- * forced absent. Then reverses it with runUninstall and asserts a clean state.
+ * NVIDIA probe forced absent (Apple Silicon still uses built-in Metal).
+ * Then reverses it with runUninstall and asserts a clean state.
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
   mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, readdirSync, existsSync,
 } from 'node:fs';
 import { join } from 'node:path';
-import { tmpdir } from 'node:os';
+import { tmpdir, platform, arch } from 'node:os';
 import { _setTestRoot, binDir, modelsDir, dbPath } from '../../src/paths.js';
 import { _resetDb } from '../../src/db.js';
 import { runInstall } from '../../src/installer/install.js';
 import { runUninstall } from '../../src/installer/uninstall.js';
 import { readConfig } from '../../src/installer/config.js';
+
+// Metal is included in the Apple Silicon binary; only NVIDIA detection is injected.
+const expectedEmbedderMode = platform() === 'darwin' && arch() === 'arm64' ? 'gpu' : 'cpu';
 
 let recallHome: string;
 let claudeDir: string;
@@ -93,8 +97,8 @@ describe('install-roundtrip', () => {
       expect(existsSync(join(recallHome, sub))).toBe(true);
     }
 
-    // config.json — CPU in the offline sandbox (no GPU libs staged)
-    expect(readConfig()?.embedder?.mode).toBe('cpu');
+    // Persist the platform verdict: built-in Metal on Apple Silicon, CPU elsewhere.
+    expect(readConfig()?.embedder?.mode).toBe(expectedEmbedderMode);
 
     // skill installed with $RECALL_BIN substituted to the RUNNABLE form
     const skillPath = join(claudeDir, 'skills', 'recall', 'SKILL.md');
@@ -149,7 +153,7 @@ describe('install-roundtrip', () => {
     expect(afterCodexHooks.hooks.PreToolUse[0].hooks[0].command).toBe('codex-keep-me');
     // ~/.recall intact (no --purge): DB + config survive
     expect(existsSync(dbPath())).toBe(true);
-    expect(readConfig()?.embedder?.mode).toBe('cpu');
+    expect(readConfig()?.embedder?.mode).toBe(expectedEmbedderMode);
     expect(un.purged).toBe(false);
   }, 30_000);
 });
