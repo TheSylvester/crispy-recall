@@ -1389,11 +1389,19 @@ async function runStatuslineSubcommand(): Promise<void> {
 // ---------------------------------------------------------------------------
 
 /** `recall push [--full]` — an explicit, user-invoked push. */
-async function runPushInline(full: boolean): Promise<void> {
+async function runPushInline(full: boolean): Promise<number> {
   const { runPush } = await import('../satellite/push.js');
-  // A live holder is polled for 5 s, then we proceed anyway: a query must not
-  // be held hostage by a long detached `--full` run (S6).
-  await runPush({ full, lockWaitMs: 5000, proceedWithoutLock: true });
+  const result = await runPush({ full, lockWaitMs: 5000, proceedWithoutLock: true });
+  const summary = `${result.pushed} pushed, ${result.unchanged} unchanged, ${result.failed} failed`;
+  // Refusals persist on the hub across runs, so warn without treating a
+  // historical refusal as a failure of this transfer.
+  if (result.refused?.count) console.error(`recall push: hub reports ${result.refused.count} session refusals; check \`recall status\`.`);
+  if (result.incomplete || result.unreachable || result.lockBusy || result.failed > 0) {
+    console.error(`recall push: incomplete (${summary}). Check \`recall status\` and logs/push.log.`);
+    return 2;
+  }
+  console.log(`recall push: ${summary} (${result.bytes} bytes uploaded).`);
+  return 0;
 }
 
 /**
@@ -1498,7 +1506,7 @@ async function main() {
       console.error(`recall ${c}: not available in satellite mode (queries run on the hub)`);
       exit(1);
     }
-    if (c === 'push') { await runPushInline(hasFlag('--full')); exit(0); }
+    if (c === 'push') { exit(await runPushInline(hasFlag('--full'))); }
     if (hasFlag('--commit') || blameMode) { await runCommitAttribution(); exit(0); }
     if (c === 'statusline' && positional.length === 1) { await runStatuslineSubcommand(); exit(0); }
     if (c && INSTALLER_SUBCOMMANDS.has(c)) { await runInstallerSubcommand(c); exit(0); }

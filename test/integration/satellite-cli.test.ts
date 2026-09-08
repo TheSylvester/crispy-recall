@@ -247,11 +247,104 @@ describe('satellite CLI', () => {
     seedTranscript(sandbox);
     const r = await runCli(['push', '--full']);
     expect(r.code).toBe(0);
+    expect(r.stdout).toMatch(/1 pushed, 0 unchanged, 0 failed \(\d+ bytes uploaded\)/);
+    expect(r.stderr).toBe('');
     const manifests = hub.by('/v1/push/manifest');
     expect(manifests.length).toBeGreaterThan(0);
     for (const m of manifests) expect((m.json as { full: boolean }).full).toBe(true);
     expect(hub.by('/v1/query')).toHaveLength(0);
     expect(existsSync(join(recallHome, 'recall.db'))).toBe(false);
+  });
+
+  it('reports a successful no-op after an identical push', async () => {
+    seedTranscript(sandbox);
+    expect((await runCli(['push'])).code).toBe(0);
+    const r = await runCli(['push']);
+    expect(r.code).toBe(0);
+    expect(r.stdout).toContain('0 pushed, 1 unchanged, 0 failed (0 bytes uploaded)');
+    expect(hub.by('/v1/push/append')).toHaveLength(1);
+  });
+
+  it('fails an explicit push when the hub is unreachable, even with no files', async () => {
+    const url = hub.url;
+    await hub.close();
+    makeSatellite(url, 'irrelevant');
+    const r = await runCli(['push', '--full']);
+    expect(r.code).toBe(2);
+    expect(r.stdout).toBe('');
+    expect(r.stderr).toContain('recall push: incomplete');
+    expect(r.stderr).not.toContain('irrelevant');
+    hub = await startStubHub();
+  });
+
+  it('fails an explicit push on an invalid token', async () => {
+    seedTranscript(sandbox);
+    makeSatellite(hub.url, 'invalid-secret-token');
+    const r = await runCli(['push']);
+    expect(r.code).toBe(2);
+    expect(r.stdout).toBe('');
+    expect(r.stderr).toContain('0 pushed, 0 unchanged, 1 failed');
+    expect(r.stderr).not.toContain('invalid-secret-token');
+    expect(hub.by('/v1/push/manifest')[0]!.status).toBe(401);
+    expect(hub.by('/v1/push/append')).toHaveLength(0);
+  });
+
+  it('reports incomplete after an upload succeeds but the next manifest fails', async () => {
+    seedTranscript(sandbox);
+    await restartHub({ manifestStatuses: [200, 500] });
+    const r = await runCli(['push', '--full']);
+    expect(r.code).toBe(2);
+    expect(r.stdout).toBe('');
+    expect(r.stderr).toContain('incomplete (1 pushed, 0 unchanged, 0 failed)');
+    expect(hub.by('/v1/push/append')).toHaveLength(1);
+    expect(hub.by('/v1/push/manifest').map((m) => m.status)).toEqual([200, 500]);
+  });
+
+  it.each([400, 413])('reports rejected manifest files on HTTP %s', async (status) => {
+    seedTranscript(sandbox);
+    await restartHub({ manifestStatuses: [status] });
+    const r = await runCli(['push']);
+    expect(r.code).toBe(2);
+    expect(r.stdout).toBe('');
+    expect(r.stderr).toContain('0 pushed, 0 unchanged, 1 failed');
+    expect(hub.by('/v1/push/append')).toHaveLength(0);
+  });
+
+  it('reports failed files after a rejected append', async () => {
+    seedTranscript(sandbox);
+    await restartHub({ appendStatus: 503 });
+    const r = await runCli(['push']);
+    expect(r.code).toBe(2);
+    expect(r.stdout).toBe('');
+    expect(r.stderr).toContain('0 pushed, 0 unchanged, 1 failed');
+  });
+
+  it('keeps a failed split-manifest result when its sibling uploads successfully', async () => {
+    seedTranscript(sandbox);
+    seedTranscript(sandbox);
+    await restartHub({ manifestStatuses: [413, 413, 200] });
+    const r = await runCli(['push']);
+    expect(r.code).toBe(2);
+    expect(r.stderr).toContain('1 pushed, 0 unchanged, 1 failed');
+    expect(hub.by('/v1/push/append')).toHaveLength(1);
+  });
+
+  it('does not disguise an unexpected manifest-processing exception as success', async () => {
+    seedTranscript(sandbox);
+    await restartHub({ manifestGarbage: '{"files":[null]}' });
+    const r = await runCli(['push']);
+    expect(r.code).toBe(2);
+    expect(r.stdout).toBe('');
+    expect(r.stderr).toContain('recall push: incomplete');
+    expect(r.stderr).not.toContain('TypeError');
+  });
+
+  it('warns about historical hub refusals without failing a successful transfer', async () => {
+    await restartHub({ refused: { count: 2, recent: [randomUUID()] } });
+    const r = await runCli(['push']);
+    expect(r.code).toBe(0);
+    expect(r.stdout).toContain('0 pushed, 0 unchanged, 0 failed');
+    expect(r.stderr).toContain('hub reports 2 session refusals');
   });
 
   it('works with no better_sqlite3.node anywhere under the satellite root', async () => {

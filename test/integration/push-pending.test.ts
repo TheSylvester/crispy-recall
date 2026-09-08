@@ -128,6 +128,27 @@ afterEach(async () => {
 });
 
 describe('push-pending', () => {
+  it('marks an exhausted run incomplete without sending requests', async () => {
+    const restore = _setTestRoot(recallHome);
+    const prev = { c: process.env['CLAUDE_CONFIG_DIR'], x: process.env['CODEX_HOME'], r: process.env['RECALL_REMOTE_ROOT'] };
+    process.env['CLAUDE_CONFIG_DIR'] = claudeDir;
+    process.env['CODEX_HOME'] = codexDir;
+    process.env['RECALL_REMOTE_ROOT'] = join(sandbox, 'remote');
+    try {
+      claudeTranscript('-pending', '/tmp/proj');
+      const { runPush } = await import('../../src/satellite/push.js');
+      const result = await runPush({ budgetMs: 0 });
+      expect(result.incomplete).toBe(true);
+      expect(result.pushed).toBe(0);
+      expect(hub.requests).toHaveLength(0);
+    } finally {
+      restore();
+      if (prev.c === undefined) delete process.env['CLAUDE_CONFIG_DIR']; else process.env['CLAUDE_CONFIG_DIR'] = prev.c;
+      if (prev.x === undefined) delete process.env['CODEX_HOME']; else process.env['CODEX_HOME'] = prev.x;
+      if (prev.r === undefined) delete process.env['RECALL_REMOTE_ROOT']; else process.env['RECALL_REMOTE_ROOT'] = prev.r;
+    }
+  });
+
   it('sends a manifest per vendor and appends every new file, with wire headers', async () => {
     const c = claudeTranscript('-tmp-proj', '/tmp/proj');
     const x = codexTranscript('/tmp/proj');

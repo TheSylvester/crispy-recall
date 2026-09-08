@@ -302,6 +302,8 @@ export interface PushResult {
   lockBusy?: boolean;
   /** True when a transport failure stopped the run before any file. */
   unreachable?: boolean;
+  /** The run stopped or skipped work after a failure or exhausted budget. */
+  incomplete?: boolean;
   /** Refusals the hub reported for this host, when it reported any (D5). */
   refused?: RefusalReport;
 }
@@ -316,7 +318,11 @@ interface Ctx {
 
 const nowIso = () => new Date().toISOString();
 
-function budgetLeft(ctx: Ctx): boolean { return Date.now() < ctx.deadline; }
+function budgetLeft(ctx: Ctx): boolean {
+  if (Date.now() < ctx.deadline) return true;
+  ctx.result.incomplete = true;
+  return false;
+}
 
 /**
  * Per-request timeout, clamped to what is left of the run budget.
@@ -389,6 +395,7 @@ export async function runPush(opts: PushOptions = {}): Promise<PushResult> {
         if (r.fullSweepDue) fullSweepDue = true;
         if (r.refused) refused = r.refused;
         if (r.transportFailed) {
+          result.incomplete = true;
           // Nothing was pushed and the hub did not answer — stop the run.
           if (result.pushed === 0) result.unreachable = true;
           return result;
@@ -400,6 +407,7 @@ export async function runPush(opts: PushOptions = {}): Promise<PushResult> {
     }
   } catch (e) {
     // Defensive: runPush must never throw into a detached child or a query.
+    result.incomplete = true;
     pushLog(`${nowIso()} push-failed host=${ctx.host} err=${(e as Error).message}`);
   } finally {
     stopHeartbeat();
@@ -427,7 +435,7 @@ async function pushVendor(
   let swept: string[] = [];
   try {
     swept = await glob(vendorPattern(vr), { nodir: true });
-  } catch { /* an absent root globs to nothing */ }
+  } catch { ctx.result.incomplete = true; /* an absent root normally globs to nothing */ }
 
   const cutoff = Date.now() - RECENT_WINDOW_MS;
   const seen = new Set<string>();
@@ -552,6 +560,7 @@ async function sendManifestBatch(
     });
   } catch (e) {
     const reason = (e as HubTransportError).reason ?? (e as Error).message;
+    ctx.result.failed += batch.length;
     pushLog(`${nowIso()} push-failed host=${ctx.host} vendor=${vr.vendor} err=unreachable ${reason}`);
     return { kind: 'fatal', fullSweepDue: false };
   }
@@ -565,11 +574,15 @@ async function sendManifestBatch(
       const refused = b.refused ?? a.refused;
       return { kind, fullSweepDue: a.fullSweepDue || b.fullSweepDue, ...(refused ? { refused } : {}) };
     }
+    ctx.result.incomplete = true;
+    ctx.result.failed += batch.length;
     pushLog(`${nowIso()} manifest replied 413 path=${batch[0]?.rel ?? '(empty batch)'}`);
     return { kind: 'skipped', fullSweepDue: false };
   }
 
   if (res.status !== 200) {
+    ctx.result.incomplete = true;
+    ctx.result.failed += batch.length;
     pushLog(`${nowIso()} push-failed host=${ctx.host} vendor=${vr.vendor} err=manifest replied ${res.status}`);
     // 401/426/5xx are whole-run conditions: no later batch can succeed.
     // Anything else is this batch's problem, so the remaining batches — a
@@ -582,6 +595,7 @@ async function sendManifestBatch(
 
   const body = parseJson<ManifestResponse>(res);
   if (!body || !Array.isArray(body.files)) {
+    ctx.result.failed += batch.length;
     // Fatal, unlike a per-batch status rejection: a hub that answers 200
     // with a body we cannot read is not a hub we can talk to at all, and a
     // silent exit 0 would report a healthy push that never happened.
