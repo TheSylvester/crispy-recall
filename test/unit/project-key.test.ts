@@ -12,10 +12,17 @@
  * CODEX_HOME: <tmp>/codex }; a child that inherits the parent env resolves
  * `recallRoot()` to the live ~/.recall (paths.ts:35-40).
  */
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
-  chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync,
+  chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync,
 } from 'node:fs';
+import * as fs from 'node:fs';
+
+// Preserve real filesystem operations, with configurable exports for the one
+// synthetic ambiguity case that a case-insensitive volume cannot represent.
+vi.mock('node:fs', async (importOriginal) => ({
+  ...await importOriginal<typeof import('node:fs')>(),
+}));
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import { tmpdir, platform } from 'node:os';
@@ -78,7 +85,8 @@ function fakeGit(body: string): string {
 }
 
 beforeEach(() => {
-  sandbox = mkdtempSync(join(tmpdir(), 'recall-pkey-'));
+  // Match the physical cwd used by git and spawned Node processes on macOS.
+  sandbox = realpathSync(mkdtempSync(join(tmpdir(), 'recall-pkey-')));
   prevPath = process.env['PATH'];
   prevRemote = process.env['RECALL_REMOTE_ROOT'];
   process.env['RECALL_REMOTE_ROOT'] = join(sandbox, 'remote');
@@ -526,16 +534,32 @@ describe.skipIf(platform() === 'win32')('resolveCaseInsensitive', () => {
     const real = join(sandbox, 'Dev', 'Claro');
     mkdirSync(real, { recursive: true });
     expect(resolveCaseInsensitive(real)).toBe(real);
-    expect(resolveCaseInsensitive(join(sandbox, 'dev', 'claro'))).toBe(real);
+    const resolved = resolveCaseInsensitive(join(sandbox, 'dev', 'claro'));
+    expect(resolved).toBeDefined();
+    expect(realpathSync(resolved!)).toBe(realpathSync(real));
   });
 
-  it('gives up on an absent path, on ambiguity, and outside the home tree', () => {
+  it('gives up on an absent path and outside the home tree', () => {
     mkdirSync(join(sandbox, 'Dev', 'Claro'), { recursive: true });
     expect(resolveCaseInsensitive(join(sandbox, 'dev', 'nope'))).toBeUndefined();
-    // Two entries that differ only in case: guessing could key the wrong repo.
-    mkdirSync(join(sandbox, 'Dev', 'CLARO'), { recursive: true });
-    expect(resolveCaseInsensitive(join(sandbox, 'dev', 'claro'))).toBeUndefined();
     expect(resolveCaseInsensitive('/etc/PASSWD-not-here')).toBeUndefined();
+  });
+
+  it('refuses ambiguous directory entries without relying on a case-sensitive volume', () => {
+    // APFS cannot hold both names on its default volume. Model the directory
+    // entries explicitly so the ambiguity guard is exercised on every host.
+    const parent = join(sandbox, 'Dev');
+    const exists = vi.spyOn(fs, 'existsSync').mockImplementation((path) =>
+      String(path) === sandbox || String(path) === parent);
+    const entries = vi.spyOn(fs, 'readdirSync').mockImplementation(((path: unknown) =>
+      String(path) === sandbox ? ['Dev'] : ['Claro', 'CLARO']) as typeof fs.readdirSync);
+    try {
+      expect(resolveCaseInsensitive(join(sandbox, 'dev', 'claro'))).toBeUndefined();
+      expect(entries).toHaveBeenCalledWith(parent);
+    } finally {
+      entries.mockRestore();
+      exists.mockRestore();
+    }
   });
 
   it('rejects a component that readdir lists but that does not resolve', () => {

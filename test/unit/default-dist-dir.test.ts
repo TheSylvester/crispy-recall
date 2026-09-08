@@ -9,7 +9,7 @@
  */
 import { afterEach, describe, expect, it } from 'vitest';
 import {
-  mkdtempSync, mkdirSync, rmSync, writeFileSync, symlinkSync,
+  mkdtempSync, mkdirSync, realpathSync, rmSync, writeFileSync, symlinkSync,
 } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -37,7 +37,7 @@ describe('defaultDistDir', () => {
 
     process.argv[1] = link;
     // Must be the dist dir (where stop-hook.js lives), NOT bin/.
-    expect(defaultDistDir()).toBe(dist);
+    expect(defaultDistDir()).toBe(realpathSync(dist));
   });
 
   it('returns the containing dir for a non-symlinked entry', () => {
@@ -48,6 +48,6 @@ describe('defaultDistDir', () => {
     writeFileSync(entry, '// bundle\n');
 
     process.argv[1] = entry;
-    expect(defaultDistDir()).toBe(dist);
+    expect(defaultDistDir()).toBe(realpathSync(dist));
   });
 });

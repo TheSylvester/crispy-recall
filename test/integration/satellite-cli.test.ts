@@ -22,7 +22,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { spawn } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
@@ -130,7 +130,7 @@ describe('satellite CLI', () => {
   it('defaults the scope to the cwd and forwards no scope flags', async () => {
     await runCli(['plain query']);
     const body = queryBody();
-    expect(body.cwd).toBe(sandbox);
+    expect(body.cwd).toBe(realpathSync(sandbox));
     expect(body.argv).toEqual(['plain query']);
   });
 
