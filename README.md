@@ -6,11 +6,12 @@ Each conversation with your agent lands in a transcript on disk, waiting for Cla
 
 **Local session memory for Claude Code, with Codex support.** Hybrid text and semantic search. Verbatim conversation history.
 
-No daemon, no cron, no cloud on a single machine — a Stop hook and a SQLite file. (Multi-machine satellite mode adds one optional hub daemon on your own private network.)
+On one machine: no daemon, no cron, no cloud — a Stop hook and a SQLite file.
 
-## Quick start
+## Quick start (single machine)
 
-Requires Claude Code and either Node.js 22 LTS (`>=22.16`) or Node.js 24+ on a hub — the ordinary single-machine install (satellites: see [Requirements](#requirements)). Install recall in the same environment where you run Claude Code:
+Use Node.js 24 (or Node.js 22.16+) and install in the environment where you run
+Claude Code. This installs the stable single-machine release:
 
 ```bash
 npm install -g crispy-recall
@@ -19,31 +20,80 @@ recall install
 
 recall downloads a local embedding runtime and model, sets up a `Stop` hook in Claude Code, installs the recall Agent Skill, and starts indexing the session history still on disk. If Codex is detected, recall sets up the same integration there.
 
-### More than one machine (experimental satellite mode)
+### More than one machine (experimental)
 
-**Experimental, platform dependent:** satellite mode is available in the `0.4.0-sat.6` prerelease tarball built from `main`; the stable `0.3.x` npm release does not include it. The live checks were run against the earlier `0.4.0-sat.3` build and covered a Linux/WSL hub, a Linux laptop satellite, and a Windows-native satellite; the scripted Windows check drove a synthetic Stop-hook payload, and a later manual real Windows turn also passed on that build. The fixes in `sat.4` and later have **not** been re-run live on any of those machines. macOS operation in satellite mode, as either hub or satellite, is unverified. Automatic hub service registration requires Linux with systemd; Windows and macOS hubs must run `recall hub serve` under a supervisor you configure. A WSL hub must remain running and reachable from the laptop. The live checks also covered laptop Codex; noninteractive SSH shells must select the intended Node/Codex installation explicitly when nvm is absent from PATH.
+Keep your coding history on one **hub**. Each **satellite** uploads its transcripts
+and searches the hub, without running its own database or embedding model.
+Install Recall under the same account and in the same environment as your coding
+agent. WSL is optional; install separately in Windows and WSL if you use both.
 
-Build the experimental package from `main` at the `0.4.0-sat.x` prerelease commit (the satellite branch is merged; `main` carries the fixes) with `npm ci`, `npm test`, and `npm pack`, then install the generated tarball on each machine with `npm install -g /path/to/crispy-recall-0.4.0-sat.4.tgz`. Run `recall install` on the hub before registering satellites. This remains a prerelease; platform acceptance beyond the configurations listed above is still pending.
+Use Node.js 24 and a private network, such as your LAN or Tailscale. Recall does
+not configure Tailscale or SSH; remote access is separate from shared memory.
 
-A **hub** is the machine that keeps the database and runs the embedding model. A **satellite** is a machine that only pushes its transcripts to the hub and forwards its queries there; it needs no database, no model and no native addon, and it runs on Node.js 20, 22 or 24+ (Node 21 and 23 are unsupported). The npm package still depends on `better-sqlite3`, even though the satellite runtime never loads or stages it — and on Node 20 there is no prebuilt binding, so npm compiles better-sqlite3 from source. A Node 20 satellite therefore needs python3, make and a C/C++ compiler installed. Node 22 or 24+ avoids that compile entirely.
-
-Install the hub first with the route above, then issue one token per satellite and start the daemon:
-
-```bash
-recall hub token --host <name>                       # prints the token once
-recall hub serve --bind <tailnet-address> --detach   # first run without --bind listens on 127.0.0.1; later runs reuse the persisted address
-```
-
-A non-loopback `--bind` requires at least one token, so issue the token first; `recall hub serve` runs in the foreground (for systemd) unless you pass `--detach`. `--bind`/`--port` are persisted on the first `hub serve`. `recall hub token` prints a ready-made `recall install --hub <url> --token -` line from that persisted address; before the first `hub serve` has persisted one it falls back to `http://127.0.0.1:7877`, so substitute your `--bind` address by hand, or re-run `recall hub token --host <name>` once the daemon is up (re-running rotates that host's token).
-
-`recall hub install-service` registers a systemd user unit on Linux so the daemon starts at login; when lingering is not already enabled it prints the `loginctl enable-linger <user>` command, which is what the daemon is intended to survive a logout or a reboot with (reboot behaviour has not been verified on a live hub). On each satellite, install recall in that environment too and register it against the hub:
+**Prepare the package.** Satellite mode is in the experimental `0.4.0-sat.6`
+build, not the stable npm release. Build it once:
 
 ```bash
-npm install -g crispy-recall
-recall install --hub http://<hub-address>:7877 --token -
+git clone https://github.com/TheSylvester/crispy-recall.git
+cd crispy-recall
+npm ci
+npm pack
 ```
 
-`--token -` reads the token from stdin, so it never reaches your shell history; `RECALL_HUB_TOKEN` is honored as well. The hub speaks plain HTTP and never binds a public address on its own: put it on a private network. Tailscale is one such network, and the deployment choice is yours — recall itself has no Tailscale awareness.
+Copy `crispy-recall-0.4.0-sat.6.tgz` to each machine and install it there:
+
+```bash
+npm install -g ./crispy-recall-0.4.0-sat.6.tgz
+```
+
+**On the hub**, initialize Recall, create a token for one satellite, and start
+listening on the hub's private IP:
+
+```bash
+recall install
+recall hub token --host laptop
+recall hub serve --bind <hub-private-ip> --port 7877 --detach
+```
+
+Save the token shown. Use your hub's private IP below even if the generated
+example shows `127.0.0.1`. Give each satellite a different host name; issuing a
+new token for the same name replaces its old token.
+
+**On the satellite**, enter that token and connect to the hub. These commands
+read it interactively and pass it through stdin, keeping it out of shell history.
+
+Bash:
+
+```bash
+read -r -s -p 'Hub token: ' recall_token; printf '\n'
+printf '%s\n' "$recall_token" | recall install --hub http://<hub-private-ip>:7877 --token -
+unset recall_token
+```
+
+PowerShell:
+
+```powershell
+$recallToken = Read-Host 'Hub token'
+$recallToken | recall install --hub http://<hub-private-ip>:7877 --token -
+Remove-Variable recallToken
+```
+
+Installation starts uploading existing transcripts; new turns follow automatically.
+Check the connection and search shared history:
+
+```bash
+recall doctor
+recall --all "a conversation from another machine"
+```
+
+Keep the hub running and reachable. `--detach` does not configure startup after
+reboot. On Linux, stop the detached hub before running `recall hub install-service`,
+which starts and enables the systemd service; follow any printed linger instructions.
+Windows and macOS need their own startup configuration. Live platform and reboot
+acceptance for this prerelease is still pending.
+
+Only connect trusted users: satellites upload raw transcripts, and every hub
+token can search the entire hub history. See [Privacy and data](#privacy-and-data).
 
 ## How to use recall
 
@@ -78,7 +128,7 @@ Every result includes a session id and the matched message id. For UUID-based Cl
 recall <session-uuid> <message-uuid>
 ```
 
-Search defaults to the current project's sessions. Expand only when needed:
+Search defaults to the current project's sessions. In 0.4.0, matching repositories share a search scope across clones and worktrees. Expand only when needed:
 
 ```bash
 recall --all "the decision may have happened in another repo"
@@ -185,16 +235,14 @@ Install-time backfill indexes the Claude Code and Codex sessions still present o
 
 ### Requirements
 
-- Node.js 22 LTS (`>=22.16`) or Node.js 24+ on a hub — the machine that keeps the database and runs the embedding model. This is the default install.
-- Node.js 20, 22 or 24+ on a satellite — a machine that only pushes transcripts and forwards queries. Node 21 and Node 23 are unsupported. It stages no database, model or native addon.
-- Claude Code (required); Codex session indexing and search are also configured when Codex is detected
-- Linux x64/arm64, macOS x64/arm64, or Windows x64
-- macOS 14+ on Apple Silicon or macOS 13.7+ on Intel
-- 500 MB free recommended for installation; upgrading also needs free space for retained rollback snapshots — up to twice the database size when upgrading from 0.2.x, and up to three times that from 0.1.x
+- Node.js 24 recommended; Node.js 22.16+ is also supported for a local install or hub.
+- Claude Code; Codex integration is added when detected.
+- Linux x64/arm64, macOS x64/arm64, or Windows x64.
+- macOS 14+ on Apple Silicon or macOS 13.7+ on Intel.
+- 500 MB free for installation, plus space for database backups when upgrading.
 
-Node 21 and Node 23 are unsupported because no prebuilt SQLite binding is published for their ABIs.
-
-On Node 20 npm also has no prebuilt SQLite binding and compiles `better-sqlite3` from source, so python3, make and a C/C++ compiler must be installed — even though a satellite never loads it. Node 22 or 24+ installs from a prebuild and needs no toolchain.
+Satellites also support Node.js 20, but installing on Node 20 requires Python,
+make and a C/C++ compiler. Node.js 21 and 23 are unsupported.
 
 ```bash
 npm install -g crispy-recall
@@ -217,26 +265,40 @@ Use `recall doctor` if setup reports a problem. Use `recall install --offline` w
 
 ### Upgrading
 
-Close active Claude Code and Codex sessions, then make `recall install` the first recall command you run after upgrading — it applies any pending one-time database migrations attended, before your agent reopens the database:
+Close active coding-agent sessions, upgrade the package, then run `recall install`
+before using Recall again. For a stable release:
 
 ```bash
 npm install -g crispy-recall
 recall install
 ```
 
-- **From 0.1.x**, the installer migrates the wasm database to native SQLite/WAL (writing a `~/.recall/recall.db.pre-upgrade-<stamp>` snapshot) and checks integrity, then runs the retrieval-class migration below.
-- **From 0.2.x**, the installer runs the retrieval-class migration: it reclassifies any subagent (agent-leaf) messages as durable-but-excluded-from-default-search, rebuilds the FTS index, and re-embeds affected rows in the background.
-- **From 0.3.x on a hub**, `recall install` also runs the attended Codex message-id migration, which re-ingests and re-embeds your Codex history in the background — semantic recall over Codex sessions is degraded until `recall doctor` reports the embedding gap at 0 — and it offers `recall repair --rekey-projects` to fill the new project key on existing rows.
+For the experimental satellite build, install the tarball from
+[the setup above](#more-than-one-machine-experimental) instead. On an existing
+satellite, re-run `recall install --hub http://<hub-private-ip>:7877`; it reuses
+the saved token for that hub.
 
-Each of the three migrations that rewrite message text or ids — wasm→native, retrieval-class, and the Codex re-key — takes a consistent SQLite backup before changing the database and aborts if the backup fails. (`recall repair --rekey-projects` takes no snapshot: it only fills the `project_key` column, in a single transaction that rolls back on failure.) Snapshot names identify the migration: `recall.db.pre-upgrade-<stamp>`, `recall.db.pre-retrieval-<stamp>`, and `recall.db.pre-codex-rekey-<stamp>`. A 0.1.x upgrade can retain all three; a 0.2.x upgrade can retain two. Allow that many database-sized copies in free space and delete them only after you are satisfied.
+The installer applies required migrations and keeps rollback snapshots. Allow up
+to three database-sized backups when upgrading from 0.1.x, or two from 0.2.x.
+If the database is busy, close the process using it and retry. Complete migrations
+before searching; semantic results may be incomplete while background embedding
+catches up. Check progress with `recall status` and `recall doctor`.
 
-If a live session or a running backfill holds the database, the installer aborts cleanly so you can exit it and rerun `recall install`. Search remains available during migration; use `recall status` to watch progress, and the background re-embed resumes after interruption or reboot.
+The 0.4.0 upgrade rebuilds Codex message identities from available transcripts.
+Keep the default backfill enabled to recover sessions previously missed by the
+index. Deleted source transcripts cannot be recovered.
 
-The retrieval-class migration works from `recall.db`, so it preserves indexed history after source cleanup. Codex re-keying needs readable source transcripts; missing or pruned rollouts cannot be recovered. Your database is the store of record; if old transcripts are gone, `recall repair --full` cannot recreate them. Don't downgrade to `<=0.1.6` after converting the database.
+If an earlier build missed messages or misordered turns, run this on the local
+installation or hub after upgrading:
 
-Upgrading the npm package alone does not complete the Codex migration: normal commands fail closed, and Stop hooks cannot ingest until `recall install` completes it. The default install backfill also recovers available sessions that previously inserted no rows; `--no-backfill` and `repair --rekey-codex` alone do not. A clean migration marker or residue count does not prove that this backfill has finished.
+```bash
+recall repair --messages
+recall backfill --auto-embed
+```
 
-For installations exposed to the earlier sequence or fork-ID bugs, run `recall repair --messages` after upgrading. It re-reads known transcripts to recover missed turns and repair ordering without deleting indexed history whose source is gone. It invalidates affected vectors; follow with `recall backfill --auto-embed`. Status and doctor report persistent embedding failures so an unavailable runtime or bad input cannot silently stall catch-up.
+This repairs known transcripts without clearing retained history. Avoid
+`recall repair --full` unless you intend to rebuild the index from the transcripts
+still on disk. Do not downgrade to 0.1.6 or earlier after database conversion.
 
 ## Command reference
 
@@ -296,7 +358,10 @@ The installed statusline never opens the database. Its only I/O is one guarded `
 
 The installed integration is inspectable too: Claude's skill and hook live under `~/.claude/skills/recall/` and `~/.claude/settings.json`. When Codex is detected, recall also uses `~/.codex/skills/recall/` and `~/.codex/hooks.json`.
 
-In satellite mode, each satellite pushes its transcript **bytes** to the hub, and forwards its query text and cwd to the hub, over plain HTTP. There is no TLS in v1, so put the hub port on a private network. The hub stores those bytes under `~/.recall/remote/<host>/` and indexes them beside its own sessions. Authorization is coarse: a hub token grants read of the whole hub index, and write only to that host's mirror. Tokens are stored hashed in `~/.recall/hub-tokens.json` on the hub and in plain text in `~/.recall/satellite-token` (mode 0600) on the satellite; `recall hub token --revoke <name>` takes effect immediately, with no daemon restart.
+Satellites send raw transcripts and queries to your hub. Recall uses plain HTTP
+without built-in TLS, so keep it on a private network. Each token can search the
+whole hub index and upload only to its named satellite's mirror. Revoke a token
+with `recall hub token --revoke <name>`; no restart is needed.
 
 The index deliberately outlives source-transcript cleanup. recall doesn't encrypt `recall.db`; treat `~/.recall/` with the same care as your original Claude Code and Codex histories.
 
