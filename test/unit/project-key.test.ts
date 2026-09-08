@@ -536,7 +536,11 @@ describe.skipIf(platform() === 'win32')('resolveCaseInsensitive', () => {
     expect(resolveCaseInsensitive(real)).toBe(real);
     const resolved = resolveCaseInsensitive(join(sandbox, 'dev', 'claro'));
     expect(resolved).toBeDefined();
-    expect(realpathSync(resolved!)).toBe(realpathSync(real));
+    // APFS can retain the requested case even in realpath(). Compare the
+    // directory itself, not the spelling used to reach it.
+    const actual = fs.statSync(resolved!, { bigint: true });
+    const expected = fs.statSync(real, { bigint: true });
+    expect({ dev: actual.dev, ino: actual.ino }).toEqual({ dev: expected.dev, ino: expected.ino });
   });
 
   it('gives up on an absent path and outside the home tree', () => {
