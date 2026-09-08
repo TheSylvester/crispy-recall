@@ -25,6 +25,14 @@ import { repairFull, repairVectors, repairFts, integrityCheck } from '../../src/
 import { mtimeScan } from '../../src/recall/mtime-scan.js';
 import { _setTestRoot, dbPath } from '../../src/paths.js';
 import { _resetDb, getDb } from '../../src/db.js';
+import { availableMemory } from '../../src/recall/available-memory.js';
+import { runEmbeddingBackfill } from '../../src/recall/catchup.js';
+
+// The fake embedding model allocates no model memory. Test the pressure gate
+// explicitly below, independent of unrelated load on a shared CI runner.
+vi.mock('../../src/recall/available-memory.js', () => ({
+  availableMemory: vi.fn(() => 8 * 1024 ** 3),
+}));
 
 // No network, no llama-server: `repair --full` embeds through this stub.
 vi.mock('../../src/recall/embedder.js', async (importOriginal) => ({
@@ -41,6 +49,7 @@ let claudeRoot: string;
 let restoreRoot: () => void;
 let origClaudeConfigDir: string | undefined;
 let origCodexHome: string | undefined;
+let origRemoteRoot: string | undefined;
 
 function writeFixtureSession(filePath: string, sessionId: string): void {
   const lines: string[] = [];
@@ -71,8 +80,10 @@ describe('repair', () => {
     restoreRoot = _setTestRoot(recallHome);
     origClaudeConfigDir = process.env['CLAUDE_CONFIG_DIR'];
     origCodexHome = process.env['CODEX_HOME'];
+    origRemoteRoot = process.env['RECALL_REMOTE_ROOT'];
     process.env['CLAUDE_CONFIG_DIR'] = claudeRoot;
     process.env['CODEX_HOME'] = join(recallHome, 'codex-empty');
+    process.env['RECALL_REMOTE_ROOT'] = join(recallHome, 'remote-empty');
     _resetDb();
 
     // Seed 3 transcript sessions and index them via the steady-state scan.
@@ -90,7 +101,20 @@ describe('repair', () => {
     else process.env['CLAUDE_CONFIG_DIR'] = origClaudeConfigDir;
     if (origCodexHome === undefined) delete process.env['CODEX_HOME'];
     else process.env['CODEX_HOME'] = origCodexHome;
+    if (origRemoteRoot === undefined) delete process.env['RECALL_REMOTE_ROOT'];
+    else process.env['RECALL_REMOTE_ROOT'] = origRemoteRoot;
     if (recallHome && existsSync(recallHome)) rmSync(recallHome, { recursive: true, force: true });
+  });
+
+  it('retains pending messages without embedding under genuine memory pressure', async () => {
+    vi.mocked(availableMemory).mockReturnValue(128 * 1024 ** 2);
+    try {
+      await runEmbeddingBackfill();
+      expect(count('SELECT COUNT(*) AS c FROM messages')).toBe(12);
+      expect(count('SELECT COUNT(*) AS c FROM message_vectors')).toBe(0);
+    } finally {
+      vi.mocked(availableMemory).mockReturnValue(8 * 1024 ** 3);
+    }
   });
 
   it('full repair deletes orphans, reingests from JSONL, and rebuilds the watermark', async () => {

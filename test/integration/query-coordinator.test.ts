@@ -102,7 +102,8 @@ function fakeVec(text) {
 const sleepMs = parseInt(process.env.FAKE_EMBED_SLEEP_MS || '300', 10);
 setTimeout(() => {
   try { process.stdout.write(JSON.stringify(texts.map(fakeVec))); } catch {}
-  process.exit(0);
+  // Natural exit waits for stdout to drain. process.exit(0) truncates large
+  // batched vectors when a pipe is full (notably the smaller macOS pipes).
 }, sleepMs);
 `;
 }
@@ -180,6 +181,7 @@ function runCli(
     env: {
       ...process.env,
       RECALL_HOME: recallHome,
+      RECALL_REMOTE_ROOT: join(recallHome, 'remote'),
       CLAUDE_CONFIG_DIR: join(recallHome, 'claude-empty'),
       CODEX_HOME: join(recallHome, 'codex-empty'),
       ...env,
@@ -334,6 +336,26 @@ describe.skipIf(!gpuAcceptance || !existsSync(realBin) || !existsSync(realModel)
 );
 
 describe.skipIf(platform() === 'win32')('query coordinator — subprocess fleets (fake backend)', () => {
+  it('flushes the fake backend response even when its stdout pipe applies backpressure', async () => {
+    const texts = Array.from({ length: 64 }, (_, i) => `${QUERY_PREFIX}backpressure probe ${i}`);
+    const child = spawn(process.execPath, [join(binDir(), 'llama-embedding'), '-p', texts.join('<#sep#>')], {
+      env: { ...process.env, FAKE_EMBED_SLEEP_MS: '0' },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    spawned.push(child);
+    let stdout = '';
+    child.stdout.on('data', (chunk) => { stdout += chunk; });
+    child.stdout.pause();
+    const finished = new Promise<number | null>((resolve) => child.on('close', resolve));
+    // Force a response larger than the pipe buffer to remain queued at exit.
+    await sleep(200);
+    child.stdout.resume();
+    expect(await finished).toBe(0);
+    const vectors = JSON.parse(stdout) as number[][];
+    expect(vectors).toHaveLength(texts.length);
+    expect(Float32Array.from(vectors.at(-1)!)).toEqual(fakeVec(texts.at(-1)!));
+  });
+
   it('a synchronized burst of 7 CLIs (6 distinct + 1 duplicate query) coalesces into ONE one-shot invocation, never llama-server', async () => {
     // 7 CLIs > SERVER_THRESHOLD(5): without the one-shot pin the coalesced
     // batch would engage llama-server — the fake server records the violation.
@@ -350,7 +372,7 @@ describe.skipIf(platform() === 'win32')('query coordinator — subprocess fleets
     for (const r of results) expect(r.code).toBe(0);
     // Correct routed vector per CLI: its top semantic hit is its own session.
     results.forEach((r, i) => {
-      expect(topSessionOf(r.stdout), `CLI ${i} (${queries[i]})`).toBe(expected.get(queries[i]!));
+      expect(topSessionOf(r.stdout), `CLI ${i} (${queries[i]})\nstdout: ${r.stdout}\nstderr: ${r.stderr}`).toBe(expected.get(queries[i]!));
     });
 
     const inv = invocations();
