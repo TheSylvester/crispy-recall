@@ -58,14 +58,16 @@ jobs:
       matrix:
         node: [22, 24]
     env:
-      # Never let a test touch the runner's real home. Suites that spawn children
-      # need these in the environment, not just via _setTestRoot (which does not
-      # cross a process boundary).
-      RECALL_HOME: ${{ runner.temp }}/recall-home
-      CLAUDE_CONFIG_DIR: ${{ runner.temp }}/claude-home
-      CODEX_HOME: ${{ runner.temp }}/codex-home
       GH_TOKEN: ${{ github.token }}
     steps:
+      # runner.temp is unavailable in job-level env; resolve paths on the runner.
+      # GITHUB_ENV also gives spawned test children the isolated homes.
+      - name: Isolate test homes
+        run: |
+          echo "RECALL_HOME=$RUNNER_TEMP/recall-home" >> "$GITHUB_ENV"
+          echo "CLAUDE_CONFIG_DIR=$RUNNER_TEMP/claude-home" >> "$GITHUB_ENV"
+          echo "CODEX_HOME=$RUNNER_TEMP/codex-home" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
@@ -127,11 +129,13 @@ jobs:
     name: satellite-node20
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    env:
-      RECALL_HOME: ${{ runner.temp }}/recall-home
-      CLAUDE_CONFIG_DIR: ${{ runner.temp }}/claude-home
-      CODEX_HOME: ${{ runner.temp }}/codex-home
     steps:
+      - name: Isolate test homes
+        run: |
+          echo "RECALL_HOME=$RUNNER_TEMP/recall-home" >> "$GITHUB_ENV"
+          echo "CLAUDE_CONFIG_DIR=$RUNNER_TEMP/claude-home" >> "$GITHUB_ENV"
+          echo "CODEX_HOME=$RUNNER_TEMP/codex-home" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
