@@ -32,20 +32,11 @@ agent. WSL is optional; install separately in Windows and WSL if you use both.
 Use Node.js 24 and a private network, such as your LAN or Tailscale. Recall does
 not configure Tailscale or SSH; remote access is separate from shared memory.
 
-**Prepare the package.** Satellite mode is in the experimental `0.4.0-sat.6`
-build, not the stable npm release. Build it once:
+Satellite mode is experimental. On every machine (the hub and each satellite),
+install Recall first:
 
 ```bash
-git clone https://github.com/TheSylvester/crispy-recall.git
-cd crispy-recall
-npm ci
-npm pack
-```
-
-Copy `crispy-recall-0.4.0-sat.6.tgz` to each machine and install it there:
-
-```bash
-npm install -g ./crispy-recall-0.4.0-sat.6.tgz
+npm install -g crispy-recall
 ```
 
 **On the hub**, initialize Recall, create a token for one satellite, and start
@@ -270,10 +261,13 @@ npm install -g crispy-recall
 recall install
 ```
 
-For the experimental satellite build, install the tarball from
-[the setup above](#more-than-one-machine-experimental) instead. On an existing
-satellite, re-run `recall install --hub http://<hub-private-ip>:7877`; it reuses
-the saved token for that hub.
+On an existing satellite, upgrade the package and re-run the satellite installer.
+It reuses the saved token for that hub:
+
+```bash
+npm install -g crispy-recall
+recall install --hub http://<hub-private-ip>:7877
+```
 
 The installer applies required migrations and keeps rollback snapshots. Allow up
 to three database-sized backups when upgrading from 0.1.x, or two from 0.2.x.
